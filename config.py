@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Server ---
-PORT = int(os.getenv("PORT", 5000))
+PORT = int(os.getenv("PORT", 8000)) # Default to 8000 for FastAPI
 
 # --- Supabase ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")

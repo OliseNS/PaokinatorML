@@ -7,6 +7,9 @@ class AkinatorEngine:
     Optimized PyTorch-based Akinator engine.
     This class contains only pure ML/math logic and is isolated
     from the web server and database.
+    
+    Includes optimizations for fast question selection at the
+    start of the game.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -24,6 +27,11 @@ class AkinatorEngine:
             'sometimes': 0.5, 'maybe': 0.5, 'rarely': 0.25,
             'no': 0.0, 'n': 0.0
         }
+        
+        # --- Cache for Q0 ---
+        # This will be populated by _build_tensors
+        self.sorted_initial_feature_indices = []
+
         self._build_tensors()
         
     def _build_tensors(self):
@@ -48,18 +56,28 @@ class AkinatorEngine:
         self.allowed_feature_mask = (col_nan_frac < 0.8) & (col_var > 1e-4)
         self.allowed_feature_indices = [i for i, ok in enumerate(self.allowed_feature_mask) if ok]
         
+        # --- Pre-compute and cache Q0 results ---
         try:
             N = len(self.animals)
             if N > 0 and len(self.allowed_feature_indices) > 0:
                 uniform_prior = torch.ones(N, dtype=torch.float32) / float(N)
                 gains = self.info_gain_batch(uniform_prior, self.allowed_feature_indices)
+                
                 self.feature_importance = {self.feature_cols[idx]: float(gains[i].item())
                                            for i, idx in enumerate(self.allowed_feature_indices)}
+                
+                # --- NEW: Store the sorted indices for Q0 ---
+                sorted_gains_indices = torch.argsort(gains, descending=True)
+                # Store the *actual* feature indices (from the full list)
+                self.sorted_initial_feature_indices = [self.allowed_feature_indices[i.item()] for i in sorted_gains_indices]
+                
             else:
                 self.feature_importance = {f: 0.0 for f in self.feature_cols}
+                self.sorted_initial_feature_indices = []
         except Exception as e:
             print(f"Warning: failed computing feature importance: {e}")
             self.feature_importance = {f: 0.0 for f in self.feature_cols}
+            self.sorted_initial_feature_indices = []
 
     def _compute_specificity_all(self):
         """Compute specificity score for all animals (batched)."""
@@ -146,8 +164,14 @@ class AkinatorEngine:
 
         active_thresh = 1e-8
         active_idx = torch.where(prior > active_thresh)[0]
+        
+        # Handle case where prior is all zeros
         if len(active_idx) == 0:
-            return torch.zeros(len(feature_indices))
+             # This can happen if all animals are rejected
+             active_idx = torch.arange(len(prior))
+             prior = torch.ones_like(prior) / len(prior) # Reset to uniform
+             curr_entropy = self.entropy(prior)
+
 
         if len(active_idx) < len(prior):
             prior_sub = prior[active_idx]
@@ -193,14 +217,47 @@ class AkinatorEngine:
         return gains
 
     def select_question(self, prior, asked, question_count):
-        """Select most informative question."""
+        """
+        Select most informative question.
+        OPTIMIZED: Uses precomputed Q0 and dynamic feature checking.
+        """
+        
+        # --- OPTIMIZATION 1: Use pre-computed gains for Q0 ---
+        if question_count == 0:
+            if not self.sorted_initial_feature_indices:
+                print("Warning: No sorted_initial_feature_indices. Falling back.")
+            else:
+                top_n = min(5, len(self.sorted_initial_feature_indices))
+                # Pick from the pre-sorted top 5
+                chosen_global_idx = self.sorted_initial_feature_indices[np.random.randint(top_n)]
+                
+                # Ensure it hasn't somehow been asked (shouldn't happen on Q0)
+                if self.feature_cols[chosen_global_idx] in asked:
+                     chosen_global_idx = self.sorted_initial_feature_indices[0] # Fallback
+                
+                feature = self.feature_cols[chosen_global_idx]
+                question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
+                return feature, question
+        # --- END OPTIMIZATION 1 ---
+
+        # Find all features that are allowed AND haven't been asked
         all_available = [i for i, f in enumerate(self.feature_cols)
                          if f not in asked and (i in self.allowed_feature_indices)]
         if not all_available:
             return None, None
         
-        MAX_FEATURES_TO_CHECK = 30
+        # --- OPTIMIZATION 2: Dynamic feature check limit ---
+        # Check fewer features for Q1-Q4 when N_active is still large
+        if question_count < 3:    # For Q1, Q2
+            MAX_FEATURES_TO_CHECK = 15
+        elif question_count < 5:  # For Q3, Q4
+            MAX_FEATURES_TO_CHECK = 25
+        else:
+            MAX_FEATURES_TO_CHECK = 30 # Back to normal
+        # --- END OPTIMIZATION 2 ---
+        
         if len(all_available) > MAX_FEATURES_TO_CHECK:
+            # Sample from the available features
             sampled_indices_map = {
                 new_idx: old_idx for new_idx, old_idx in enumerate(
                     np.random.choice(all_available, MAX_FEATURES_TO_CHECK, replace=False)
@@ -211,18 +268,18 @@ class AkinatorEngine:
             sampled_indices_map = {idx: old_idx for idx, old_idx in enumerate(all_available)}
             available_features_to_check = all_available
         
+        # This now runs on a smaller set (15 or 25) for the slow questions
         gains_tensor = self.info_gain_batch(prior, available_features_to_check)
         sorted_indices_of_gains = torch.argsort(gains_tensor, descending=True)
 
-        if question_count == 0:
-            top_n = min(5, len(sorted_indices_of_gains))
-            chosen_local_idx = sorted_indices_of_gains[np.random.randint(top_n)]
-        elif question_count < 5:
+        # Use less randomness as the game progresses
+        if question_count < 5:
             top_n = min(3, len(sorted_indices_of_gains))
             chosen_local_idx = sorted_indices_of_gains[np.random.randint(top_n)]
         else:
             chosen_local_idx = sorted_indices_of_gains[0]
         
+        # Map the local index from the gains_tensor back to the original feature index
         idx = sampled_indices_map[chosen_local_idx.item()]
         
         feature = self.feature_cols[idx]

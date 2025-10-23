@@ -1,19 +1,18 @@
-# Flask Web Server
-flask
-gunicorn
+fastapi
+uvicorn[standard]
 
-# Configuration
+#Database
+
+redis
+supabase
 python-dotenv
 
-# Database & Caching
-supabase
-redis
-
-# ML & Data
+#ML
 pandas
 numpy
 torch
 
-# Fast Serialization
+#Serialize
+
 msgpack
 msgpack-numpy

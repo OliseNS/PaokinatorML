@@ -88,6 +88,8 @@ def get_session(session_id: str) -> dict | None:
             state = msgpack.unpackb(packed_state, raw=False)
 
             # --- Convert Numpy Arrays back to Tensors ---
+            # We use .copy() to ensure the tensor is writable,
+            # which is crucial for our state migration logic.
             if 'probabilities' in state:
                 state['probabilities'] = torch.from_numpy(state['probabilities'].copy())
             if 'rejected_mask' in state:
@@ -116,7 +118,7 @@ def get_active_session_count() -> int:
     try:
         # Avoid using 'KEYS' in production on large dbs, 
         # but for a "session:" prefix, it's generally acceptable.
-        return len(redis_client.keys("session:*"))
+        return len(list(redis_client.scan_iter("session:*")))
     except Exception as e:
         print(f"Error counting sessions in Redis: {e}")
         return 0

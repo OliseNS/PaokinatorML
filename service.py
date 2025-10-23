@@ -1,306 +1,273 @@
-import pandas as pd
-import numpy as np
 import json
-import os
+import threading
 import torch
-from threading import Lock, Thread
+import numpy as np
 
-# Import from our new refactored files
+# Import our project files
+import db
 from engine import AkinatorEngine
-from db import load_data_from_supabase, persist_learned_animal
-import config
-
 
 class AkinatorService:
     """
-    Game manager for Akinator sessions.
-    This class connects the pure 'engine' to the 'db' layer
-    and manages game logic.
+    Manages the AkinatorEngine instance and game logic.
+    
+    This class handles the "hot-swap" of the engine when new
+    data is learned, and seamlessly migrates active game sessions
+    to the new engine's tensor shapes.
     """
     
-    def __init__(self, questions_path=config.QUESTIONS_PATH):
-        # This lock protects the 'self.engine' and 'self.animal_to_idx'
-        # references, allowing them to be "hot-swapped" safely.
-        self.engine_lock = Lock()
+    def __init__(self, questions_path: str):
+        print("Initializing AkinatorService...")
+        self.engine_lock = threading.Lock()
+        self.questions_map = self._load_questions(questions_path)
         
-        # These will be populated by reload_engine()
-        self.engine: AkinatorEngine = None
-        self.animal_to_idx: dict = {}
-        self.feature_cols: list = [] # Stored for learn_animal
-        
-        # Initial load
-        self.reload_engine()
-        
-        print("✅ AkinatorService initialized")
-    
-    def _load_engine_data(self) -> tuple[AkinatorEngine, dict, list]:
-        """
-        Helper function to load all data from scratch and build a new engine.
-        This runs in the background during a hot-reload.
-        """
-        # 1. Load data from Supabase
-        df, feature_cols = load_data_from_supabase()
+        # Load the engine blocking on the first startup
+        self.engine = self._create_engine()
+        print(f"✅ Service initialized with {len(self.engine.animals)} animals.")
 
-        # 2. Load questions map
-        questions_map = {}
-        path_used = None
-        tried = []
-
-        if config.QUESTIONS_PATH:
-            tried.append(os.path.abspath(config.QUESTIONS_PATH))
-            if os.path.exists(config.QUESTIONS_PATH):
-                path_used = config.QUESTIONS_PATH
-
-        if path_used is None:
-            base_dir = os.path.dirname(__file__)
-            alt = os.path.join(base_dir, config.QUESTIONS_PATH)
-            tried.append(os.path.abspath(alt))
-            if os.path.exists(alt):
-                path_used = alt
-
-        if path_used:
-            try:
-                with open(path_used, 'r', encoding='utf-8') as f:
-                    questions_map = json.load(f)
-            except Exception as e:
-                print(f"Warning: failed loading questions file '{path_used}': {e}")
-        else:
-            print(f"Warning: questions file not found. Tried: {tried}")
-        
-        # 3. Build the engine and lookup map
-        engine = AkinatorEngine(df, feature_cols, questions_map)
-        animal_to_idx = {
-            name.lower(): i for i, name in enumerate(df['animal_name'].values)
-        }
-        
-        return engine, animal_to_idx, feature_cols
-
-    def reload_engine(self):
-        """
-        Builds a new engine and atomically swaps it into the service.
-        This provides zero-downtime updates when new animals are learned.
-        """
-        print("🧠 Engine hot-reload starting...")
+    def _load_questions(self, questions_path: str) -> dict:
+        """Loads the questions.json file."""
         try:
-            new_engine, new_animal_map, new_feature_cols = self._load_engine_data()
+            with open(questions_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            print(f"⚠️ WARNING: {questions_path} not found. Using empty questions map.")
+            return {}
+        except json.JSONDecodeError:
+            print(f"❌ ERROR: Failed to parse {questions_path}. Using empty map.")
+            return {}
+
+    def _create_engine(self) -> AkinatorEngine:
+        """Loads data from DB and builds a new engine instance."""
+        print("Loading data from Supabase to build engine...")
+        df, feature_cols = db.load_data_from_supabase()
+        return AkinatorEngine(df, feature_cols, self.questions_map)
+
+    def _background_reload(self):
+        """
+        Runs in a separate thread to build a new engine
+        and hot-swap it atomically.
+        """
+        print("🚀 Starting background engine reload...")
+        try:
+            new_engine = self._create_engine()
             
-            # This is the "atomic swap"
-            # Any request happening right now will finish with the OLD
-            # engine, and the next request will get the NEW one.
+            # Atomic swap
             with self.engine_lock:
                 self.engine = new_engine
-                self.animal_to_idx = new_animal_map
-                self.feature_cols = new_feature_cols # Store for learn_animal
             
-            print(f"✅ Engine hot-reloaded. Total animals: {len(self.engine.animals)}")
+            print(f"✅ Engine hot-swap complete. Now serving {len(new_engine.animals)} animals.")
         except Exception as e:
-            print(f"❌ CRITICAL: Engine hot-reload FAILED: {e}")
-            # The service will continue to run with the old engine (if one exists)
-    
-    def create_initial_state(self):
-        """Creates a new game state. Must be called *after* engine is loaded."""
-        with self.engine_lock:
-            N = len(self.engine.animals)
-        
-        return {
-            'probabilities': torch.ones(N, dtype=torch.float32),
-            'rejected_mask': torch.zeros(N, dtype=torch.bool),
-            'answered_features': {},
-            'asked_features': [],
-            'rejected_animals': [],
-            'question_count': 0,
-            'middle_guess_made': False,
-            'discriminative_mode': False,
-            'discrimination_target': None
-        }
-    
-    def get_next_question(self, state):
-        with self.engine_lock:
-            # Ensure probabilities tensor is the right size, in case of hot-reload
-            if len(state['probabilities']) != len(self.engine.animals):
-                # This is a simple fix: just reset the state.
-                # A more complex fix would be to remap probabilities.
-                print("Engine size changed, resetting game state.")
-                state.update(self.create_initial_state())
+            print(f"❌ ERROR: Background reload failed: {e}")
 
-            probs = state['probabilities'] / (state['probabilities'].sum() + 1e-10)
-            
-            if state.get('discriminative_mode'):
-                target_idx = state.get('discrimination_target')
-                if target_idx is not None and target_idx < len(self.engine.animals):
-                    feature, question = self.engine.get_discriminative_question(
-                        target_idx, probs, state['asked_features'])
-                    if feature:
-                        return feature, question
-                state['discriminative_mode'] = False
-            
-            result = self.engine.select_question(
-                probs, 
-                state['asked_features'], 
-                state['question_count']
-            )
-            return result
+    def _migrate_state(self, game_state: dict, engine: AkinatorEngine) -> dict:
+        """
+        Ensures the game state tensors match the current engine's dimensions.
+        This is the core of the seamless "hot-swap".
+        """
+        current_n = len(engine.animals)
+        state_n = game_state.get('animal_count', 0)
         
-    def process_answer(self, state, feature, answer):
-        try:
-            # Must read feature_cols from self, not engine
-            feature_idx = self.feature_cols.index(feature)
-        except ValueError:
+        # If counts match, state is valid.
+        if state_n == current_n:
+            return game_state
+
+        print(f"🔄 Migrating session state from {state_n} to {current_n} animals.")
+        
+        # --- Migrate Probabilities ---
+        old_probs = game_state['probabilities']
+        new_probs = torch.ones(current_n, dtype=torch.float32)
+        
+        # Copy old probabilities
+        new_probs[:state_n] = old_probs
+        
+        # Fill new animals with a low-ish, normalized probability
+        # We use mean as a heuristic, but could be any small value
+        fill_prob = torch.mean(old_probs).item() if state_n > 0 else (1.0 / current_n)
+        new_probs[state_n:] = fill_prob
+        
+        # Re-normalize
+        game_state['probabilities'] = new_probs / new_probs.sum()
+        
+        # --- Migrate Rejected Mask ---
+        old_mask = game_state['rejected_mask']
+        new_mask = torch.zeros(current_n, dtype=torch.bool)
+        new_mask[:state_n] = old_mask
+        game_state['rejected_mask'] = new_mask
+        
+        # --- Update animal count ---
+        game_state['animal_count'] = current_n
+        
+        return game_state
+
+    # --- Public API Methods (Called by FastAPI) ---
+
+    def create_initial_state(self) -> dict:
+        """Creates a new game session state."""
+        with self.engine_lock:
+            engine = self.engine
+            n_animals = len(engine.animals)
+            
+            # Initial prior: uniform distribution
+            probabilities = torch.ones(n_animals, dtype=torch.float32) / n_animals
+            
+            state = {
+                'probabilities': probabilities,
+                'rejected_mask': torch.zeros(n_animals, dtype=torch.bool),
+                'asked_features': [],
+                'answered_features': {},
+                'question_count': 0,
+                'middle_guess_made': False,
+                'animal_count': n_animals  # CRITICAL: Stamp the state with animal count
+            }
             return state
-        
-        with self.engine_lock:
-            # Re-check tensor size
-            if len(state['probabilities']) != len(self.engine.animals):
-                print("Engine size changed, resetting game state.")
-                state.update(self.create_initial_state())
-                return state # Ask user to answer again
 
-            probs = state['probabilities'] / (state['probabilities'].sum() + 1e-10)
-            state['probabilities'] = self.engine.update(probs, feature_idx, answer)
-        
-        state['probabilities'][state['rejected_mask']] = 0.0
-        return state
-    
-    def should_make_guess(self, state):
-        """Determine if we should make a guess."""
+    def get_top_predictions(self, game_state: dict, n: int = 5) -> list[dict]:
+        """Gets top N predictions from a game state."""
+        # This function is read-only on the engine, but we acquire
+        # the lock to ensure we get a consistent engine and migrate
+        # the state *before* trying to read from it.
         with self.engine_lock:
-            # Re-check tensor size
-            if len(state['probabilities']) != len(self.engine.animals):
-                print("Engine size changed, resetting game state.")
-                state.update(self.create_initial_state())
-                return False, None, None
-
-            probs = state['probabilities'] / (state['probabilities'].sum() + 1e-10)
-            num_questions = len(state['answered_features'])
+            engine = self.engine
+            game_state = self._migrate_state(game_state, engine)
             
-            rejected_set = set(state.get('rejected_animals', []))
-            sorted_indices = torch.argsort(probs, descending=True)
+            probs = game_state['probabilities']
+            mask = game_state['rejected_mask']
             
-            top_idx, second_idx = None, None
-            top_prob, second_prob = 0.0, 0.0
+            # Apply rejected mask
+            probs[mask] = 0.0
             
-            for idx in sorted_indices:
-                idx_item = idx.item()
-                if idx_item >= len(self.engine.animals):
-                    continue # Index out of bounds (mid-reload)
-                
-                name = self.engine.animals[idx_item]
-                if name in rejected_set:
-                    continue
-                if top_idx is None:
-                    top_idx = idx_item
-                    top_prob = probs[idx].item()
-                elif second_idx is None:
-                    second_prob = probs[idx].item()
-                    break
+            sorted_probs, indices = torch.sort(probs, descending=True)
             
-            if top_idx is None:
-                return False, None, None
-            
-            animal_name = self.engine.animals[top_idx]
-            top_spec = self.engine.specificity[top_idx].item()
-            entropy = self.engine.entropy(probs).item()
-            ratio = top_prob / max(second_prob, 1e-12)
-        
-        # (Guessing logic remains outside the lock)
-        if not state['middle_guess_made'] and num_questions >= 4:
-            required_ratio = 6.0 if top_spec < 0.25 else 3.0
-            if (top_prob > 0.93 and ratio > required_ratio) or top_prob > 0.98:
-                state['middle_guess_made'] = True
-                state['discriminative_mode'] = True
-                state['discrimination_target'] = top_idx
-                return True, animal_name, "middle"
-        
-        if (top_prob > 0.96 and top_spec > 0.08) or entropy < 0.06 or num_questions >= 25:
-            return True, animal_name, "final"
-        
-        return False, None, None
-    
-    def reject_guess(self, state, animal_name):
-        # This function modifies the session 'state' and 'animal_to_idx',
-        # so it needs a lock for the read operation.
-        with self.engine_lock:
-            idx = self.animal_to_idx.get(animal_name.lower())
-        
-        if idx is not None:
-            if idx < len(state['rejected_mask']):
-                state['rejected_mask'][idx] = True
-                state['probabilities'][idx] = 0.0
-            
-            if animal_name not in state['rejected_animals']:
-                state['rejected_animals'].append(animal_name)
-        
-        return state
-    
-    def get_top_predictions(self, state, n=5):
-        """Get top N predictions adjusted by specificity."""
-        with self.engine_lock:
-            # Re-check tensor size
-            if len(state['probabilities']) != len(self.engine.animals):
-                print("Engine size changed, resetting game state.")
-                state.update(self.create_initial_state())
-            
-            probs = state['probabilities'] / (state['probabilities'].sum() + 1e-10)
-            rejected = set(state.get('rejected_animals', []))
-            
-            answered_count = max(1, len(state.get('answered_features', {})))
-            spec_influence = min(1.0, answered_count / 6.0)
-            
+            top_n = min(n, len(indices))
             results = []
-            k_scan = min(max(n * 3, 50), len(probs))
-            
-            if k_scan == 0:
-                return [] # Should not happen if state is valid
-
-            top_vals, top_idx = torch.topk(probs, k_scan)
-
-            for i in range(len(top_idx)):
-                idx_item = top_idx[i].item()
-                if idx_item >= len(self.engine.animals):
-                    continue # Index out of bounds (mid-reload)
-
-                name = self.engine.animals[idx_item]
-                if name in rejected:
-                    continue
-
-                prob = top_vals[i].item()
-                spec = self.engine.specificity[idx_item].item()
-                adjusted = prob * (1.0 + 0.8 * spec * spec_influence)
-
-                results.append((name, prob, adjusted))
-                if len(results) >= max(n, 10):
+            for i in range(top_n):
+                idx = indices[i].item()
+                prob = sorted_probs[i].item()
+                if prob < 0.001:
                     break
-        
-        results.sort(key=lambda x: x[2], reverse=True)
-        return [(name, prob) for name, prob, _ in results[:n]]
-    
-    def learn_animal(self, name, answered_features):
-        """
-        Learns an animal by saving to DB and triggering a background reload.
-        This no longer blocks the main thread.
-        """
-        name = name.strip().capitalize()
-        
-        # We must read self.feature_cols inside the lock
-        with self.engine_lock:
-            cols = self.feature_cols
-            
-        animal_data = {'animal_name': name}
-        for f in cols:
-            animal_data[f] = answered_features.get(f, np.nan)
+                results.append({
+                    'animal': engine.animals[idx],
+                    'probability': prob
+                })
+            return results
 
-        # 1. Persist to Supabase
-        status = persist_learned_animal(animal_data)
-        
-        # 2. Conditionally trigger a background reload in a new thread
-        #    so the HTTP request can return immediately.
-        if status == "inserted":
-            print(f"✅ New animal {name} saved. Triggering background engine reload.")
-            reload_thread = Thread(target=self.reload_engine, daemon=True)
-            reload_thread.start()
-        
-        elif status == "suggestion_inserted":
-            print(f"✅ Suggestion for {name} saved. Engine not modified.")
+    def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
+        """Determines if the engine should make a guess."""
+        with self.engine_lock:
+            engine = self.engine
+            game_state = self._migrate_state(game_state, engine)
             
-        else: # status == "error"
-            print(f"Skipping engine reload for {name} due to DB error.")
+            q_count = game_state['question_count']
+            probs = game_state['probabilities']
+            mask = game_state['rejected_mask']
+            probs[mask] = 0.0 # Apply mask
+            
+            top_prob, top_idx = torch.max(probs, dim=0)
+            top_animal = engine.animals[top_idx.item()]
+            
+            # Final guess conditions
+            if top_prob > 0.8 and q_count > 5:
+                return True, top_animal, 'final'
+            if top_prob > 0.95 and q_count > 2:
+                return True, top_animal, 'final'
+            if q_count >= 20: # Max questions
+                return True, top_animal, 'final'
+
+            # Middle guess ("sneaky guess") condition
+            if (
+                q_count in [5, 10, 15] and 
+                top_prob > 0.3 and 
+                not game_state['middle_guess_made']
+            ):
+                game_state['middle_guess_made'] = True # Mutates state
+                return True, top_animal, 'middle'
+                
+            return False, None, None
+
+    def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
+        """Gets the next best question, returns (feature, question, modified_state)."""
+        with self.engine_lock:
+            engine = self.engine
+            game_state = self._migrate_state(game_state, engine)
+
+            prior = game_state['probabilities'].clone()
+            prior[game_state['rejected_mask']] = 0.0
+            prior = prior / (prior.sum() + 1e-10)
+            
+            asked = game_state['asked_features']
+            q_count = game_state['question_count']
+            
+            # 1. Try to find a discriminative question
+            top_prob, top_idx = torch.max(prior, dim=0)
+            if top_prob > 0.2:
+                feature, q = engine.get_discriminative_question(top_idx, prior, asked)
+                if feature:
+                    return feature, q, game_state
+
+            # 2. If not, find the max info-gain question
+            feature, q = engine.select_question(prior, asked, q_count)
+            return feature, q, game_state
+
+    def process_answer(self, game_state: dict, feature: str, answer: str) -> dict:
+        """Updates game state based on an answer."""
+        with self.engine_lock:
+            engine = self.engine
+            game_state = self._migrate_state(game_state, engine)
+            
+            if feature not in engine.feature_cols:
+                print(f"Warning: Feature '{feature}' not in engine. Skipping update.")
+                return game_state
+                
+            feature_idx = engine.feature_cols.index(feature)
+            
+            prior = game_state['probabilities'].clone()
+            prior[game_state['rejected_mask']] = 0.0
+            prior = prior / (prior.sum() + 1e-10) # Re-normalize
+            
+            posterior = engine.update(prior, feature_idx, answer)
+            game_state['probabilities'] = posterior
+            
+            return game_state
+
+    def reject_guess(self, game_state: dict, animal_name: str) -> dict:
+        """Marks an animal as rejected in the game state."""
+        with self.engine_lock:
+            engine = self.engine
+            game_state = self._migrate_state(game_state, engine)
+            
+            try:
+                # Find index of animal in the *current* engine
+                idx = np.where(engine.animals == animal_name)[0][0]
+                game_state['rejected_mask'][idx] = True
+                game_state['probabilities'][idx] = 0.0 # Zero out prob
+                
+                # Re-normalize probabilities
+                total = game_state['probabilities'].sum()
+                if total > 1e-10:
+                    game_state['probabilities'] = game_state['probabilities'] / total
+                
+            except IndexError:
+                print(f"Warning: Could not reject '{animal_name}', not found in engine.")
+                
+            return game_state
+
+    def learn_animal(self, animal_name: str, answered_features: dict) -> str:
+        """
+        Persists a new animal to the database and triggers a
+        non-blocking background reload of the engine.
+        """
+        animal_data = answered_features.copy()
+        animal_data['animal_name'] = animal_name
+        
+        # Persist to DB
+        result = db.persist_learned_animal(animal_data)
+        
+        # Trigger background reload ONLY if it was a new animal
+        if result == "inserted":
+            print("New animal inserted. Triggering background engine reload...")
+            # Run the reload in a new thread so it doesn't block
+            # the API response.
+            threading.Thread(target=self._background_reload, daemon=True).start()
+        
+        return result
