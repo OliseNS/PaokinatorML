@@ -194,12 +194,40 @@ class AkinatorEngine:
 
     def select_question(self, prior, asked, question_count):
         """Select most informative question."""
+
         all_available = [i for i, f in enumerate(self.feature_cols)
                          if f not in asked and (i in self.allowed_feature_indices)]
         if not all_available:
             return None, None
         
-        MAX_FEATURES_TO_CHECK = 30
+        if question_count == 0:
+            available_with_gains = []
+            for idx in all_available:
+                feature = self.feature_cols[idx]
+                gain = self.feature_importance.get(feature, 0.0)
+                if gain > 0:
+                    available_with_gains.append((gain, idx, feature))
+            
+            if not available_with_gains:
+                return self.select_question(prior, asked, 1) 
+
+            available_with_gains.sort(key=lambda x: x[0], reverse=True)
+            
+            top_n = min(5, len(available_with_gains))
+            chosen_idx_in_list = np.random.randint(top_n)
+            
+            _, best_idx, best_feature = available_with_gains[chosen_idx_in_list]
+            
+            question = self.questions_map.get(best_feature, f"Does it have {best_feature.replace('_', ' ')}?")
+            return best_feature, question
+
+        # --- DYNAMIC FEATURE CHECKING ---
+        if question_count < 5:
+            MAX_FEATURES_TO_CHECK = 15
+        else:
+            MAX_FEATURES_TO_CHECK = 30
+        # --- END DYNAMIC CHECKING ---
+            
         if len(all_available) > MAX_FEATURES_TO_CHECK:
             sampled_indices_map = {
                 new_idx: old_idx for new_idx, old_idx in enumerate(
@@ -214,10 +242,8 @@ class AkinatorEngine:
         gains_tensor = self.info_gain_batch(prior, available_features_to_check)
         sorted_indices_of_gains = torch.argsort(gains_tensor, descending=True)
 
-        if question_count == 0:
-            top_n = min(5, len(sorted_indices_of_gains))
-            chosen_local_idx = sorted_indices_of_gains[np.random.randint(top_n)]
-        elif question_count < 5:
+        # Note: We removed the `if question_count == 0` block from here
+        if question_count < 5:
             top_n = min(3, len(sorted_indices_of_gains))
             chosen_local_idx = sorted_indices_of_gains[np.random.randint(top_n)]
         else:
@@ -228,7 +254,6 @@ class AkinatorEngine:
         feature = self.feature_cols[idx]
         question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
         return feature, question
-    
     def get_discriminative_question(self, top_idx, prior, asked):
         """Find question that best separates top candidate from others."""
         top_prob = prior[top_idx].item()
