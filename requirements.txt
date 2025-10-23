@@ -1,0 +1,19 @@
+# Flask Web Server
+flask
+gunicorn
+
+# Configuration
+python-dotenv
+
+# Database & Caching
+supabase
+redis
+
+# ML & Data
+pandas
+numpy
+torch
+
+# Fast Serialization
+msgpack
+msgpack-numpy
