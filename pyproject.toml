@@ -1,0 +1,23 @@
+[project]
+name = "paokinator-ml"
+version = "0.1.0"
+description = "Paokinator ML Service"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "redis",
+    "supabase",
+    "python-dotenv",
+    "pandas",
+    "numpy",
+    "torch",
+    "msgpack",
+    "msgpack-numpy",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
