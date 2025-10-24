@@ -257,7 +257,7 @@ class AkinatorService:
                 # Find index of animal in the *current* engine
                 idx = np.where(engine.animals == animal_name)[0][0]
                 game_state['rejected_mask'][idx] = True
-                game_state['probabilities'][idx] = 0.0 # Zero out prob
+                game_state['probabilities'][idx] = 0.0 
                 
                 # Re-normalize probabilities
                 total = game_state['probabilities'].sum()
@@ -280,12 +280,12 @@ class AkinatorService:
         # Persist to DB
         result = db.persist_learned_animal(animal_data)
         
-        # Trigger background reload ONLY if it was a new animal
-        if result == "inserted":
-            print("New animal inserted. Triggering background engine reload...")
-            # Run the reload in a new thread so it doesn't block
-            # the API response.
-            # --- MODIFICATION: Added daemon=True ---
-            threading.Thread(target=self._background_reload, daemon=True).start()
-        
         return result
+
+    def start_engine_reload(self):
+        """
+        Starts a background engine reload in a separate thread.
+        This is the public method called by the admin endpoint.
+        """
+        import threading
+        threading.Thread(target=self._background_reload, daemon=True).start()

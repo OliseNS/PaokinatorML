@@ -237,22 +237,14 @@ class AkinatorEngine:
                 
                 feature = self.feature_cols[chosen_global_idx]
                 question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
-                return feature, question
-        # --- END OPTIMIZATION 1 ---
-
-        # Find all features that are allowed AND haven't been asked
+     
         all_available_indices = [i for i, f in enumerate(self.feature_cols)
                                  if f not in asked and (i in self.allowed_feature_indices)]
         if not all_available_indices:
             return None, None
         
-        # --- START MODIFICATION ---
-        
-        # --- OPTIMIZATION 2: Use *top* global features for Q1-Q4 ---
-        if question_count < 5:  # For Q1, Q2, Q3, Q4
             MAX_FEATURES_TO_CHECK = 15
             
-            # Get the intersection of top global features and available features
             available_set = set(all_available_indices)
             top_available_features = [
                 idx for idx in self.sorted_initial_feature_indices

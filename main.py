@@ -21,6 +21,10 @@ class AnswerPayload(BaseModel):
 class RejectPayload(BaseModel):
     animal_name: str
 
+# --- NEW: Model for confirming a win ---
+class WinPayload(BaseModel):
+    animal_name: str
+
 class LearnPayload(BaseModel):
     animal_name: str
 
@@ -167,6 +171,12 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
     # Handle sneaky guess
     if feature == 'sneaky_guess':
         if client_answer in ['yes', 'y', 'usually']:
+            
+            # --- MODIFICATION: Save data on successful sneaky guess ---
+            answered_features = game_state['answered_features']
+            srv.learn_animal(payload.animal_name, answered_features)
+            # --- END MODIFICATION ---
+
             db.delete_session(session_id)
             return {
                 'status': 'guess_correct',
@@ -233,6 +243,35 @@ async def reject_animal(session_id: str, payload: RejectPayload):
         'animal': payload.animal_name,
         'top_predictions': srv.get_top_predictions(game_state, n=5)
     }
+
+
+# --- NEW ENDPOINT: /win ---
+@app.post("/win/{session_id}", summary="Confirm a final guess")
+async def confirm_win(session_id: str, payload: WinPayload):
+    """
+    Confirms the engine's final guess was correct.
+    This saves the session data as a suggestion.
+    """
+    srv = get_service()
+    game_state = db.get_session(session_id)
+    if not game_state:
+        raise HTTPException(status_code=404, detail="Session expired or not found")
+    
+    # Get the features from this successful game
+    answered_features = game_state['answered_features']
+    
+    # Save the data. This will go to 'animalsuggest'
+    # because the animal already exists.
+    srv.learn_animal(payload.animal_name, answered_features)
+    
+    # Clean up the session
+    db.delete_session(session_id)
+    
+    return {
+        'status': 'win_confirmed',
+        'animal': payload.animal_name
+    }
+# --- END NEW ENDPOINT ---
 
 
 @app.post("/learn/{session_id}", summary="Learn a new animal")
@@ -304,12 +343,14 @@ async def trigger_reload(reload_token: str = Header(..., alias="X-Reload-Token")
         raise HTTPException(status_code=503, detail="Reload endpoint is not configured")
         
     if reload_token != config.RELOAD_SECRET_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid or missing reload token")
+        raise HTTPException(status_code=43, detail="Invalid or missing reload token")
     
     srv = get_service()
         
     try:
+        # Start the background engine reload
         srv.start_engine_reload()
+
         return {
             "status": "ok",
             "message": "Engine reload process started in background."
@@ -318,13 +359,11 @@ async def trigger_reload(reload_token: str = Header(..., alias="X-Reload-Token")
         print(f"ERROR: /admin/reload failed to start: {e}")
         raise HTTPException(status_code=500, detail="Failed to start reload process")
 
-# --- Run Server ---
-
 if __name__ == "__main__":
     print("Starting server with uvicorn...")
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=config.PORT, 
-        reload=True # Enable auto-reload for development
+        reload=False # Enable auto-reload for development
     )
