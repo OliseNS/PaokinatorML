@@ -968,9 +968,6 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"] },
 ]
 
-[package.metadata.requires-dev]
-dev = []
-
 [[package]]
 name = "postgrest"
 version = "2.22.1"

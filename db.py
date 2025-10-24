@@ -17,9 +17,9 @@ m.patch()
 # --- Initialize Clients ---
 try:
     supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-    print("✅ Connected to Supabase")
+    print("SUCCESS: Connected to Supabase")
 except Exception as e:
-    print(f"❌ ERROR: Could not connect to Supabase: {e}")
+    print(f"ERROR: Could not connect to Supabase: {e}")
     supabase = None
 
 try:
@@ -30,9 +30,9 @@ try:
         decode_responses=False  # We will use msgpack, so we need bytes
     )
     redis_client.ping()
-    print("✅ Connected to Redis")
+    print("SUCCESS: Connected to Redis")
 except Exception as e:
-    print(f"❌ ERROR: Could not connect to Redis: {e}")
+    print(f"ERROR: Could not connect to Redis: {e}")
     redis_client = None
 
 
@@ -136,7 +136,7 @@ def load_data_from_supabase() -> tuple[pd.DataFrame, list]:
         df = pd.DataFrame(data.data)
         
         if df.empty or 'animal_name' not in df.columns:
-            print("⚠️ No data found in Supabase. Using dummy data.")
+            print("WARNING: No data found in Supabase. Using dummy data.")
             df = pd.DataFrame({
                 'animal_name': ['Dog', 'Cat'],
                 'has_fur': [1.0, 1.0],
@@ -156,7 +156,7 @@ def load_data_from_supabase() -> tuple[pd.DataFrame, list]:
         return df, feature_cols
 
     except Exception as e:
-        print(f"❌ CRITICAL: Failed to load data from Supabase: {e}")
+        print(f"CRITICAL: Failed to load data from Supabase: {e}")
         raise
 
 def persist_learned_animal(animal_data: dict) -> str:
