@@ -10,6 +10,9 @@ PORT = int(os.getenv("PORT", 8000)) # Default to 8000 for FastAPI
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# --- Admin ---
+RELOAD_SECRET_TOKEN = os.getenv("RELOAD_SECRET_TOKEN")
+
 # --- Redis ---
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
