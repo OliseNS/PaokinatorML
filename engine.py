@@ -241,34 +241,58 @@ class AkinatorEngine:
         # --- END OPTIMIZATION 1 ---
 
         # Find all features that are allowed AND haven't been asked
-        all_available = [i for i, f in enumerate(self.feature_cols)
-                         if f not in asked and (i in self.allowed_feature_indices)]
-        if not all_available:
+        all_available_indices = [i for i, f in enumerate(self.feature_cols)
+                                 if f not in asked and (i in self.allowed_feature_indices)]
+        if not all_available_indices:
             return None, None
         
-        # --- OPTIMIZATION 2: Dynamic feature check limit ---
-        # Check fewer features for Q1-Q4 when N_active is still large
-        if question_count < 3:    # For Q1, Q2
+        # --- START MODIFICATION ---
+        
+        # --- OPTIMIZATION 2: Use *top* global features for Q1-Q4 ---
+        if question_count < 5:  # For Q1, Q2, Q3, Q4
             MAX_FEATURES_TO_CHECK = 15
-        elif question_count < 5:  # For Q3, Q4
-            MAX_FEATURES_TO_CHECK = 25
-        else:
-            MAX_FEATURES_TO_CHECK = 30 # Back to normal
-        # --- END OPTIMIZATION 2 ---
-        
-        if len(all_available) > MAX_FEATURES_TO_CHECK:
-            # Sample from the available features
+            
+            # Get the intersection of top global features and available features
+            available_set = set(all_available_indices)
+            top_available_features = [
+                idx for idx in self.sorted_initial_feature_indices
+                if idx in available_set
+            ][:MAX_FEATURES_TO_CHECK]
+
+            # Fallback if intersection is empty (unlikely but safe)
+            if not top_available_features:
+                print(f"Warning: Q{question_count} falling back to random sample.")
+                top_available_features = np.random.choice(
+                    all_available_indices, 
+                    min(len(all_available_indices), MAX_FEATURES_TO_CHECK), 
+                    replace=False
+                ).tolist()
+            
+            available_features_to_check = top_available_features
+            # Create the map for index lookup after batching
             sampled_indices_map = {
-                new_idx: old_idx for new_idx, old_idx in enumerate(
-                    np.random.choice(all_available, MAX_FEATURES_TO_CHECK, replace=False)
-                )
+                new_idx: old_idx for new_idx, old_idx in enumerate(available_features_to_check)
             }
-            available_features_to_check = list(sampled_indices_map.values())
+
         else:
-            sampled_indices_map = {idx: old_idx for idx, old_idx in enumerate(all_available)}
-            available_features_to_check = all_available
+            # --- This is the OLD logic, which is fine for later questions ---
+            MAX_FEATURES_TO_CHECK = 30 # Back to normal
+            
+            if len(all_available_indices) > MAX_FEATURES_TO_CHECK:
+                # Sample from the available features
+                sampled_indices_map = {
+                    new_idx: old_idx for new_idx, old_idx in enumerate(
+                        np.random.choice(all_available_indices, MAX_FEATURES_TO_CHECK, replace=False)
+                    )
+                }
+                available_features_to_check = list(sampled_indices_map.values())
+            else:
+                sampled_indices_map = {idx: old_idx for idx, old_idx in enumerate(all_available_indices)}
+                available_features_to_check = all_available_indices
         
-        # This now runs on a smaller set (15 or 25) for the slow questions
+        # --- END MODIFICATION ---
+        
+        # This now runs on a smaller, higher-quality set for Q1-Q4
         gains_tensor = self.info_gain_batch(prior, available_features_to_check)
         sorted_indices_of_gains = torch.argsort(gains_tensor, descending=True)
 
@@ -314,3 +338,4 @@ class AkinatorEngine:
             return feature, question
 
         return None, None
+

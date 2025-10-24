@@ -131,7 +131,7 @@ class AkinatorService:
             engine = self.engine
             game_state = self._migrate_state(game_state, engine)
             
-            probs = game_state['probabilities']
+            probs = game_state['probabilities'].clone() # Clone to avoid mutation
             mask = game_state['rejected_mask']
             
             # Apply rejected mask
@@ -159,29 +159,46 @@ class AkinatorService:
             game_state = self._migrate_state(game_state, engine)
             
             q_count = game_state['question_count']
-            probs = game_state['probabilities']
+            probs = game_state['probabilities'].clone() # Clone to avoid mutation
             mask = game_state['rejected_mask']
             probs[mask] = 0.0 # Apply mask
             
+            # --- START MODIFICATION ---
+            
+            # Find top TWO probabilities
             top_prob, top_idx = torch.max(probs, dim=0)
             top_animal = engine.animals[top_idx.item()]
+            top_prob_val = top_prob.item()
             
-            # Final guess conditions
-            if top_prob > 0.8 and q_count > 5:
-                return True, top_animal, 'final'
-            if top_prob > 0.95 and q_count > 2:
-                return True, top_animal, 'final'
-            if q_count >= 20: # Max questions
-                return True, top_animal, 'final'
-
-            # Middle guess ("sneaky guess") condition
+            # Temporarily zero out the top one to find the second
+            probs[top_idx] = 0.0
+            second_prob_val = torch.max(probs, dim=0)[0].item()
+            
+            # Calculate confidence ratio
+            confidence_ratio = top_prob_val / (second_prob_val + 1e-9) # Add epsilon for safety
+            
+            # --- LOGIC RE-ORDERING ---
+            # 1. Check for Middle guess ("sneaky guess") condition FIRST
             if (
                 q_count in [5, 10, 15] and 
-                top_prob > 0.3 and 
+                top_prob_val > 0.3 and  # Use the value we already calculated
                 not game_state['middle_guess_made']
             ):
                 game_state['middle_guess_made'] = True # Mutates state
                 return True, top_animal, 'middle'
+                
+            # 2. Check for Final guess conditions SECOND
+            # We now check *both* absolute prob and relative ratio
+            if (top_prob_val > 0.7 and confidence_ratio > 5.0 and q_count > 5):
+                # e.g., P(A) = 0.7, P(B) = 0.13 -> ratio = 5.3 (Guess)
+                return True, top_animal, 'final'
+            if (top_prob_val > 0.5 and confidence_ratio > 10.0 and q_count > 8):
+                # e.g., P(A) = 0.5, P(B) = 0.04 -> ratio = 12.5 (Guess)
+                return True, top_animal, 'final'
+            if q_count >= 20: # Max questions
+                return True, top_animal, 'final'
+            
+            # --- END MODIFICATION ---
                 
             return False, None, None
 
@@ -268,6 +285,7 @@ class AkinatorService:
             print("New animal inserted. Triggering background engine reload...")
             # Run the reload in a new thread so it doesn't block
             # the API response.
+            # --- MODIFICATION: Added daemon=True ---
             threading.Thread(target=self._background_reload, daemon=True).start()
         
         return result
