@@ -311,7 +311,10 @@ class AkinatorEngine:
         return feature, question
     
     def get_discriminative_question(self, top_idx, prior, asked):
-        """Find question that best separates top candidate from others."""
+        """
+        Find question that best separates top candidate from others.
+        OPTIMIZED: Only searches allowed and un-asked features.
+        """
         top_prob = prior[top_idx].item()
         similar_mask = (prior > top_prob * 0.1)
         similar_mask[top_idx] = False
@@ -320,17 +323,35 @@ class AkinatorEngine:
         if len(similar_indices) == 0:
             return None, None
         
+        # --- START OPTIMIZATION ---
+        
+        # 1. Find all available feature indices
+        available_indices = [
+            i for i, f in enumerate(self.feature_cols)
+            if f not in asked and (i in self.allowed_feature_indices)
+        ]
+        if not available_indices:
+            return None, None
+        
+        # 2. Perform diff calculation (this is fast)
         top_features = self.features[top_idx]
         similar_features = self.features[similar_indices]
         diffs = torch.abs(top_features.unsqueeze(0) - similar_features)
         avg_diffs = torch.nanmean(diffs, dim=0)
         
-        avg_diffs[torch.isnan(top_features)] = 0.0
-        for i, feat in enumerate(self.feature_cols):
-            if feat in asked:
-                avg_diffs[i] = 0.0
+        # 3. Create a mask to filter for *only* available features
+        # Set unavailable/disallowed features to a very low value (-1)
+        # so they are never chosen.
+        mask = torch.full_like(avg_diffs, -1.0)
+        mask[available_indices] = avg_diffs[available_indices]
         
-        best_diff, best_idx = torch.max(avg_diffs, dim=0)
+        # 4. Also mask out NaNs from the top animal's features
+        mask[torch.isnan(top_features)] = -1.0
+        
+        # 5. Find the max *from the masked tensor*
+        best_diff, best_idx = torch.max(mask, dim=0)
+        
+        # --- END OPTIMIZATION ---
         
         if best_diff.item() > 0.3:
             feature = self.feature_cols[best_idx.item()]
@@ -338,4 +359,3 @@ class AkinatorEngine:
             return feature, question
 
         return None, None
-
