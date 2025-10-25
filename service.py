@@ -21,6 +21,10 @@ class AkinatorService:
         self.engine_lock = threading.Lock()
         self.questions_map = self._load_questions(questions_path)
         
+        # Performance caches
+        self._prediction_cache = {}  # Cache for top predictions
+        self._cache_lock = threading.Lock()
+        
         # Load the engine blocking on the first startup
         self.engine = self._create_engine()
         print(f"✅ Service initialized with {len(self.engine.animals)} animals.")
@@ -100,6 +104,14 @@ class AkinatorService:
         
         return game_state
 
+    def _get_state_key(self, game_state: dict, n: int) -> str:
+        """Create a cache key for the game state."""
+        # Create a hashable key from the state
+        probs_hash = hash(tuple(game_state['probabilities'].tolist()))
+        mask_hash = hash(tuple(game_state['rejected_mask'].tolist()))
+        asked_hash = hash(tuple(sorted(game_state['asked_features'])))
+        return f"{probs_hash}_{mask_hash}_{asked_hash}_{n}"
+
     # --- Public API Methods (Called by FastAPI) ---
 
     def create_initial_state(self) -> dict:
@@ -123,7 +135,15 @@ class AkinatorService:
             return state
 
     def get_top_predictions(self, game_state: dict, n: int = 5) -> list[dict]:
-        """Gets top N predictions from a game state."""
+        """Gets top N predictions from a game state with caching."""
+        # Create cache key based on state
+        state_key = self._get_state_key(game_state, n)
+        
+        # Check cache first
+        with self._cache_lock:
+            if state_key in self._prediction_cache:
+                return self._prediction_cache[state_key]
+        
         # This function is read-only on the engine, but we acquire
         # the lock to ensure we get a consistent engine and migrate
         # the state *before* trying to read from it.
@@ -150,6 +170,17 @@ class AkinatorService:
                     'animal': engine.animals[idx],
                     'probability': prob
                 })
+            
+            # Cache the results
+            with self._cache_lock:
+                self._prediction_cache[state_key] = results
+                # Limit cache size to prevent memory issues
+                if len(self._prediction_cache) > 1000:
+                    # Remove oldest entries (simple FIFO)
+                    oldest_keys = list(self._prediction_cache.keys())[:100]
+                    for key in oldest_keys:
+                        del self._prediction_cache[key]
+            
             return results
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
@@ -214,6 +245,12 @@ class AkinatorService:
             
             asked = game_state['asked_features']
             q_count = game_state['question_count']
+            
+            # Optimization: Use cached uniform prior for Q0
+            if q_count == 0 and hasattr(engine, '_uniform_prior') and engine._uniform_prior is not None:
+                # For Q0, we can use the precomputed uniform prior directly
+                feature, q = engine.select_question(engine._uniform_prior, asked, q_count)
+                return feature, q, game_state
             
             # 1. Try to find a discriminative question
             top_prob, top_idx = torch.max(prior, dim=0)

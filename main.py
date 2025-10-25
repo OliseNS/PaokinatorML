@@ -1,7 +1,10 @@
 import uvicorn
 import uuid
 import time
-from fastapi import FastAPI, HTTPException, Request, Header
+import gzip
+import json
+from fastapi import FastAPI, HTTPException, Request, Header, Response
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
@@ -41,7 +44,14 @@ async def lifespan(app: FastAPI):
     print("FastAPI server starting up...")
     try:
         service = AkinatorService(config.QUESTIONS_PATH)
-        print("✅ FastAPI startup complete, AkinatorService is loaded.")
+        
+        # Warmup: Precompute initial state and first question
+        print("🔥 Warming up engine for instant responses...")
+        initial_state = service.create_initial_state()
+        service.get_next_question(initial_state)  # Precompute first question
+        service.get_top_predictions(initial_state, n=5)  # Precompute predictions
+        
+        print("✅ FastAPI startup complete, AkinatorService is loaded and warmed up.")
     except Exception as e:
         print(f"❌ CRITICAL: Failed to initialize AkinatorService. Server cannot start.")
         print(f"Error: {e}")
@@ -59,6 +69,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan  # Set the lifespan handler
 )
+
+# Add GZip compression middleware for faster responses
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # --- Middleware for logging ---
 @app.middleware("http")
@@ -311,9 +324,15 @@ async def get_stats():
     with srv.engine_lock:
         total_animals = len(srv.engine.animals)
     
+    # Get cache statistics
+    with srv._cache_lock:
+        cache_size = len(srv._prediction_cache)
+    
     return {
         'active_sessions': active_sessions,
-        'total_animals': total_animals
+        'total_animals': total_animals,
+        'prediction_cache_size': cache_size,
+        'engine_optimized': hasattr(srv.engine, '_question_cache') and len(srv.engine._question_cache) > 0
     }
 
 
@@ -329,6 +348,38 @@ async def get_predictions(session_id: str):
     
     top_predictions = srv.get_top_predictions(game_state, n=10)
     return {'top_predictions': top_predictions}
+
+
+@app.get("/performance", summary="Get performance metrics")
+async def get_performance():
+    """
+    Returns performance metrics and optimization status.
+    """
+    srv = get_service()
+    
+    with srv.engine_lock:
+        engine = srv.engine
+        has_cache = hasattr(engine, '_question_cache') and len(engine._question_cache) > 0
+        has_uniform_prior = hasattr(engine, '_uniform_prior') and engine._uniform_prior is not None
+        sorted_features_count = len(engine.sorted_initial_feature_indices)
+    
+    with srv._cache_lock:
+        cache_size = len(srv._prediction_cache)
+    
+    return {
+        'optimizations': {
+            'question_cache_enabled': has_cache,
+            'uniform_prior_cached': has_uniform_prior,
+            'precomputed_features': sorted_features_count,
+            'prediction_cache_size': cache_size
+        },
+        'performance_tips': [
+            "Q0 questions are precomputed for instant response",
+            "Top predictions are cached for faster subsequent requests",
+            "GZip compression is enabled for smaller responses",
+            "Engine is warmed up on startup for optimal performance"
+        ]
+    }
 
 # --- NEW: Admin Endpoint ---
 
