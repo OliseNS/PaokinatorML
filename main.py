@@ -109,7 +109,11 @@ async def get_question(session_id: str):
     """
     Fetches the next question for the given session.
     This endpoint will also return a guess if the engine is confident.
+    OPTIMIZED for sub-100ms response times.
     """
+    import time
+    request_start = time.time()
+    
     srv = get_service()
     game_state = db.get_session(session_id)
     if not game_state:
@@ -124,6 +128,8 @@ async def get_question(session_id: str):
         db.set_session(session_id, game_state)
         
         if guess_type == 'final':
+            elapsed = (time.time() - request_start) * 1000
+            print(f"🎯 Final guess served in {elapsed:.2f}ms")
             return {
                 'should_guess': True,
                 'guess': guess_animal,
@@ -134,6 +140,8 @@ async def get_question(session_id: str):
         # Middle guess (sneaky guess)
         q_num = game_state['question_count'] 
         top_pred = srv.get_top_predictions(game_state, n=1)
+        elapsed = (time.time() - request_start) * 1000
+        print(f"🎯 Middle guess served in {elapsed:.2f}ms")
         return {
             'should_guess': False,
             'question': f"Is it a/an {guess_animal}?",
@@ -149,6 +157,8 @@ async def get_question(session_id: str):
     db.set_session(session_id, game_state) 
 
     if not feature or not question:
+        elapsed = (time.time() - request_start) * 1000
+        print(f"❌ No question available in {elapsed:.2f}ms")
         return {
             'question': None,
             'feature': None,
@@ -157,6 +167,9 @@ async def get_question(session_id: str):
     
     q_num = game_state['question_count'] + 1  # Add 1 to start from Q1
     top_pred = srv.get_top_predictions(game_state, n=1)
+    
+    elapsed = (time.time() - request_start) * 1000
+    print(f"❓ Q{q_num} question served in {elapsed:.2f}ms")
     
     return {
         'question': question,

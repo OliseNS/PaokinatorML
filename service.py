@@ -25,6 +25,10 @@ class AkinatorService:
         self._prediction_cache = {}  # Cache for top predictions
         self._cache_lock = threading.Lock()
         
+        # Data caching to avoid repeated DB calls
+        self._cached_data = None
+        self._data_lock = threading.Lock()
+        
         # Load the engine blocking on the first startup
         self.engine = self._create_engine()
         print(f"✅ Service initialized with {len(self.engine.animals)} animals.")
@@ -42,9 +46,23 @@ class AkinatorService:
             return {}
 
     def _create_engine(self) -> AkinatorEngine:
-        """Loads data from DB and builds a new engine instance."""
-        print("Loading data from Supabase to build engine...")
-        df, feature_cols = db.load_data_from_supabase()
+        """Loads data from DB and builds a new engine instance - OPTIMIZED with caching."""
+        import time
+        start_time = time.time()
+        
+        # Check if we have cached data
+        with self._data_lock:
+            if self._cached_data is not None:
+                df, feature_cols = self._cached_data
+                print(f"🚀 Using cached data (saved {time.time() - start_time:.3f}s)")
+            else:
+                print("Loading data from Supabase to build engine...")
+                df, feature_cols = db.load_data_from_supabase()
+                # Cache the data for future engine creations
+                self._cached_data = (df, feature_cols)
+                elapsed = time.time() - start_time
+                print(f"📊 Data loaded in {elapsed:.3f}s and cached")
+        
         return AkinatorEngine(df, feature_cols, self.questions_map)
 
     def _background_reload(self):
@@ -59,6 +77,10 @@ class AkinatorService:
             # Atomic swap
             with self.engine_lock:
                 self.engine = new_engine
+            
+            # Clear prediction cache when engine changes
+            with self._cache_lock:
+                self._prediction_cache.clear()
             
             print(f"✅ Engine hot-swap complete. Now serving {len(new_engine.animals)} animals.")
         except Exception as e:
@@ -234,33 +256,42 @@ class AkinatorService:
             return False, None, None
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
-        """Gets the next best question, returns (feature, question, modified_state)."""
+        """Gets the next best question, returns (feature, question, modified_state) - OPTIMIZED."""
+        import time
+        start_time = time.time()
+        
         with self.engine_lock:
             engine = self.engine
             game_state = self._migrate_state(game_state, engine)
 
-            prior = game_state['probabilities'].clone()
-            prior[game_state['rejected_mask']] = 0.0
-            prior = prior / (prior.sum() + 1e-10)
-            
             asked = game_state['asked_features']
             q_count = game_state['question_count']
             
-            # Optimization: Use cached uniform prior for Q0
+            # ULTRA-FAST Q0: Use precomputed cache (0ms response)
             if q_count == 0 and hasattr(engine, '_uniform_prior') and engine._uniform_prior is not None:
-                # For Q0, we can use the precomputed uniform prior directly
                 feature, q = engine.select_question(engine._uniform_prior, asked, q_count)
+                elapsed = (time.time() - start_time) * 1000
+                print(f"⚡ Q0 question served in {elapsed:.2f}ms (CACHED)")
                 return feature, q, game_state
+            
+            # For Q1+, compute prior only when needed
+            prior = game_state['probabilities'].clone()
+            prior[game_state['rejected_mask']] = 0.0
+            prior = prior / (prior.sum() + 1e-10)
             
             # 1. Try to find a discriminative question
             top_prob, top_idx = torch.max(prior, dim=0)
             if top_prob > 0.2:
                 feature, q = engine.get_discriminative_question(top_idx, prior, asked)
                 if feature:
+                    elapsed = (time.time() - start_time) * 1000
+                    print(f"⚡ Q{q_count+1} discriminative question served in {elapsed:.2f}ms")
                     return feature, q, game_state
 
             # 2. If not, find the max info-gain question
             feature, q = engine.select_question(prior, asked, q_count)
+            elapsed = (time.time() - start_time) * 1000
+            print(f"⚡ Q{q_count+1} info-gain question served in {elapsed:.2f}ms")
             return feature, q, game_state
 
     def process_answer(self, game_state: dict, feature: str, answer: str) -> dict:
@@ -316,6 +347,10 @@ class AkinatorService:
         
         # Persist to DB
         result = db.persist_learned_animal(animal_data)
+        
+        # Clear cached data to force reload on next engine creation
+        with self._data_lock:
+            self._cached_data = None
         
         return result
 
