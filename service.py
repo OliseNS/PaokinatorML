@@ -23,13 +23,7 @@ class AkinatorService:
         
         # Performance caches
         self._prediction_cache = {}  # Cache for top predictions
-        self._question_cache = {}    # Cache for common questions
         self._cache_lock = threading.Lock()
-        
-        # Data caching to avoid repeated DB calls
-        self._cached_data = None
-        self._data_cache_timestamp = 0
-        self._data_cache_ttl = 300  # 5 minutes
         
         # Load the engine blocking on the first startup
         self.engine = self._create_engine()
@@ -50,27 +44,8 @@ class AkinatorService:
     def _create_engine(self) -> AkinatorEngine:
         """Loads data from DB and builds a new engine instance."""
         print("Loading data from Supabase to build engine...")
-        df, feature_cols = self._get_cached_data()
-        return AkinatorEngine(df, feature_cols, self.questions_map)
-    
-    def _get_cached_data(self):
-        """Get data from cache or load from database with TTL."""
-        import time
-        current_time = time.time()
-        
-        # Check if cache is valid
-        if (self._cached_data is not None and 
-            current_time - self._data_cache_timestamp < self._data_cache_ttl):
-            print("📦 Using cached data (avoiding DB call)")
-            return self._cached_data
-        
-        # Load from database and cache
-        print("🔄 Loading fresh data from Supabase...")
         df, feature_cols = db.load_data_from_supabase()
-        self._cached_data = (df, feature_cols)
-        self._data_cache_timestamp = current_time
-        
-        return df, feature_cols
+        return AkinatorEngine(df, feature_cols, self.questions_map)
 
     def _background_reload(self):
         """
@@ -275,30 +250,10 @@ class AkinatorService:
             asked = game_state['asked_features']
             q_count = game_state['question_count']
             
-            # Check cache for common question patterns
-            cache_key = self._get_question_cache_key(asked, q_count)
-            with self._cache_lock:
-                if cache_key in self._question_cache:
-                    cached_result = self._question_cache[cache_key]
-                    if cached_result and cached_result[0] not in asked:
-                        print(f"🚀 Cache hit for question {q_count}")
-                        return cached_result[0], cached_result[1], game_state
-            
             # Optimization: Use precomputed uniform prior for Q0 (INSTANT)
             if q_count == 0 and hasattr(engine, '_uniform_prior') and engine._uniform_prior is not None:
                 # For Q0, use the precomputed uniform prior directly - NO CALCULATION
                 feature, q = engine.select_question(engine._uniform_prior, asked, q_count)
-                
-                # Cache the result
-                with self._cache_lock:
-                    self._question_cache[cache_key] = (feature, q)
-                    # Limit cache size
-                    if len(self._question_cache) > 500:
-                        # Remove oldest entries
-                        oldest_keys = list(self._question_cache.keys())[:100]
-                        for key in oldest_keys:
-                            del self._question_cache[key]
-                
                 return feature, q, game_state
             
             # 1. Try to find a discriminative question
@@ -306,24 +261,11 @@ class AkinatorService:
             if top_prob > 0.2:
                 feature, q = engine.get_discriminative_question(top_idx, prior, asked)
                 if feature:
-                    # Cache the result
-                    with self._cache_lock:
-                        self._question_cache[cache_key] = (feature, q)
                     return feature, q, game_state
 
             # 2. If not, find the max info-gain question
             feature, q = engine.select_question(prior, asked, q_count)
-            
-            # Cache the result
-            with self._cache_lock:
-                self._question_cache[cache_key] = (feature, q)
-            
             return feature, q, game_state
-    
-    def _get_question_cache_key(self, asked_features: list, question_count: int) -> str:
-        """Create a cache key for question patterns."""
-        asked_sorted = sorted(asked_features)
-        return f"q{question_count}_{hash(tuple(asked_sorted))}"
 
     def process_answer(self, game_state: dict, feature: str, answer: str) -> dict:
         """Updates game state based on an answer."""

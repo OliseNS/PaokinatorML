@@ -4,8 +4,8 @@ import torch
 
 class AkinatorEngine:
     """
-    Optimized PyTorch-based Akinator engine with FP16 (half precision).
-    Uses float16 for 50% memory reduction and better cache efficiency.
+    CPU-optimized PyTorch Akinator engine with enhanced accuracy.
+    Uses hybrid numpy/torch approach for maximum CPU performance.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -13,7 +13,7 @@ class AkinatorEngine:
         self.feature_cols = feature_cols
         self.questions_map = questions_map
 
-        # Use float32 for answer values (small array, needs precision)
+        # Core parameters
         self.answer_values = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0], dtype=torch.float32)
         self.definite_exp = -6.0
         self.uncertain_exp = -3.0
@@ -24,106 +24,112 @@ class AkinatorEngine:
             'no': 0.0, 'n': 0.0
         }
         
-        # Performance optimization caches
-        self._question_cache = {}  # Cache for precomputed questions
-        self._uniform_prior = None  # Precomputed uniform prior
         self.sorted_initial_feature_indices = []
+        self.feature_variance = None  # Cache for accuracy boost
         self._build_tensors()
         
     def _build_tensors(self):
-        """(Re)builds all tensors from the DataFrame using FP16."""
+        """Builds all tensors from the DataFrame - CPU optimized."""
+        print("[INFO] Building tensors...")
         self.animals = self.df['animal_name'].values
         
         features_np = self.df[self.feature_cols].values.astype(np.float32)
         
-        # Store features as float16 (half precision) - 50% memory savings
-        self.features = torch.from_numpy(features_np).half()
+        # Use float32 throughout for CPU efficiency
+        self.features = torch.from_numpy(features_np)
         self.nan_mask = torch.isnan(self.features)
         self.features_filled = torch.nan_to_num(self.features, nan=0.5)
         
-        self.specificity = self._compute_specificity_all()
+        # Cache variance for accuracy improvements
+        with torch.no_grad():
+            self.feature_variance = torch.nanmean(
+                (self.features - torch.nanmean(self.features, dim=0, keepdim=True)) ** 2, 
+                dim=0
+            )
+            self.feature_variance = torch.nan_to_num(self.feature_variance, nan=0.0)
         
-        # Feature-level heuristics (keep as float32 for stability)
-        try:
-            col_nan_frac = np.isnan(features_np).mean(axis=0)
-            col_var = np.nanvar(features_np, axis=0)
-        except Exception:
-            col_nan_frac = np.zeros(len(self.feature_cols))
-            col_var = np.ones(len(self.feature_cols))
+        # Feature-level heuristics
+        col_nan_frac = np.isnan(features_np).mean(axis=0)
+        col_var = np.nanvar(features_np, axis=0)
+        col_var = np.where(np.isnan(col_var), 0.0, col_var)
         
         self.allowed_feature_mask = (col_nan_frac < 0.8) & (col_var > 1e-4)
-        self.allowed_feature_indices = [i for i, ok in enumerate(self.allowed_feature_mask) if ok]
+        self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
-        # Pre-compute Q0 results and uniform prior (use float32 for precision)
-        try:
-            N = len(self.animals)
-            if N > 0 and len(self.allowed_feature_indices) > 0:
-                # Precompute uniform prior for instant Q0 access
-                self._uniform_prior = torch.ones(N, dtype=torch.float32) / float(N)
-                
-                gains = self.info_gain_batch(self._uniform_prior, self.allowed_feature_indices)
-                
-                self.feature_importance = {self.feature_cols[idx]: float(gains[i].item())
-                                           for i, idx in enumerate(self.allowed_feature_indices)}
-                
-                sorted_gains_indices = torch.argsort(gains, descending=True)
-                self.sorted_initial_feature_indices = [self.allowed_feature_indices[i.item()] for i in sorted_gains_indices]
-                
-                # Precompute Q0 questions for instant response
-                self._precompute_q0_questions()
-                
-            else:
-                self.feature_importance = {f: 0.0 for f in self.feature_cols}
-                self.sorted_initial_feature_indices = []
-                self._uniform_prior = None
-        except Exception as e:
-            print(f"Warning: failed computing feature importance: {e}")
+        print(f"[INFO] Total features: {len(self.feature_cols)}, Allowed: {len(self.allowed_feature_indices)}")
+        
+        # Pre-compute Q0 results using numpy for speed
+        N = len(self.animals)
+        if N > 0 and len(self.allowed_feature_indices) > 0:
+            print("[INFO] Computing initial feature rankings...")
+            uniform_prior_np = np.ones(N, dtype=np.float32) / N
+            gains = self._fast_info_gain_numpy(uniform_prior_np, self.allowed_feature_indices)
+            
+            self.feature_importance = {
+                self.feature_cols[idx]: float(gains[i])
+                for i, idx in enumerate(self.allowed_feature_indices)
+            }
+            
+            sorted_gains_indices = np.argsort(gains)[::-1]
+            self.sorted_initial_feature_indices = [
+                self.allowed_feature_indices[i] for i in sorted_gains_indices
+            ]
+            print(f"[OK] Feature rankings computed. Top feature: {self.feature_cols[self.sorted_initial_feature_indices[0]]}")
+        else:
+            print("[WARNING] No valid features found")
             self.feature_importance = {f: 0.0 for f in self.feature_cols}
             self.sorted_initial_feature_indices = []
-            self._uniform_prior = None
 
-    def _precompute_q0_questions(self):
-        """Precompute Q0 questions for instant response."""
-        if not self.sorted_initial_feature_indices:
-            return
-            
-        # Precompute top 20 Q0 questions for variety
-        top_20_features = self.sorted_initial_feature_indices[:20]
-        self._question_cache['q0_questions'] = []
+    def _fast_info_gain_numpy(self, prior_np, feature_indices):
+        """Fast info gain computation using numpy - for initialization only."""
+        curr_entropy = self._entropy_numpy(prior_np)
+        if curr_entropy < 0.01:
+            return np.zeros(len(feature_indices))
         
-        for idx in top_20_features:
-            feature = self.feature_cols[idx]
-            question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
-            self._question_cache['q0_questions'].append((feature, question))
+        features_np = self.features_filled.numpy()[:, feature_indices]
+        nan_mask_np = self.nan_mask.numpy()[:, feature_indices]
+        answer_values_np = self.answer_values.numpy()
         
-        print(f"✅ Precomputed {len(self._question_cache['q0_questions'])} Q0 questions for instant response")
-
-    def _compute_specificity_all(self):
-        """Compute specificity score for all animals (batched)."""
-        with torch.no_grad():
-            # Convert to float32 for exp/log operations
-            features_f32 = self.features_filled.float()
-            dists = torch.abs(features_f32.unsqueeze(-1) - self.answer_values.view(1, 1, -1))
-            nearest = torch.argmin(dists, dim=-1)
-            
-            A = len(self.answer_values)
-            one_hot = torch.nn.functional.one_hot(nearest, num_classes=A)
-            bins = one_hot.sum(dim=1).float()
-            
-            probs = bins / (bins.sum(dim=1, keepdim=True) + 1e-10)
-            probs_safe = torch.clamp(probs, min=1e-10)
-            entropy = -torch.sum(probs_safe * torch.log(probs_safe), dim=1)
-            max_entropy = np.log(len(self.answer_values))
-            
-            # Return as float16
-            return (entropy / (max_entropy + 1e-12)).half()
+        k = len(feature_indices)
+        A = len(answer_values_np)
+        
+        # Vectorized computation
+        dist = np.abs(features_np[:, :, None] - answer_values_np[None, None, :])
+        definite_mask = np.abs(answer_values_np - 0.5) > 0.3
+        
+        # Compute likelihoods
+        def_like = np.exp(self.definite_exp * dist)
+        def_like = np.where(dist > 0.7, def_like * 0.001, def_like)
+        def_like = np.where((dist > 0.3) & (dist <= 0.7), def_like * 0.2, def_like)
+        unc_like = np.exp(self.uncertain_exp * dist)
+        
+        likelihoods = np.where(definite_mask, def_like, unc_like)
+        likelihoods = np.where(nan_mask_np[:, :, None], 1.0, likelihoods)
+        likelihoods = np.clip(likelihoods, 0.0001, 1.0)
+        
+        # Compute expected entropy
+        prob_answer = np.einsum('n,nka->ka', prior_np, likelihoods)
+        posterior = prior_np[:, None, None] * likelihoods
+        posterior_sum = posterior.sum(axis=0, keepdims=True)
+        normalized_posterior = posterior / (posterior_sum + 1e-10)
+        
+        probs_safe = np.clip(normalized_posterior, 1e-10, 1.0)
+        posterior_entropy = -np.sum(probs_safe * np.log(probs_safe), axis=0)
+        expected_entropy = np.sum(prob_answer * posterior_entropy, axis=1)
+        
+        gains = curr_entropy - expected_entropy
+        return gains
+    
+    @staticmethod
+    def _entropy_numpy(probs):
+        """Fast numpy entropy calculation."""
+        probs_safe = np.clip(probs, 1e-10, 1.0)
+        return -np.sum(probs_safe * np.log(probs_safe))
 
     @staticmethod
     def calc_likelihood(feature_vec: torch.Tensor, target: float, 
                         definite_exp: float, uncertain_exp: float) -> torch.Tensor:
         """Calculate likelihood of answer given features."""
-        # Convert to float32 for exp operations (more stable)
-        feature_vec = feature_vec.float()
         dist = torch.abs(target - feature_vec)
         
         if abs(target - 0.5) > 0.3:
@@ -136,18 +142,10 @@ class AkinatorEngine:
         return torch.clamp(likelihood, 0.0001, 1.0)
     
     @staticmethod
-    @torch.jit.script
     def entropy(probs: torch.Tensor) -> torch.Tensor:
+        """Calculate entropy."""
         probs_safe = torch.clamp(probs, min=1e-10)
         return -torch.sum(probs_safe * torch.log(probs_safe))
-    
-    @staticmethod
-    @torch.jit.script
-    def fast_entropy(probs: torch.Tensor) -> torch.Tensor:
-        """Optimized entropy calculation for better performance."""
-        probs_safe = torch.clamp(probs, min=1e-10)
-        log_probs = torch.log(probs_safe)
-        return -torch.sum(probs_safe * log_probs)
     
     def get_prior(self, rejected_mask):
         prior = torch.ones(len(self.animals), dtype=torch.float32)
@@ -160,7 +158,6 @@ class AkinatorEngine:
         if fuzzy_val is None:
             return prior
         
-        # Features are in FP16, but likelihood calc needs FP32
         feature_vec = self.features_filled[:, feature_idx]
         likelihood = self.calc_likelihood(feature_vec, fuzzy_val, 
                                           self.definite_exp, self.uncertain_exp)
@@ -173,7 +170,7 @@ class AkinatorEngine:
 
     def info_gain_batch(self, prior, feature_indices):
         """Compute information gain for multiple features efficiently."""
-        curr_entropy = self.fast_entropy(prior)
+        curr_entropy = self.entropy(prior)
         if curr_entropy < 0.01 or not feature_indices:
             return torch.zeros(len(feature_indices))
 
@@ -185,20 +182,21 @@ class AkinatorEngine:
             prior = torch.ones_like(prior) / len(prior)
             curr_entropy = self.entropy(prior)
 
-        if len(active_idx) < len(prior):
+        # Subset optimization: only compute for active animals
+        if len(active_idx) < len(prior) * 0.8:  # Only subset if >20% reduction
             prior_sub = prior[active_idx]
             prior_sub = prior_sub / (prior_sub.sum() + 1e-12)
-            # Convert FP16 to FP32 for calculations
-            feature_batch = self.features_filled[active_idx][:, feature_indices].float()
+            feature_batch = self.features_filled[active_idx][:, feature_indices]
             nan_mask_batch = self.nan_mask[active_idx][:, feature_indices]
         else:
             prior_sub = prior
-            feature_batch = self.features_filled[:, feature_indices].float()
+            feature_batch = self.features_filled[:, feature_indices]
             nan_mask_batch = self.nan_mask[:, feature_indices]
 
         k = len(feature_indices)
         A = len(self.answer_values)
         
+        # Expand dimensions for broadcasting
         prior_exp = prior_sub.view(-1, 1, 1)
         feat_exp = feature_batch.unsqueeze(-1)
         nan_exp = nan_mask_batch.unsqueeze(-1)
@@ -207,6 +205,7 @@ class AkinatorEngine:
         dist = torch.abs(ans_exp - feat_exp)
         definite_mask = (torch.abs(ans_exp - 0.5) > 0.3)
         
+        # Compute likelihoods
         def_like = torch.exp(self.definite_exp * dist)
         def_like = torch.where(dist > 0.7, def_like * 0.001, def_like)
         def_like = torch.where((dist > 0.3) & (dist <= 0.7), def_like * 0.2, def_like)
@@ -217,6 +216,7 @@ class AkinatorEngine:
         likelihoods = torch.where(nan_exp, torch.ones_like(likelihoods), likelihoods)
         likelihoods = torch.clamp(likelihoods, 0.0001, 1.0)
         
+        # Compute expected entropy
         prob_answer = torch.einsum('n,nka->ka', prior_sub, likelihoods)
         posterior = prior_exp * likelihoods
         posterior_sum = posterior.sum(dim=0, keepdim=True)
@@ -231,111 +231,101 @@ class AkinatorEngine:
 
     def select_question(self, prior, asked, question_count):
         """
-        Select most informative question using precomputed Q0.
+        Adaptive question selection with accuracy enhancements.
         
-        Q0: INSTANT - Randomly pick from precomputed questions (no calculation)
-        Q1-4: FAST - Randomly pick from top 3 of 15 best precomputed features
-        Q5+: ACCURATE - Pick best from 30 features (accurate, slower)
+        Q0: Instant - precomputed top 5
+        Q1-4: Fast - precomputed top 20, pick best of top 5
+        Q5-9: Balanced - compute 40 features, pick best of top 3
+        Q10+: Accurate - compute 50 features, pick absolute best
         """
         
-        # === Q0: INSTANT, RANDOM FROM PRECOMPUTED QUESTIONS ===
+        # Q0: INSTANT - NO COMPUTATION
         if question_count == 0:
-            if 'q0_questions' in self._question_cache and self._question_cache['q0_questions']:
-                # Get available precomputed questions
-                available_questions = [
-                    (feature, question) for feature, question in self._question_cache['q0_questions']
-                    if feature not in asked
-                ]
-                
-                if available_questions:
-                    # Randomly pick one from precomputed questions - INSTANT!
-                    chosen_feature, chosen_question = available_questions[np.random.randint(len(available_questions))]
-                    return chosen_feature, chosen_question
-                
-                print("Warning: All precomputed Q0 questions were asked. Using fallback.")
-            else:
-                print("Warning: No precomputed Q0 questions available. Using fallback.")
-                
-            # Fallback to old method if precomputed questions exhausted
-            if not self.sorted_initial_feature_indices:
-                print("Warning: No sorted_initial_feature_indices. Falling back.")
-            else:
-                # Get available features from top 5
+            if self.sorted_initial_feature_indices:
                 available_top_5 = [
                     idx for idx in self.sorted_initial_feature_indices[:5]
                     if self.feature_cols[idx] not in asked
                 ]
                 
                 if available_top_5:
-                    # Randomly pick one from the top 5
                     chosen_idx = available_top_5[np.random.randint(len(available_top_5))]
                     feature = self.feature_cols[chosen_idx]
                     question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
+                    print(f"[Q{question_count}] Selected: {feature} (precomputed, instant)")
                     return feature, question
-                
-                print("Warning: All top 5 Q0 features were asked. Using fallback.")
         
-        # === Q1-4: FAST, RANDOM FROM TOP 3 OF 15 BEST ===
-        all_available_indices = [i for i, f in enumerate(self.feature_cols)
-                                 if f not in asked and (i in self.allowed_feature_indices)]
+        # Get available features
+        all_available_indices = [
+            i for i, f in enumerate(self.feature_cols)
+            if f not in asked and self.allowed_feature_mask[i]
+        ]
+        
         if not all_available_indices:
+            print("[WARNING] No available features left")
             return None, None
         
+        # Adaptive strategy based on question count
         if question_count < 5:
-            # Use top 15 from precomputed rankings (no calculation needed)
-            MAX_FEATURES_TO_CHECK = 15
-            
+            # Q1-4: FAST - Use precomputed, sample top 20, pick best of 5
+            MAX_FEATURES = 20
+            TOP_N_TO_PICK = 5
             available_set = set(all_available_indices)
-            top_available_features = [
-                idx for idx in self.sorted_initial_feature_indices
-                if idx in available_set
-            ][:MAX_FEATURES_TO_CHECK]
-
-            if not top_available_features:
-                # Fallback if something went wrong
-                top_available_features = np.random.choice(
-                    all_available_indices, 
-                    min(len(all_available_indices), MAX_FEATURES_TO_CHECK), 
-                    replace=False
-                ).tolist()
+            top_available = [idx for idx in self.sorted_initial_feature_indices if idx in available_set][:MAX_FEATURES]
             
-            available_features_to_check = top_available_features
-            sampled_indices_map = {
-                new_idx: old_idx for new_idx, old_idx in enumerate(available_features_to_check)
-            }
-
+            if not top_available:
+                top_available = all_available_indices[:MAX_FEATURES]
+            
+            available_features_to_check = top_available
+            
+        elif question_count < 10:
+            # Q5-9: BALANCED - Compute 40 features, pick best of 3
+            MAX_FEATURES = 40
+            TOP_N_TO_PICK = 3
+            
+            # Prioritize high-variance features for better discrimination
+            variance_scores = self.feature_variance[all_available_indices].numpy()
+            top_variance_idx = np.argsort(variance_scores)[-MAX_FEATURES:]
+            available_features_to_check = [all_available_indices[i] for i in top_variance_idx]
+            
         else:
-            # === Q5+: ACCURATE, BEST FROM 30 FEATURES ===
-            MAX_FEATURES_TO_CHECK = 30
+            # Q10+: ACCURATE - Compute 50 features, pick absolute best
+            MAX_FEATURES = 50
+            TOP_N_TO_PICK = 1
             
-            if len(all_available_indices) > MAX_FEATURES_TO_CHECK:
-                sampled_indices_map = {
-                    new_idx: old_idx for new_idx, old_idx in enumerate(
-                        np.random.choice(all_available_indices, MAX_FEATURES_TO_CHECK, replace=False)
-                    )
-                }
-                available_features_to_check = list(sampled_indices_map.values())
-            else:
-                sampled_indices_map = {idx: old_idx for idx, old_idx in enumerate(all_available_indices)}
-                available_features_to_check = all_available_indices
+            # Mix of precomputed and high-variance features
+            available_set = set(all_available_indices)
+            precomputed_top = [idx for idx in self.sorted_initial_feature_indices if idx in available_set][:MAX_FEATURES//2]
+            
+            variance_scores = self.feature_variance[all_available_indices].numpy()
+            top_variance_idx = np.argsort(variance_scores)[-(MAX_FEATURES//2):]
+            variance_top = [all_available_indices[i] for i in top_variance_idx]
+            
+            available_features_to_check = list(set(precomputed_top + variance_top))
         
-        # Compute gains for Q1+ (Q0 skipped this entirely)
+        # Create index mapping
+        sampled_indices_map = {new_idx: old_idx for new_idx, old_idx in enumerate(available_features_to_check)}
+        
+        # Compute gains
         gains_tensor = self.info_gain_batch(prior, available_features_to_check)
-        sorted_indices_of_gains = torch.argsort(gains_tensor, descending=True)
-
-        # Random selection from top candidates
+        sorted_indices = torch.argsort(gains_tensor, descending=True)
+        
+        # Select from top candidates
         if question_count < 5:
-            # Q1-4: Pick randomly from top 3 (good variety + accuracy)
-            top_n = min(3, len(sorted_indices_of_gains))
-            chosen_local_idx = sorted_indices_of_gains[np.random.randint(top_n)]
+            top_n = min(TOP_N_TO_PICK, len(sorted_indices))
+            chosen_local_idx = sorted_indices[np.random.randint(top_n)]
+            print(f"[Q{question_count}] Computed gains for {len(available_features_to_check)} features, picked from top {top_n}")
+        elif question_count < 10:
+            top_n = min(TOP_N_TO_PICK, len(sorted_indices))
+            chosen_local_idx = sorted_indices[np.random.randint(top_n)]
+            print(f"[Q{question_count}] Computed gains for {len(available_features_to_check)} features, picked from top {top_n}")
         else:
-            # Q5+: Always pick the absolute best (maximum accuracy)
-            chosen_local_idx = sorted_indices_of_gains[0]
+            chosen_local_idx = sorted_indices[0]
+            print(f"[Q{question_count}] Computed gains for {len(available_features_to_check)} features, picked best")
         
         idx = sampled_indices_map[chosen_local_idx.item()]
-        
         feature = self.feature_cols[idx]
         question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
+        
         return feature, question
     
     def get_discriminative_question(self, top_idx, prior, asked):
@@ -350,14 +340,13 @@ class AkinatorEngine:
         
         available_indices = [
             i for i, f in enumerate(self.feature_cols)
-            if f not in asked and (i in self.allowed_feature_indices)
+            if f not in asked and self.allowed_feature_mask[i]
         ]
         if not available_indices:
             return None, None
         
-        # Convert to float32 for calculations
-        top_features = self.features[top_idx].float()
-        similar_features = self.features[similar_indices].float()
+        top_features = self.features[top_idx]
+        similar_features = self.features[similar_indices]
         diffs = torch.abs(top_features.unsqueeze(0) - similar_features)
         avg_diffs = torch.nanmean(diffs, dim=0)
         
@@ -371,6 +360,7 @@ class AkinatorEngine:
         if best_diff.item() > 0.3:
             feature = self.feature_cols[best_idx.item()]
             question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
+            print(f"[DISCRIMINATIVE] Selected: {feature} (diff={best_diff.item():.3f})")
             return feature, question
 
         return None, None
