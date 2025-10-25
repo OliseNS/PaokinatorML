@@ -41,7 +41,7 @@ except Exception as e:
 def set_session(session_id: str, state: dict):
     """
     Saves a session state to Redis.
-    *** OPTIMIZED: Uses msgpack + raw numpy bytes. ***
+    *** OPTIMIZED: Uses msgpack + raw numpy bytes + compression. ***
     """
     if not redis_client:
         print("Error: Redis client not initialized.")
@@ -60,8 +60,16 @@ def set_session(session_id: str, state: dict):
         # msgpack is much faster than pickle
         packed_state = msgpack.packb(state_to_save, use_bin_type=True)
         
+        # Compress for even better performance on large states
+        if len(packed_state) > 1024:  # Only compress if larger than 1KB
+            import gzip
+            packed_state = gzip.compress(packed_state)
+            key = f"session_gz:{session_id}"
+        else:
+            key = f"session:{session_id}"
+        
         redis_client.setex(
-            f"session:{session_id}", 
+            key, 
             config.SESSION_TTL_SECONDS, 
             packed_state
         )
@@ -77,26 +85,33 @@ def get_session(session_id: str) -> dict | None:
         print("Error: Redis client not initialized.")
         return None
     try:
-        key = f"session:{session_id}"
-        packed_state = redis_client.get(key)
+        # Try compressed version first, then fallback to uncompressed
+        for key_prefix in ["session_gz:", "session:"]:
+            key = f"{key_prefix}{session_id}"
+            packed_state = redis_client.get(key)
+            
+            if packed_state:
+                # Reset TTL on access to keep active sessions alive
+                redis_client.expire(key, config.SESSION_TTL_SECONDS)
+                
+                # Decompress if needed
+                if key_prefix == "session_gz:":
+                    import gzip
+                    packed_state = gzip.decompress(packed_state)
+                
+                # Unpack with msgpack
+                state = msgpack.unpackb(packed_state, raw=False)
+
+                # --- Convert Numpy Arrays back to Tensors ---
+                # We use .copy() to ensure the tensor is writable,
+                # which is crucial for our state migration logic.
+                if 'probabilities' in state:
+                    state['probabilities'] = torch.from_numpy(state['probabilities'].copy())
+                if 'rejected_mask' in state:
+                    state['rejected_mask'] = torch.from_numpy(state['rejected_mask'].copy())
+
+                return state
         
-        if packed_state:
-            # Reset TTL on access to keep active sessions alive
-            redis_client.expire(key, config.SESSION_TTL_SECONDS)
-            
-            # Unpack with msgpack
-            state = msgpack.unpackb(packed_state, raw=False)
-
-            # --- Convert Numpy Arrays back to Tensors ---
-            # We use .copy() to ensure the tensor is writable,
-            # which is crucial for our state migration logic.
-            if 'probabilities' in state:
-                state['probabilities'] = torch.from_numpy(state['probabilities'].copy())
-            if 'rejected_mask' in state:
-                state['rejected_mask'] = torch.from_numpy(state['rejected_mask'].copy())
-
-            return state
-            
         return None  # Session expired or not found
     except Exception as e:
         print(f"Error getting session {session_id} from Redis: {e}")

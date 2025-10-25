@@ -2,7 +2,7 @@
 name = "paokinator-ml"
 version = "0.1.0"
 description = "Paokinator ML Service"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "fastapi",
     "uvicorn[standard]",

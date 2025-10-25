@@ -4,8 +4,8 @@ import torch
 
 class AkinatorEngine:
     """
-    Ultra-optimized PyTorch-based Akinator engine with aggressive caching.
-    Uses float16 for 50% memory reduction and precomputed question cache.
+    Optimized PyTorch-based Akinator engine with FP16 (half precision).
+    Uses float16 for 50% memory reduction and better cache efficiency.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -25,12 +25,10 @@ class AkinatorEngine:
         }
         
         # Performance optimization caches
-        self._question_cache = {}  # Cache for instant question retrieval
-        self._uniform_prior = None  # Precomputed uniform prior for Q0
+        self._question_cache = {}  # Cache for precomputed questions
+        self._uniform_prior = None  # Precomputed uniform prior
         self.sorted_initial_feature_indices = []
-        
         self._build_tensors()
-        self._precompute_question_cache()
         
     def _build_tensors(self):
         """(Re)builds all tensors from the DataFrame using FP16."""
@@ -56,12 +54,14 @@ class AkinatorEngine:
         self.allowed_feature_mask = (col_nan_frac < 0.8) & (col_var > 1e-4)
         self.allowed_feature_indices = [i for i, ok in enumerate(self.allowed_feature_mask) if ok]
         
-        # Pre-compute Q0 results (use float32 for precision)
+        # Pre-compute Q0 results and uniform prior (use float32 for precision)
         try:
             N = len(self.animals)
             if N > 0 and len(self.allowed_feature_indices) > 0:
-                uniform_prior = torch.ones(N, dtype=torch.float32) / float(N)
-                gains = self.info_gain_batch(uniform_prior, self.allowed_feature_indices)
+                # Precompute uniform prior for instant Q0 access
+                self._uniform_prior = torch.ones(N, dtype=torch.float32) / float(N)
+                
+                gains = self.info_gain_batch(self._uniform_prior, self.allowed_feature_indices)
                 
                 self.feature_importance = {self.feature_cols[idx]: float(gains[i].item())
                                            for i, idx in enumerate(self.allowed_feature_indices)}
@@ -69,32 +69,34 @@ class AkinatorEngine:
                 sorted_gains_indices = torch.argsort(gains, descending=True)
                 self.sorted_initial_feature_indices = [self.allowed_feature_indices[i.item()] for i in sorted_gains_indices]
                 
+                # Precompute Q0 questions for instant response
+                self._precompute_q0_questions()
+                
             else:
                 self.feature_importance = {f: 0.0 for f in self.feature_cols}
                 self.sorted_initial_feature_indices = []
+                self._uniform_prior = None
         except Exception as e:
             print(f"Warning: failed computing feature importance: {e}")
             self.feature_importance = {f: 0.0 for f in self.feature_cols}
             self.sorted_initial_feature_indices = []
+            self._uniform_prior = None
 
-    def _precompute_question_cache(self):
-        """Precompute question cache for instant Q0 responses."""
-        print("🔥 Precomputing question cache for instant responses...")
-        
-        # Precompute uniform prior for Q0
-        N = len(self.animals)
-        if N > 0:
-            self._uniform_prior = torch.ones(N, dtype=torch.float32) / float(N)
+    def _precompute_q0_questions(self):
+        """Precompute Q0 questions for instant response."""
+        if not self.sorted_initial_feature_indices:
+            return
             
-            # Precompute Q0 questions (top 5 features)
-            if self.sorted_initial_feature_indices:
-                for i in range(min(5, len(self.sorted_initial_feature_indices))):
-                    idx = self.sorted_initial_feature_indices[i]
-                    feature = self.feature_cols[idx]
-                    question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
-                    self._question_cache[f"q0_{i}"] = (feature, question)
+        # Precompute top 20 Q0 questions for variety
+        top_20_features = self.sorted_initial_feature_indices[:20]
+        self._question_cache['q0_questions'] = []
         
-        print(f"✅ Precomputed {len(self._question_cache)} instant questions")
+        for idx in top_20_features:
+            feature = self.feature_cols[idx]
+            question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
+            self._question_cache['q0_questions'].append((feature, question))
+        
+        print(f"✅ Precomputed {len(self._question_cache['q0_questions'])} Q0 questions for instant response")
 
     def _compute_specificity_all(self):
         """Compute specificity score for all animals (batched)."""
@@ -119,25 +121,33 @@ class AkinatorEngine:
     @staticmethod
     def calc_likelihood(feature_vec: torch.Tensor, target: float, 
                         definite_exp: float, uncertain_exp: float) -> torch.Tensor:
-        """Calculate likelihood of answer given features - OPTIMIZED VERSION."""
-        # Keep in float16 for speed, only convert to float32 for exp operations
-        with torch.no_grad():
-            dist = torch.abs(target - feature_vec.float())
-            
-            if abs(target - 0.5) > 0.3:
-                likelihood = torch.exp(definite_exp * dist)
-                likelihood = torch.where(dist > 0.7, likelihood * 0.001, likelihood)
-                likelihood = torch.where((dist > 0.3) & (dist <= 0.7), likelihood * 0.2, likelihood)
-            else:
-                likelihood = torch.exp(uncertain_exp * dist)
-            
-            return torch.clamp(likelihood, 0.0001, 1.0)
+        """Calculate likelihood of answer given features."""
+        # Convert to float32 for exp operations (more stable)
+        feature_vec = feature_vec.float()
+        dist = torch.abs(target - feature_vec)
+        
+        if abs(target - 0.5) > 0.3:
+            likelihood = torch.exp(definite_exp * dist)
+            likelihood = torch.where(dist > 0.7, likelihood * 0.001, likelihood)
+            likelihood = torch.where((dist > 0.3) & (dist <= 0.7), likelihood * 0.2, likelihood)
+        else:
+            likelihood = torch.exp(uncertain_exp * dist)
+        
+        return torch.clamp(likelihood, 0.0001, 1.0)
     
     @staticmethod
     @torch.jit.script
     def entropy(probs: torch.Tensor) -> torch.Tensor:
         probs_safe = torch.clamp(probs, min=1e-10)
         return -torch.sum(probs_safe * torch.log(probs_safe))
+    
+    @staticmethod
+    @torch.jit.script
+    def fast_entropy(probs: torch.Tensor) -> torch.Tensor:
+        """Optimized entropy calculation for better performance."""
+        probs_safe = torch.clamp(probs, min=1e-10)
+        log_probs = torch.log(probs_safe)
+        return -torch.sum(probs_safe * log_probs)
     
     def get_prior(self, rejected_mask):
         prior = torch.ones(len(self.animals), dtype=torch.float32)
@@ -162,30 +172,29 @@ class AkinatorEngine:
         return posterior / (posterior.sum() + 1e-10)
 
     def info_gain_batch(self, prior, feature_indices):
-        """Compute information gain for multiple features efficiently - OPTIMIZED."""
-        with torch.no_grad():
+        """Compute information gain for multiple features efficiently."""
+        curr_entropy = self.fast_entropy(prior)
+        if curr_entropy < 0.01 or not feature_indices:
+            return torch.zeros(len(feature_indices))
+
+        active_thresh = 1e-8
+        active_idx = torch.where(prior > active_thresh)[0]
+        
+        if len(active_idx) == 0:
+            active_idx = torch.arange(len(prior))
+            prior = torch.ones_like(prior) / len(prior)
             curr_entropy = self.entropy(prior)
-            if curr_entropy < 0.01 or not feature_indices:
-                return torch.zeros(len(feature_indices))
 
-            active_thresh = 1e-8
-            active_idx = torch.where(prior > active_thresh)[0]
-            
-            if len(active_idx) == 0:
-                active_idx = torch.arange(len(prior))
-                prior = torch.ones_like(prior) / len(prior)
-                curr_entropy = self.entropy(prior)
-
-            if len(active_idx) < len(prior):
-                prior_sub = prior[active_idx]
-                prior_sub = prior_sub / (prior_sub.sum() + 1e-12)
-                # Single conversion to float32 for all operations
-                feature_batch = self.features_filled[active_idx][:, feature_indices].float()
-                nan_mask_batch = self.nan_mask[active_idx][:, feature_indices]
-            else:
-                prior_sub = prior
-                feature_batch = self.features_filled[:, feature_indices].float()
-                nan_mask_batch = self.nan_mask[:, feature_indices]
+        if len(active_idx) < len(prior):
+            prior_sub = prior[active_idx]
+            prior_sub = prior_sub / (prior_sub.sum() + 1e-12)
+            # Convert FP16 to FP32 for calculations
+            feature_batch = self.features_filled[active_idx][:, feature_indices].float()
+            nan_mask_batch = self.nan_mask[active_idx][:, feature_indices]
+        else:
+            prior_sub = prior
+            feature_batch = self.features_filled[:, feature_indices].float()
+            nan_mask_batch = self.nan_mask[:, feature_indices]
 
         k = len(feature_indices)
         A = len(self.answer_values)
@@ -224,33 +233,47 @@ class AkinatorEngine:
         """
         Select most informative question using precomputed Q0.
         
-        Q0: INSTANT lookup from precomputed cache (0ms response time)
-        Q1-4: Randomly pick from top 3 of 15 best precomputed features (fast, good variety)
-        Q5+: Pick best from 30 features (accurate, slower)
+        Q0: INSTANT - Randomly pick from precomputed questions (no calculation)
+        Q1-4: FAST - Randomly pick from top 3 of 15 best precomputed features
+        Q5+: ACCURATE - Pick best from 30 features (accurate, slower)
         """
         
-        # === Q0: INSTANT CACHE LOOKUP (0ms) ===
+        # === Q0: INSTANT, RANDOM FROM PRECOMPUTED QUESTIONS ===
         if question_count == 0:
-            # Try to get an available question from precomputed cache
-            for i in range(min(5, len(self.sorted_initial_feature_indices))):
-                cache_key = f"q0_{i}"
-                if cache_key in self._question_cache:
-                    feature, question = self._question_cache[cache_key]
-                    if feature not in asked:
-                        return feature, question
-            
-            # Fallback if all cached questions were asked
-            print("Warning: All cached Q0 questions were asked. Using fallback.")
-            if self.sorted_initial_feature_indices:
+            if 'q0_questions' in self._question_cache and self._question_cache['q0_questions']:
+                # Get available precomputed questions
+                available_questions = [
+                    (feature, question) for feature, question in self._question_cache['q0_questions']
+                    if feature not in asked
+                ]
+                
+                if available_questions:
+                    # Randomly pick one from precomputed questions - INSTANT!
+                    chosen_feature, chosen_question = available_questions[np.random.randint(len(available_questions))]
+                    return chosen_feature, chosen_question
+                
+                print("Warning: All precomputed Q0 questions were asked. Using fallback.")
+            else:
+                print("Warning: No precomputed Q0 questions available. Using fallback.")
+                
+            # Fallback to old method if precomputed questions exhausted
+            if not self.sorted_initial_feature_indices:
+                print("Warning: No sorted_initial_feature_indices. Falling back.")
+            else:
+                # Get available features from top 5
                 available_top_5 = [
                     idx for idx in self.sorted_initial_feature_indices[:5]
                     if self.feature_cols[idx] not in asked
                 ]
+                
                 if available_top_5:
+                    # Randomly pick one from the top 5
                     chosen_idx = available_top_5[np.random.randint(len(available_top_5))]
                     feature = self.feature_cols[chosen_idx]
                     question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
                     return feature, question
+                
+                print("Warning: All top 5 Q0 features were asked. Using fallback.")
         
         # === Q1-4: FAST, RANDOM FROM TOP 3 OF 15 BEST ===
         all_available_indices = [i for i, f in enumerate(self.feature_cols)

@@ -23,11 +23,13 @@ class AkinatorService:
         
         # Performance caches
         self._prediction_cache = {}  # Cache for top predictions
+        self._question_cache = {}    # Cache for common questions
         self._cache_lock = threading.Lock()
         
         # Data caching to avoid repeated DB calls
         self._cached_data = None
-        self._data_lock = threading.Lock()
+        self._data_cache_timestamp = 0
+        self._data_cache_ttl = 300  # 5 minutes
         
         # Load the engine blocking on the first startup
         self.engine = self._create_engine()
@@ -46,24 +48,29 @@ class AkinatorService:
             return {}
 
     def _create_engine(self) -> AkinatorEngine:
-        """Loads data from DB and builds a new engine instance - OPTIMIZED with caching."""
-        import time
-        start_time = time.time()
-        
-        # Check if we have cached data
-        with self._data_lock:
-            if self._cached_data is not None:
-                df, feature_cols = self._cached_data
-                print(f"🚀 Using cached data (saved {time.time() - start_time:.3f}s)")
-            else:
-                print("Loading data from Supabase to build engine...")
-                df, feature_cols = db.load_data_from_supabase()
-                # Cache the data for future engine creations
-                self._cached_data = (df, feature_cols)
-                elapsed = time.time() - start_time
-                print(f"📊 Data loaded in {elapsed:.3f}s and cached")
-        
+        """Loads data from DB and builds a new engine instance."""
+        print("Loading data from Supabase to build engine...")
+        df, feature_cols = self._get_cached_data()
         return AkinatorEngine(df, feature_cols, self.questions_map)
+    
+    def _get_cached_data(self):
+        """Get data from cache or load from database with TTL."""
+        import time
+        current_time = time.time()
+        
+        # Check if cache is valid
+        if (self._cached_data is not None and 
+            current_time - self._data_cache_timestamp < self._data_cache_ttl):
+            print("📦 Using cached data (avoiding DB call)")
+            return self._cached_data
+        
+        # Load from database and cache
+        print("🔄 Loading fresh data from Supabase...")
+        df, feature_cols = db.load_data_from_supabase()
+        self._cached_data = (df, feature_cols)
+        self._data_cache_timestamp = current_time
+        
+        return df, feature_cols
 
     def _background_reload(self):
         """
@@ -256,43 +263,67 @@ class AkinatorService:
             return False, None, None
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
-        """Gets the next best question, returns (feature, question, modified_state) - OPTIMIZED."""
-        import time
-        start_time = time.time()
-        
+        """Gets the next best question, returns (feature, question, modified_state)."""
         with self.engine_lock:
             engine = self.engine
             game_state = self._migrate_state(game_state, engine)
 
-            asked = game_state['asked_features']
-            q_count = game_state['question_count']
-            
-            # ULTRA-FAST Q0: Use precomputed cache (0ms response)
-            if q_count == 0 and hasattr(engine, '_uniform_prior') and engine._uniform_prior is not None:
-                feature, q = engine.select_question(engine._uniform_prior, asked, q_count)
-                elapsed = (time.time() - start_time) * 1000
-                print(f"⚡ Q0 question served in {elapsed:.2f}ms (CACHED)")
-                return feature, q, game_state
-            
-            # For Q1+, compute prior only when needed
             prior = game_state['probabilities'].clone()
             prior[game_state['rejected_mask']] = 0.0
             prior = prior / (prior.sum() + 1e-10)
+            
+            asked = game_state['asked_features']
+            q_count = game_state['question_count']
+            
+            # Check cache for common question patterns
+            cache_key = self._get_question_cache_key(asked, q_count)
+            with self._cache_lock:
+                if cache_key in self._question_cache:
+                    cached_result = self._question_cache[cache_key]
+                    if cached_result and cached_result[0] not in asked:
+                        print(f"🚀 Cache hit for question {q_count}")
+                        return cached_result[0], cached_result[1], game_state
+            
+            # Optimization: Use precomputed uniform prior for Q0 (INSTANT)
+            if q_count == 0 and hasattr(engine, '_uniform_prior') and engine._uniform_prior is not None:
+                # For Q0, use the precomputed uniform prior directly - NO CALCULATION
+                feature, q = engine.select_question(engine._uniform_prior, asked, q_count)
+                
+                # Cache the result
+                with self._cache_lock:
+                    self._question_cache[cache_key] = (feature, q)
+                    # Limit cache size
+                    if len(self._question_cache) > 500:
+                        # Remove oldest entries
+                        oldest_keys = list(self._question_cache.keys())[:100]
+                        for key in oldest_keys:
+                            del self._question_cache[key]
+                
+                return feature, q, game_state
             
             # 1. Try to find a discriminative question
             top_prob, top_idx = torch.max(prior, dim=0)
             if top_prob > 0.2:
                 feature, q = engine.get_discriminative_question(top_idx, prior, asked)
                 if feature:
-                    elapsed = (time.time() - start_time) * 1000
-                    print(f"⚡ Q{q_count+1} discriminative question served in {elapsed:.2f}ms")
+                    # Cache the result
+                    with self._cache_lock:
+                        self._question_cache[cache_key] = (feature, q)
                     return feature, q, game_state
 
             # 2. If not, find the max info-gain question
             feature, q = engine.select_question(prior, asked, q_count)
-            elapsed = (time.time() - start_time) * 1000
-            print(f"⚡ Q{q_count+1} info-gain question served in {elapsed:.2f}ms")
+            
+            # Cache the result
+            with self._cache_lock:
+                self._question_cache[cache_key] = (feature, q)
+            
             return feature, q, game_state
+    
+    def _get_question_cache_key(self, asked_features: list, question_count: int) -> str:
+        """Create a cache key for question patterns."""
+        asked_sorted = sorted(asked_features)
+        return f"q{question_count}_{hash(tuple(asked_sorted))}"
 
     def process_answer(self, game_state: dict, feature: str, answer: str) -> dict:
         """Updates game state based on an answer."""
@@ -347,10 +378,6 @@ class AkinatorService:
         
         # Persist to DB
         result = db.persist_learned_animal(animal_data)
-        
-        # Clear cached data to force reload on next engine creation
-        with self._data_lock:
-            self._cached_data = None
         
         return result
 
