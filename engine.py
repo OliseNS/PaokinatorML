@@ -4,8 +4,7 @@ import torch
 
 class AkinatorEngine:
     """
-    CPU-optimized PyTorch Akinator engine.
-    Eliminates FP16 overhead and minimizes tensor operations for speed.
+    Highly optimized PyTorch Akinator engine using matmul and caching.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -13,7 +12,6 @@ class AkinatorEngine:
         self.feature_cols = feature_cols
         self.questions_map = questions_map
 
-        # Keep everything in float32 for CPU efficiency
         self.answer_values = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0], dtype=torch.float32)
         self.definite_exp = -6.0
         self.uncertain_exp = -3.0
@@ -25,15 +23,44 @@ class AkinatorEngine:
         }
         
         self.sorted_initial_feature_indices = []
+        # Precompute likelihood lookup tables for massive speedup
+        self._precompute_likelihood_tables()
         self._build_tensors()
+        
+    def _precompute_likelihood_tables(self):
+        """Precompute all possible likelihoods for instant lookup."""
+        # Discretize feature space to 0.05 resolution (21 values from 0 to 1)
+        feature_grid = torch.linspace(0.0, 1.0, 21)
+        n_grid = len(feature_grid)
+        n_answers = len(self.answer_values)
+        
+        # Precompute all (feature_val, answer_val) -> likelihood mappings
+        self.likelihood_table_definite = torch.zeros(n_grid, n_answers)
+        self.likelihood_table_uncertain = torch.zeros(n_grid, n_answers)
+        
+        for i, fval in enumerate(feature_grid):
+            for j, aval in enumerate(self.answer_values):
+                dist = abs(fval - aval)
+                
+                # Definite answer likelihood
+                like_def = np.exp(self.definite_exp * dist)
+                if dist > 0.7:
+                    like_def *= 0.001
+                elif dist > 0.3:
+                    like_def *= 0.2
+                self.likelihood_table_definite[i, j] = np.clip(like_def, 0.0001, 1.0)
+                
+                # Uncertain answer likelihood
+                like_unc = np.exp(self.uncertain_exp * dist)
+                self.likelihood_table_uncertain[i, j] = np.clip(like_unc, 0.0001, 1.0)
+        
+        self.feature_grid = feature_grid
         
     def _build_tensors(self):
         """Builds all tensors from the DataFrame - CPU optimized."""
         self.animals = self.df['animal_name'].values
-        
         features_np = self.df[self.feature_cols].values.astype(np.float32)
         
-        # Use float32 throughout - no FP16 conversion overhead on CPU
         self.features = torch.from_numpy(features_np)
         self.nan_mask = torch.isnan(self.features)
         self.features_filled = torch.nan_to_num(self.features, nan=0.5)
@@ -46,10 +73,9 @@ class AkinatorEngine:
         self.allowed_feature_mask = (col_nan_frac < 0.8) & (col_var > 1e-4)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
-        # Pre-compute Q0 results using numpy for speed
+        # Pre-compute Q0 results using optimized numpy
         N = len(self.animals)
         if N > 0 and len(self.allowed_feature_indices) > 0:
-            # Use numpy for initial computation - much faster on CPU
             uniform_prior_np = np.ones(N, dtype=np.float32) / N
             gains = self._fast_info_gain_numpy(uniform_prior_np, self.allowed_feature_indices)
             
@@ -58,7 +84,7 @@ class AkinatorEngine:
                 for i, idx in enumerate(self.allowed_feature_indices)
             }
             
-            sorted_gains_indices = np.argsort(gains)[::-1]  # descending
+            sorted_gains_indices = np.argsort(gains)[::-1]
             self.sorted_initial_feature_indices = [
                 self.allowed_feature_indices[i] for i in sorted_gains_indices
             ]
@@ -67,44 +93,50 @@ class AkinatorEngine:
             self.sorted_initial_feature_indices = []
 
     def _fast_info_gain_numpy(self, prior_np, feature_indices):
-        """Fast info gain computation using numpy - for initialization only."""
+        """Fast info gain using precomputed likelihood tables."""
         curr_entropy = self._entropy_numpy(prior_np)
         if curr_entropy < 0.01:
             return np.zeros(len(feature_indices))
         
         features_np = self.features_filled.numpy()[:, feature_indices]
         nan_mask_np = self.nan_mask.numpy()[:, feature_indices]
-        answer_values_np = self.answer_values.numpy()
         
-        # Vectorized computation
+        # Quantize features to grid for table lookup
+        quantized = np.clip(np.round(features_np * 20).astype(int), 0, 20)
+        
         k = len(feature_indices)
-        A = len(answer_values_np)
+        A = len(self.answer_values)
+        n = len(features_np)
         
-        # Shape: (n_animals, k_features, A_answers)
-        dist = np.abs(features_np[:, :, None] - answer_values_np[None, None, :])
-        definite_mask = np.abs(answer_values_np - 0.5) > 0.3
+        # Use lookup table instead of computing exponentials
+        likelihoods = np.zeros((n, k, A))
+        for a_idx, aval in enumerate(self.answer_values):
+            is_definite = abs(aval - 0.5) > 0.3
+            table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
+            
+            for f_idx in range(k):
+                indices = quantized[:, f_idx]
+                likelihoods[:, f_idx, a_idx] = table[indices, a_idx].numpy()
         
-        # Compute likelihoods
-        def_like = np.exp(self.definite_exp * dist)
-        def_like = np.where(dist > 0.7, def_like * 0.001, def_like)
-        def_like = np.where((dist > 0.3) & (dist <= 0.7), def_like * 0.2, def_like)
-        unc_like = np.exp(self.uncertain_exp * dist)
-        
-        likelihoods = np.where(definite_mask, def_like, unc_like)
         likelihoods = np.where(nan_mask_np[:, :, None], 1.0, likelihoods)
-        likelihoods = np.clip(likelihoods, 0.0001, 1.0)
         
-        # Compute expected entropy
-        prob_answer = np.einsum('n,nka->ka', prior_np, likelihoods)
-        posterior = prior_np[:, None, None] * likelihoods
-        posterior_sum = posterior.sum(axis=0, keepdims=True)
-        normalized_posterior = posterior / (posterior_sum + 1e-10)
+        # Vectorized computation using matmul
+        # prob_answer shape: (k, A)
+        prob_answer = prior_np @ likelihoods.reshape(n, -1)
+        prob_answer = prob_answer.reshape(k, A)
         
-        probs_safe = np.clip(normalized_posterior, 1e-10, 1.0)
-        posterior_entropy = -np.sum(probs_safe * np.log(probs_safe), axis=0)
-        expected_entropy = np.sum(prob_answer * posterior_entropy, axis=1)
+        # Compute posterior entropies efficiently
+        gains = np.zeros(k)
+        for f_idx in range(k):
+            exp_ent = 0.0
+            for a_idx in range(A):
+                posterior = prior_np * likelihoods[:, f_idx, a_idx]
+                post_sum = posterior.sum()
+                if post_sum > 1e-10:
+                    posterior = posterior / post_sum
+                    exp_ent += prob_answer[f_idx, a_idx] * self._entropy_numpy(posterior)
+            gains[f_idx] = curr_entropy - exp_ent
         
-        gains = curr_entropy - expected_entropy
         return gains
     
     @staticmethod
@@ -113,24 +145,24 @@ class AkinatorEngine:
         probs_safe = np.clip(probs, 1e-10, 1.0)
         return -np.sum(probs_safe * np.log(probs_safe))
 
-    @staticmethod
-    def calc_likelihood(feature_vec: torch.Tensor, target: float, 
+    def calc_likelihood(self, feature_vec: torch.Tensor, target: float, 
                         definite_exp: float, uncertain_exp: float) -> torch.Tensor:
-        """Calculate likelihood of answer given features."""
-        dist = torch.abs(target - feature_vec)
+        """Calculate likelihood using precomputed table - ultra fast."""
+        # Quantize to grid
+        quantized = torch.clamp(torch.round(feature_vec * 20).long(), 0, 20)
         
-        if abs(target - 0.5) > 0.3:
-            likelihood = torch.exp(definite_exp * dist)
-            likelihood = torch.where(dist > 0.7, likelihood * 0.001, likelihood)
-            likelihood = torch.where((dist > 0.3) & (dist <= 0.7), likelihood * 0.2, likelihood)
-        else:
-            likelihood = torch.exp(uncertain_exp * dist)
+        # Find target answer index
+        target_idx = torch.argmin(torch.abs(self.answer_values - target))
         
-        return torch.clamp(likelihood, 0.0001, 1.0)
+        # Table lookup
+        is_definite = abs(target - 0.5) > 0.3
+        table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
+        
+        return table[quantized, target_idx]
     
     @staticmethod
     def entropy(probs: torch.Tensor) -> torch.Tensor:
-        """Calculate entropy - removed JIT for CPU."""
+        """Calculate entropy."""
         probs_safe = torch.clamp(probs, min=1e-10)
         return -torch.sum(probs_safe * torch.log(probs_safe))
     
@@ -140,7 +172,7 @@ class AkinatorEngine:
         return prior / (prior.sum() + 1e-10)
     
     def update(self, prior, feature_idx, answer):
-        """Update beliefs via Bayesian inference."""
+        """Update beliefs via Bayesian inference - optimized."""
         fuzzy_val = self.fuzzy_map.get(answer.lower().strip())
         if fuzzy_val is None:
             return prior
@@ -156,7 +188,10 @@ class AkinatorEngine:
         return posterior / (posterior.sum() + 1e-10)
 
     def info_gain_batch(self, prior, feature_indices):
-        """Compute information gain for multiple features efficiently."""
+        """
+        Compute information gain using efficient matmul operations.
+        Key optimization: Use matrix multiplication instead of einsum/loops.
+        """
         curr_entropy = self.entropy(prior)
         if curr_entropy < 0.01 or not feature_indices:
             return torch.zeros(len(feature_indices))
@@ -169,6 +204,7 @@ class AkinatorEngine:
             prior = torch.ones_like(prior) / len(prior)
             curr_entropy = self.entropy(prior)
 
+        # Subset to active animals
         if len(active_idx) < len(prior):
             prior_sub = prior[active_idx]
             prior_sub = prior_sub / (prior_sub.sum() + 1e-12)
@@ -181,35 +217,53 @@ class AkinatorEngine:
 
         k = len(feature_indices)
         A = len(self.answer_values)
+        n = len(prior_sub)
         
-        prior_exp = prior_sub.view(-1, 1, 1)
-        feat_exp = feature_batch.unsqueeze(-1)
-        nan_exp = nan_mask_batch.unsqueeze(-1)
-        ans_exp = self.answer_values.view(1, 1, -1)
+        # Quantize for table lookup
+        quantized = torch.clamp(torch.round(feature_batch * 20).long(), 0, 20)
         
-        dist = torch.abs(ans_exp - feat_exp)
-        definite_mask = (torch.abs(ans_exp - 0.5) > 0.3)
+        # Build likelihood matrix efficiently using broadcasting
+        # Shape: (n, k, A)
+        likelihoods = torch.zeros(n, k, A)
         
-        def_like = torch.exp(self.definite_exp * dist)
-        def_like = torch.where(dist > 0.7, def_like * 0.001, def_like)
-        def_like = torch.where((dist > 0.3) & (dist <= 0.7), def_like * 0.2, def_like)
+        for a_idx, aval in enumerate(self.answer_values):
+            is_definite = abs(aval.item() - 0.5) > 0.3
+            table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
+            
+            # Vectorized table lookup for all animals and features at once
+            likelihoods[:, :, a_idx] = table[quantized, a_idx]
         
-        unc_like = torch.exp(self.uncertain_exp * dist)
+        # Apply NaN mask
+        likelihoods = torch.where(nan_mask_batch.unsqueeze(-1), 
+                                  torch.ones_like(likelihoods), likelihoods)
         
-        likelihoods = torch.where(definite_mask, def_like, unc_like)
-        likelihoods = torch.where(nan_exp, torch.ones_like(likelihoods), likelihoods)
-        likelihoods = torch.clamp(likelihoods, 0.0001, 1.0)
+        # KEY OPTIMIZATION: Use matmul instead of einsum
+        # Reshape for efficient matrix multiplication
+        # prior_sub: (n,) -> (1, n)
+        # likelihoods: (n, k, A) -> (n, k*A)
+        prior_2d = prior_sub.unsqueeze(0)  # (1, n)
+        like_2d = likelihoods.view(n, k * A)  # (n, k*A)
         
-        prob_answer = torch.einsum('n,nka->ka', prior_sub, likelihoods)
-        posterior = prior_exp * likelihoods
-        posterior_sum = posterior.sum(dim=0, keepdim=True)
-        normalized_posterior = posterior / (posterior_sum + 1e-10)
-
-        probs_safe = torch.clamp(normalized_posterior, min=1e-10)
-        posterior_entropy = -torch.sum(probs_safe * torch.log(probs_safe), dim=0)
-        expected_entropy = torch.sum(prob_answer * posterior_entropy, dim=1)
-
-        gains = curr_entropy - expected_entropy
+        # Matrix multiply: (1, n) @ (n, k*A) = (1, k*A)
+        prob_answer = torch.matmul(prior_2d, like_2d).view(k, A)  # (k, A)
+        
+        # Compute expected entropy for each feature
+        gains = torch.zeros(k)
+        
+        for f_idx in range(k):
+            expected_ent = 0.0
+            for a_idx in range(A):
+                # Posterior for this answer
+                posterior = prior_sub * likelihoods[:, f_idx, a_idx]
+                post_sum = posterior.sum()
+                
+                if post_sum > 1e-10:
+                    posterior = posterior / post_sum
+                    ent = self.entropy(posterior)
+                    expected_ent += prob_answer[f_idx, a_idx] * ent
+            
+            gains[f_idx] = curr_entropy - expected_ent
+        
         return gains
 
     def select_question(self, prior, asked, question_count):
@@ -245,7 +299,6 @@ class AkinatorEngine:
             return None, None
         
         if question_count < 5:
-            # Use precomputed rankings - no gain calculation needed
             MAX_FEATURES_TO_CHECK = 15
             
             available_set = set(all_available_indices)

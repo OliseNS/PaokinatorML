@@ -5,6 +5,7 @@ csv
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 
 # C extensions
 *.so
@@ -60,3 +61,5 @@ Thumbs.db
 
 # dotenv files (already have /.env above)
 .env*
+__pycache__/engine.cpython-310.pyc
+__pycache__/main.cpython-310.pyc
