@@ -5,6 +5,10 @@ import torch
 class AkinatorEngine:
     """
     Highly optimized PyTorch Akinator engine using matmul and caching.
+    
+    This engine is data-agnostic. It simply requires a 'wide' DataFrame
+    with 'animal_name' (or equivalent) and feature columns, plus
+    a 'questions_map' dictionary.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -58,6 +62,7 @@ class AkinatorEngine:
         
     def _build_tensors(self):
         """Builds all tensors from the DataFrame - CPU optimized."""
+        # The 'animal_name' column is expected from the pivoted DB data
         self.animals = self.df['animal_name'].values
         features_np = self.df[self.feature_cols].values.astype(np.float32)
         
@@ -284,7 +289,8 @@ class AkinatorEngine:
                 ]
                 
                 if available_top_5:
-                    chosen_idx = available_top_5[np.random.randint(len(available_top_5))]
+                    # Choose the *best* available, not random
+                    chosen_idx = available_top_5[0]
                     feature = self.feature_cols[chosen_idx]
                     question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
                     return feature, question
@@ -330,6 +336,9 @@ class AkinatorEngine:
         # Compute gains for Q1+ (Q0 skipped this entirely)
         gains_tensor = self.info_gain_batch(prior, available_features_to_check)
         sorted_indices_of_gains = torch.argsort(gains_tensor, descending=True)
+
+        if len(sorted_indices_of_gains) == 0:
+            return None, None # No valid questions found
 
         # Selection strategy
         if question_count < 5:

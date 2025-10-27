@@ -3,6 +3,7 @@ import uuid
 import time
 import gzip
 import json
+import random  # <-- ADDED IMPORT
 from fastapi import FastAPI, HTTPException, Request, Header, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -16,6 +17,9 @@ import db  # We still need db for session functions
 
 # --- Pydantic Models for Request Bodies ---
 
+class StartPayload(BaseModel):
+    domain_name: str = "animals" # Default to "animals"
+
 class AnswerPayload(BaseModel):
     feature: str
     answer: str
@@ -24,61 +28,65 @@ class AnswerPayload(BaseModel):
 class RejectPayload(BaseModel):
     animal_name: str
 
-# --- NEW: Model for confirming a win ---
 class WinPayload(BaseModel):
     animal_name: str
 
 class LearnPayload(BaseModel):
     animal_name: str
 
+# --- NEW: Model for suggesting a feature ---
+class SuggestFeaturePayload(BaseModel):
+    domain_name: str
+    feature_name: str
+    question_text: str
+    item_name: str     # Changed from animal_name to be generic
+    fuzzy_value: float # The answer for that item (e.g., 1.0 for 'yes')
+
 # --- Global Service Variable ---
-# This will be populated during the 'lifespan' startup event
 service: AkinatorService | None = None
 
-# --- NEW: Lifespan Event Handler ---
-# This replaces the deprecated @app.on_event("startup")
+# --- Lifespan Event Handler ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Code to run on startup
     global service
     print("FastAPI server starting up...")
     try:
-        service = AkinatorService(config.QUESTIONS_PATH)
+        service = AkinatorService()
         
-        # Warmup: Precompute initial state and first question
-        print("🔥 Warming up engine for instant responses...")
-        initial_state = service.create_initial_state()
-        service.get_next_question(initial_state)  # Precompute first question
-        service.get_top_predictions(initial_state, n=5)  # Precompute predictions
+        # Warmup: Precompute initial state and first question for default domain
+        print("🔥 Warming up engine for default 'animals' domain...")
+        if "animals" in service.get_available_domains():
+            initial_state = service.create_initial_state(domain_name="animals")
+            service.get_next_question(initial_state)
+            service.get_top_predictions(initial_state, n=5)
+        else:
+            print("⚠ 'animals' domain not found, skipping warmup.")
         
-        print("✅ FastAPI startup complete, AkinatorService is loaded and warmed up.")
+        print(f"✅ FastAPI startup complete. {len(service.get_available_domains())} domains loaded.")
     except Exception as e:
         print(f"❌ CRITICAL: Failed to initialize AkinatorService. Server cannot start.")
         print(f"Error: {e}")
         service = None
     
-    yield  # This is when the application is running
+    yield
     
-    # Code to run on shutdown
     print("FastAPI server shutting down...")
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Akinator API",
-    description="Akinator-style game server with FastAPI and PyTorch.",
-    version="1.0.0",
-    lifespan=lifespan  # Set the lifespan handler
+    description="Multi-domain Akinator-style game server.",
+    version="1.1.0",
+    lifespan=lifespan
 )
 
-# Add GZip compression middleware for faster responses
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# --- Middleware for logging ---
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
-    process_time = (time.time() - start_time) * 1000
+    process_time = (time.time() * 1000)
     response.headers["X-Process-Time-ms"] = f"{process_time:.2f}"
     return response
 
@@ -91,17 +99,28 @@ def get_service() -> AkinatorService:
 
 # --- API Endpoints ---
 
-@app.post("/start", summary="Start a new game session")
-async def start_game():
+@app.get("/domains", summary="Get available domains")
+async def get_available_domains():
     """
-    Initializes a new game session and returns a unique session ID.
+    Returns a list of all currently loaded game domains (e.g., "animals").
+    """
+    srv = get_service()
+    return {"domains": srv.get_available_domains()}
+
+@app.post("/start", summary="Start a new game session")
+async def start_game(payload: StartPayload):
+    """
+    Initializes a new game session for a specific domain.
     """
     srv = get_service()
     session_id = str(uuid.uuid4())
-    game_state = srv.create_initial_state()
+    try:
+        game_state = srv.create_initial_state(payload.domain_name)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     
     db.set_session(session_id, game_state)
-    return {"session_id": session_id}
+    return {"session_id": session_id, "domain_name": payload.domain_name}
 
 
 @app.get("/question/{session_id}", summary="Get the next question")
@@ -115,57 +134,68 @@ async def get_question(session_id: str):
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
-    # Check if we should guess
-    should_guess, guess_animal, guess_type = srv.should_make_guess(game_state)
-    
-    if should_guess:
-        top_predictions = srv.get_top_predictions(game_state, n=5)
-        # Save state changes (like 'middle_guess_made')
-        db.set_session(session_id, game_state)
+    try:
+        should_guess, guess_animal, guess_type = srv.should_make_guess(game_state)
         
-        if guess_type == 'final':
+        if should_guess:
+            top_predictions = srv.get_top_predictions(game_state, n=5)
+            db.set_session(session_id, game_state) # Save state changes (like 'middle_guess_made')
+            
+            if guess_type == 'final':
+                return {
+                    'should_guess': True,
+                    'guess': guess_animal,
+                    'guess_type': guess_type,
+                    'top_predictions': top_predictions
+                }
+            
+            q_num = game_state['question_count'] 
+            top_pred = srv.get_top_predictions(game_state, n=1)
             return {
-                'should_guess': True,
-                'guess': guess_animal,
-                'guess_type': guess_type,
-                'top_predictions': top_predictions
+                'should_guess': False,
+                'question': f"Is it a/an {guess_animal}?",
+                'feature': 'sneaky_guess',
+                'animal_name': guess_animal,
+                'is_sneaky_guess': True,
+                'question_number': q_num,
+                'top_prediction': top_pred[0] if top_pred else None
             }
         
-        # Middle guess (sneaky guess)
-        q_num = game_state['question_count'] 
-        top_pred = srv.get_top_predictions(game_state, n=1)
-        return {
-            'should_guess': False,
-            'question': f"Is it a/an {guess_animal}?",
-            'feature': 'sneaky_guess',
-            'animal_name': guess_animal,
-            'is_sneaky_guess': True,
-            'question_number': q_num,
-            'top_prediction': top_pred[0] if top_pred else None
-        }
-    
-    # If not guessing, get next question
-    feature, question, game_state = srv.get_next_question(game_state)
-    db.set_session(session_id, game_state) 
+        feature, question, game_state = srv.get_next_question(game_state)
+        db.set_session(session_id, game_state) 
 
-    if not feature or not question:
+        if not feature or not question:
+            top_preds = srv.get_top_predictions(game_state, n=3)
+            if not top_preds:
+                 return {
+                    'question': "I'm stumped! You win!",
+                    'feature': "game_over_lost",
+                    'top_predictions': [],
+                    'should_guess': False,
+                    'is_sneaky_guess': False
+                }
+
+            return {
+                'should_guess': True,
+                'guess': top_preds[0]['animal'],
+                'guess_type': 'final',
+                'top_predictions': top_preds
+            }
+        
+        q_num = game_state['question_count'] + 1
+        top_pred = srv.get_top_predictions(game_state, n=1)
+        
         return {
-            'question': None,
-            'feature': None,
-            'top_predictions': srv.get_top_predictions(game_state, n=3)
+            'question': question,
+            'feature': feature,
+            'question_number': q_num,
+            'top_prediction': top_pred[0] if top_pred else None,
+            'should_guess': False,
+            'is_sneaky_guess': False
         }
-    
-    q_num = game_state['question_count'] + 1  # Add 1 to start from Q1
-    top_pred = srv.get_top_predictions(game_state, n=1)
-    
-    return {
-        'question': question,
-        'feature': feature,
-        'question_number': q_num,
-        'top_prediction': top_pred[0] if top_pred else None,
-        'should_guess': False,
-        'is_sneaky_guess': False
-    }
+    except Exception as e:
+        print(f"Error in /question: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 
 @app.post("/answer/{session_id}", summary="Submit an answer")
@@ -177,19 +207,16 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
     game_state = db.get_session(session_id)
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
+    
+    domain_name = game_state['domain_name'] # Get domain from state
 
     client_answer = payload.answer.lower().strip()
     feature = payload.feature
     
-    # Handle sneaky guess
     if feature == 'sneaky_guess':
         if client_answer in ['yes', 'y', 'usually']:
-            
-            # --- MODIFICATION: Save data on successful sneaky guess ---
             answered_features = game_state['answered_features']
-            srv.learn_animal(payload.animal_name, answered_features)
-            # --- END MODIFICATION ---
-
+            srv.record_suggestion(payload.animal_name, answered_features, domain_name) # Pass domain
             db.delete_session(session_id)
             return {
                 'status': 'guess_correct',
@@ -197,7 +224,6 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
                 'top_predictions': srv.get_top_predictions(game_state, n=5)
             }
 
-        # Rejected sneaky guess
         game_state = srv.reject_guess(game_state, payload.animal_name)
         if 'sneaky_guess' not in game_state['asked_features']:
             game_state['asked_features'].append('sneaky_guess')
@@ -208,7 +234,6 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
             'top_predictions': srv.get_top_predictions(game_state, n=5)
         }
     
-    # Handle normal question
     if feature not in game_state['asked_features']:
         game_state['asked_features'].append(feature)
 
@@ -223,7 +248,9 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
 
     status = 'skipped'
     if client_answer != 'skip' and brain_answer is not None:
-        fuzzy_value = srv.engine.fuzzy_map.get(brain_answer)
+        # Use the engine from the service to get the fuzzy map
+        engine_fuzzy_map = srv.engines.get(domain_name).fuzzy_map if srv.engines.get(domain_name) else {}
+        fuzzy_value = engine_fuzzy_map.get(brain_answer)
         if fuzzy_value is not None:
             game_state['answered_features'][feature] = fuzzy_value
             game_state = srv.process_answer(game_state, feature, brain_answer)
@@ -258,7 +285,6 @@ async def reject_animal(session_id: str, payload: RejectPayload):
     }
 
 
-# --- NEW ENDPOINT: /win ---
 @app.post("/win/{session_id}", summary="Confirm a final guess")
 async def confirm_win(session_id: str, payload: WinPayload):
     """
@@ -270,28 +296,23 @@ async def confirm_win(session_id: str, payload: WinPayload):
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
-    # Get the features from this successful game
     answered_features = game_state['answered_features']
+    domain_name = game_state['domain_name'] # Get domain
     
-    # Save the data. This will go to 'animalsuggest'
-    # because the animal already exists.
-    srv.learn_animal(payload.animal_name, answered_features)
-    
-    # Clean up the session
+    srv.record_suggestion(payload.animal_name, answered_features, domain_name) # Pass domain
+
     db.delete_session(session_id)
     
     return {
         'status': 'win_confirmed',
         'animal': payload.animal_name
     }
-# --- END NEW ENDPOINT ---
 
 
 @app.post("/learn/{session_id}", summary="Learn a new animal")
 async def learn_animal(session_id: str, payload: LearnPayload):
     """
     Finishes the game and teaches the engine a new animal.
-    This endpoint NO LONGER triggers an engine reload.
     """
     srv = get_service()
     game_state = db.get_session(session_id)
@@ -299,10 +320,10 @@ async def learn_animal(session_id: str, payload: LearnPayload):
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
     answered_features = game_state['answered_features']
+    domain_name = game_state['domain_name'] # Get domain
     
-    # This function now ONLY saves to DB.
-    result = srv.learn_animal(payload.animal_name, answered_features)
-    
+    result = srv.learn_new_animal(payload.animal_name, answered_features, domain_name) # Pass domain
+
     db.delete_session(session_id)
     
     return {
@@ -311,28 +332,83 @@ async def learn_animal(session_id: str, payload: LearnPayload):
         'db_status': result
     }
 
+# --- NEW ENDPOINT AS REQUESTED ---
+@app.get("/items_for_questions/{domain_name}", summary="Get random items for feature suggestion")
+async def get_items_for_questions(domain_name: str):
+    """
+    Returns a list of 5 random items (e.g., animals) from a
+    given domain. Used by the 'add_questions' page in the client.
+    """
+    srv = get_service()
+    
+    with srv.engines_lock:
+        engine = srv.engines.get(domain_name)
+        
+        if not engine:
+            raise HTTPException(status_code=404, detail=f"Domain '{domain_name}' not found.")
+        
+        # engine.animals is the list of item names
+        all_items = list(engine.animals)
+        
+        if len(all_items) == 0:
+            # Handle empty domain, though unlikely
+            return {"items": []}
+        
+        # Select 5 random items, or all items if fewer than 5
+        num_to_select = min(5, len(all_items))
+        selected_items = random.sample(all_items, num_to_select)
+        
+        return {"items": selected_items}
+# --- END NEW ENDPOINT ---
+
+
+@app.post("/suggest_feature", summary="Suggest a new feature")
+async def suggest_feature(payload: SuggestFeaturePayload):
+    """
+    Allows a user to suggest a new feature (question) and
+    provide the first answer for a specific item.
+    This does not require a session ID.
+    """
+    srv = get_service() # Just to check if service is up
+    
+    result = db.suggest_new_feature(
+        domain_name=payload.domain_name,
+        feature_name=payload.feature_name,
+        question_text=payload.question_text,
+        item_name=payload.item_name,
+        fuzzy_value=payload.fuzzy_value
+    )
+    
+    if result['status'] == 'error':
+        raise HTTPException(status_code=400, detail=result['message'])
+    
+    return result
+
 
 @app.get("/stats", summary="Get server statistics")
 async def get_stats():
     """
-    Returns statistics about active sessions and engine state.
+    Returns statistics about active sessions and all loaded domains.
     """
     srv = get_service()
     active_sessions = db.get_active_session_count()
     
-    # Thread-safe read of total animals
-    with srv.engine_lock:
-        total_animals = len(srv.engine.animals)
+    with srv.engines_lock:
+        domain_stats = {}
+        for domain, engine in srv.engines.items():
+            domain_stats[domain] = {
+                'total_items': len(engine.animals),
+                'total_features': len(engine.feature_cols),
+                'precomputed_features': len(engine.sorted_initial_feature_indices)
+            }
     
-    # Get cache statistics
     with srv._cache_lock:
         cache_size = len(srv._prediction_cache)
     
     return {
         'active_sessions': active_sessions,
-        'total_animals': total_animals,
         'prediction_cache_size': cache_size,
-        'engine_optimized': hasattr(srv.engine, '_question_cache') and len(srv.engine._question_cache) > 0
+        'domains': domain_stats
     }
 
 
@@ -353,58 +429,55 @@ async def get_predictions(session_id: str):
 @app.get("/performance", summary="Get performance metrics")
 async def get_performance():
     """
-    Returns performance metrics and optimization status.
+    Returns performance metrics for the default 'animals' domain.
     """
     srv = get_service()
     
-    with srv.engine_lock:
-        engine = srv.engine
-        has_cache = hasattr(engine, '_question_cache') and len(engine._question_cache) > 0
-        has_uniform_prior = hasattr(engine, '_uniform_prior') and engine._uniform_prior is not None
-        sorted_features_count = len(engine.sorted_initial_feature_indices)
-    
+    optimizations = {}
+    with srv.engines_lock:
+        engine = srv.engines.get("animals") # Get default domain
+        if engine:
+            optimizations = {
+                'domain': 'animals',
+                'uniform_prior_cached': hasattr(engine, 'sorted_initial_feature_indices'),
+                'precomputed_features': len(engine.sorted_initial_feature_indices),
+            }
+        else:
+            optimizations = {'domain': 'animals', 'status': 'not_loaded'}
+            
     with srv._cache_lock:
-        cache_size = len(srv._prediction_cache)
+        optimizations['prediction_cache_size'] = len(srv._prediction_cache)
     
     return {
-        'optimizations': {
-            'question_cache_enabled': has_cache,
-            'uniform_prior_cached': has_uniform_prior,
-            'precomputed_features': sorted_features_count,
-            'prediction_cache_size': cache_size
-        },
+        'optimizations': optimizations,
         'performance_tips': [
             "Q0 questions are precomputed for instant response",
             "Top predictions are cached for faster subsequent requests",
             "GZip compression is enabled for smaller responses",
-            "Engine is warmed up on startup for optimal performance"
+            "Engines are warmed up on startup for optimal performance"
         ]
     }
 
-# --- NEW: Admin Endpoint ---
 
 @app.post("/admin/reload", summary="Trigger engine reload", include_in_schema=False)
 async def trigger_reload(reload_token: str = Header(..., alias="X-Reload-Token")):
     """
-    Secure endpoint to trigger a background engine reload.
-    This is intended to be called by a cron job.
+    Secure endpoint to trigger a background reload of ALL engines.
     """
     if not config.RELOAD_SECRET_TOKEN:
         print("ERROR: Reload endpoint called but RELOAD_SECRET_TOKEN is not set.")
         raise HTTPException(status_code=503, detail="Reload endpoint is not configured")
         
     if reload_token != config.RELOAD_SECRET_TOKEN:
-        raise HTTPException(status_code=43, detail="Invalid or missing reload token")
+        raise HTTPException(status_code=403, detail="Invalid or missing reload token")
     
     srv = get_service()
         
     try:
-        # Start the background engine reload
         srv.start_engine_reload()
-
         return {
             "status": "ok",
-            "message": "Engine reload process started in background."
+            "message": "Engine reload process for ALL domains started in background."
         }
     except Exception as e:
         print(f"ERROR: /admin/reload failed to start: {e}")
@@ -416,5 +489,5 @@ if __name__ == "__main__":
         "main:app", 
         host="0.0.0.0", 
         port=config.PORT, 
-        reload=False # Enable auto-reload for development
+        reload=False
     )

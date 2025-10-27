@@ -1,7 +1,7 @@
 {
   "language": "python",
   "version": "3.11",
-  "start": "uv run uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2",
+  "start": "uv run uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1",
   "env": [
     "SUPABASE_URL",
     "SUPABASE_KEY",
