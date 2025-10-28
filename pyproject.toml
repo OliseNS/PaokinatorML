@@ -14,6 +14,7 @@ dependencies = [
     "torch",
     "msgpack",
     "msgpack-numpy",
+    "fastapi_limiter",
 ]
 
 [build-system]

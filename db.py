@@ -119,7 +119,12 @@ def get_all_domains() -> list[str]:
 
 # --- Data Loading ---
 def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame, list, dict]:
-    """Load and pivot domain data from Supabase with dynamic batch sizing."""
+    """
+    Load and pivot domain data from Supabase.
+    
+    *** MODIFIED ***
+    Now ONLY loads features AND items with status = 'active'.
+    """
     if not supabase:
         raise Exception("Supabase client not initialized")
     
@@ -134,7 +139,7 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
         domain_id = domain.data[0]['id']
         print(f"✓ Domain ID: {domain_id}")
         
-        # --- MODIFIED SECTION: Load only 'active' features ---
+        # --- MODIFIED: Load only 'active' features ---
         domain_features_response = supabase.table("domain_features") \
             .select("features(id, feature_name, question_text)") \
             .eq("domain_id", domain_id) \
@@ -143,9 +148,7 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
             .execute()
 
         if not domain_features_response.data:
-            # This is NOT a critical error, a domain might have no features yet
             print(f"⚠ No active features found for domain '{domain_name}'. Engine will be empty.")
-            # Return empty structure
             return pd.DataFrame(columns=['animal_name']), [], {}
 
         active_features_data = [row['features'] for row in domain_features_response.data if row.get('features')]
@@ -162,20 +165,23 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
         questions_map = {f['feature_name']: f['question_text'] for f in active_features_data if f.get('feature_name') and f.get('question_text')}
         print(f"✓ Question texts: {len(questions_map)}")
         
-        # Get all items
+        # --- *** MODIFICATION & FIX *** ---
+        # Get all *ACTIVE* items only
+        # Fixed indentation on all chained methods.
         items = supabase.table("items") \
             .select("id,item_name") \
             .eq("domain_id", domain_id) \
+            .eq("status", "active") \
             .limit(50000) \
             .execute()
         
         if not items.data:
-            print(f"⚠ No items found for domain '{domain_name}'. Engine will be empty.")
+            print(f"⚠ No 'active' items found for domain '{domain_name}'. Engine will be empty.")
             return pd.DataFrame(columns=['animal_name']), feature_id_to_name.values(), questions_map
         
         item_id_to_name = {i['id']: i['item_name'] for i in items.data}
         item_ids = list(item_id_to_name.keys())
-        print(f"✓ Items: {len(item_ids)}")
+        print(f"✓ Active Items: {len(item_ids)}")
         
         if feature_count == 0:
              print(f"⚠ No features, returning items list only.")
@@ -353,7 +359,7 @@ def _get_or_create_feature_id(feature_name: str, question_text: str = None) -> s
     insert_data = {
         "feature_name": feature_name,
         "question_text": question_text,
-        "status": "suggested"
+        "status": "suggested" # Features are already suggested by default
     }
     result = supabase.table("features").insert(insert_data).execute()
     return result.data[0]['id'] if result.data else None
@@ -379,7 +385,13 @@ def _get_feature_map() -> dict:
 
 
 def persist_new_animal(animal_name: str, answered_features: dict, domain_name: str = "animals") -> str:
-    """Insert new animal with its features."""
+    """
+    Insert new animal with its features.
+    
+    *** MODIFIED ***
+    New animals are now inserted with status = 'suggested'
+    and will NOT appear in the game until manually approved.
+    """
     if not supabase:
         return "error"
     
@@ -392,9 +404,12 @@ def persist_new_animal(animal_name: str, answered_features: dict, domain_name: s
             print(f"'{animal_name}' exists, saving as suggestion")
             return persist_suggestion(animal_name, answered_features, domain_name)
         
+        # --- *** MODIFICATION *** ---
+        # When inserting, set the status to 'suggested'
         item_res = supabase.table("items").insert({
             "item_name": animal_name,
-            "domain_id": domain_id
+            "domain_id": domain_id,
+            "status": "suggested"  # <-- ADD THIS LINE
         }).execute()
         item_id = item_res.data[0]['id']
         
@@ -415,8 +430,8 @@ def persist_new_animal(animal_name: str, answered_features: dict, domain_name: s
         if rows:
             supabase.table("item_features").insert(rows).execute()
         
-        print(f"✓ Inserted '{animal_name}' with {len(rows)} features")
-        return "inserted"
+        print(f"✓ Inserted '{animal_name}' as 'suggested' with {len(rows)} features")
+        return "inserted_as_suggestion" # Changed return value
     
     except Exception as e:
         print(f"✗ Error persisting '{animal_name}': {e}")
@@ -435,6 +450,9 @@ def persist_suggestion(animal_name: str, answered_features: dict, domain_name: s
         
         item_id = _get_item_id(domain_id, animal_name)
         if not item_id:
+            # This could happen if user is playing with a 'suggested' animal
+            # that got deleted, or a race condition.
+            print(f"Warning: Voted for '{animal_name}' but it was not found. Ignoring vote.")
             return "error_item_not_found"
         
         feature_map = _get_feature_map()
@@ -457,17 +475,6 @@ def persist_suggestion(animal_name: str, answered_features: dict, domain_name: s
                 
                 votes_recorded += 1
             except Exception as e:
-                # This fallback is in case the 'upsert_item_feature_vote' RPC doesn't exist
-                # For this to work, you should create a SQL function:
-                # CREATE OR REPLACE FUNCTION upsert_item_feature_vote(p_item_id UUID, p_feature_id UUID, p_value_sum FLOAT, p_vote_count INT)
-                # RETURNS void AS $$
-                # INSERT INTO item_features (item_id, feature_id, value_sum, vote_count)
-                # VALUES (p_item_id, p_feature_id, p_value_sum, p_vote_count)
-                # ON CONFLICT (item_id, feature_id)
-                # DO UPDATE SET
-                #   value_sum = item_features.value_sum + p_value_sum,
-                #   vote_count = item_features.vote_count + p_vote_count;
-                # $$ LANGUAGE sql;
                 print(f"✗ RPC failed, falling back to read-then-write for '{fname}': {e}")
                 # Fallback logic
                 existing = supabase.table("item_features").select("value_sum,vote_count").eq("item_id", item_id).eq("feature_id", feature_id).execute()

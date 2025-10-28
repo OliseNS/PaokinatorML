@@ -952,6 +952,7 @@ dependencies = [
     { name = "supabase" },
     { name = "torch" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "fastapi_limiter"},
 ]
 
 [package.metadata]
@@ -966,6 +967,7 @@ requires-dist = [
     { name = "supabase" },
     { name = "torch" },
     { name = "uvicorn", extras = ["standard"] },
+    { name = "fastapi_limiter"},
 ]
 
 [[package]]
