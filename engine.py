@@ -4,8 +4,8 @@ import torch
 
 class AkinatorEngine:
     """
-    Highly optimized PyTorch Akinator engine with improved question variance
-    and more conservative guessing strategy.
+    Highly optimized PyTorch Akinator engine with strategic sparse feature handling
+    and balanced question selection for maximum accuracy.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -22,6 +22,11 @@ class AkinatorEngine:
             'sometimes': 0.5, 'maybe': 0.5, 'rarely': 0.25,
             'no': 0.0, 'n': 0.0
         }
+        
+        # Randomly select 2 questions out of first 10 for sparse features
+        sparse_positions = np.random.choice(10, size=2, replace=False)
+        self.sparse_question_positions = set(sparse_positions)
+        self.sparse_questions_asked = 0
         
         self.sorted_initial_feature_indices = []
         self._precompute_likelihood_tables()
@@ -61,12 +66,22 @@ class AkinatorEngine:
         self.nan_mask = torch.isnan(self.features)
         self.features_filled = torch.nan_to_num(self.features, nan=0.5)
         
+        # Calculate NaN fractions and variance for each column
         col_nan_frac = np.isnan(features_np).mean(axis=0)
         col_var = np.nanvar(features_np, axis=0)
         col_var = np.where(np.isnan(col_var), 0.0, col_var)
         
-        self.allowed_feature_mask = (col_nan_frac < 0.8) & (col_var > 1e-4)
+        # Store NaN fractions for sparse feature selection
+        self.col_nan_frac = col_nan_frac
+        
+        # Allow features with <99% NaN and some variance
+        self.allowed_feature_mask = (col_nan_frac < 0.99) & (col_var > 1e-4)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
+        
+        # Identify sparse features (50-100% NaN) - good candidates for data population
+        # Even features with very high NaN can be useful for collecting new data
+        self.sparse_feature_mask = (col_nan_frac >= 0.50) & (col_nan_frac < 1.0) & (col_var > 1e-6)
+        self.sparse_feature_indices = np.where(self.sparse_feature_mask)[0].tolist()
         
         N = len(self.animals)
         if N > 0 and len(self.allowed_feature_indices) > 0:
@@ -231,31 +246,75 @@ class AkinatorEngine:
         
         return gains
 
+    def select_sparse_question(self, asked):
+        """
+        Select a sparse feature (50-100% NaN) to help populate missing data.
+        These questions are strategically placed at Q2 and Q6 to collect new data.
+        """
+        available_sparse = [
+            idx for idx in self.sparse_feature_indices
+            if self.feature_cols[idx] not in asked
+        ]
+        
+        if not available_sparse:
+            return None, None
+        
+        # Prefer features with higher NaN ratios (more data to collect)
+        nan_ratios = [self.col_nan_frac[idx] for idx in available_sparse]
+        
+        # Weight by NaN ratio - prefer higher NaN (more unknown data to populate)
+        weights = []
+        for ratio in nan_ratios:
+            if 0.80 <= ratio < 1.0:
+                weights.append(3.0)  # Highest priority - lots of missing data
+            elif 0.70 <= ratio < 0.80:
+                weights.append(2.0)  # High priority
+            elif 0.60 <= ratio < 0.70:
+                weights.append(1.5)  # Good priority
+            else:  # 0.50 <= ratio < 0.60
+                weights.append(1.0)  # Standard priority
+        
+        weights = np.array(weights)
+        weights = weights / weights.sum()
+        
+        chosen_idx = np.random.choice(available_sparse, p=weights)
+        feature = self.feature_cols[chosen_idx]
+        question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
+        
+        return feature, question
+
     def select_question(self, prior, asked, question_count):
         """
-        Select most informative question with variance in early questions.
+        Strategic question selection for maximum accuracy:
         
-        Q0: Random from top 10 precomputed features (VARIED)
-        Q1-4: Random from top 5 of 25 best precomputed features (MORE VARIANCE)
-        Q5+: Pick best from 40 features (MORE ACCURATE)
+        Q0-1: Random from top 8 highest info gain features (variety + quality)
+        2 SPARSE questions: Randomly placed within first 10 questions (changes each game)
+        Other questions: Best from progressively larger pools for accuracy
         """
         
-        # === Q0: VARIED START - RANDOM FROM TOP 10 ===
-        if question_count == 0:
+        # === CHECK IF THIS POSITION SHOULD BE SPARSE ===
+        if question_count in self.sparse_question_positions and self.sparse_questions_asked < 2:
+            feature, question = self.select_sparse_question(asked)
+            if feature is not None:
+                self.sparse_questions_asked += 1
+                return feature, question
+            # Fall through to normal selection if no sparse features available
+        
+        # === Q0-1: RANDOM FROM TOP 8 FOR VARIETY ===
+        if question_count < 2:
             if self.sorted_initial_feature_indices:
-                available_top_10 = [
-                    idx for idx in self.sorted_initial_feature_indices[:10]
+                available_top = [
+                    idx for idx in self.sorted_initial_feature_indices[:8]
                     if self.feature_cols[idx] not in asked
                 ]
                 
-                if available_top_10:
-                    # RANDOM choice from top 10 for variety
-                    chosen_idx = np.random.choice(available_top_10)
+                if available_top:
+                    chosen_idx = np.random.choice(available_top)
                     feature = self.feature_cols[chosen_idx]
                     question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
                     return feature, question
         
-        # === Q1-4: MORE VARIANCE - EXPANDED POOL ===
+        # === PREPARE AVAILABLE FEATURES ===
         all_available_indices = [
             i for i, f in enumerate(self.feature_cols)
             if f not in asked and self.allowed_feature_mask[i]
@@ -264,9 +323,9 @@ class AkinatorEngine:
         if not all_available_indices:
             return None, None
         
-        if question_count < 5:
-            # Expanded from 15 to 25 for more variety
-            MAX_FEATURES_TO_CHECK = 25
+        # === Q2-5: TOP 30 FEATURES (BALANCED) ===
+        if question_count < 6:
+            MAX_FEATURES_TO_CHECK = 30
             
             available_set = set(all_available_indices)
             top_available_features = [
@@ -282,8 +341,8 @@ class AkinatorEngine:
                 new_idx: old_idx for new_idx, old_idx in enumerate(available_features_to_check)
             }
 
+        # === Q6+: TOP 40 FEATURES (MAXIMUM ACCURACY) ===
         else:
-            # === Q5+: MORE ACCURATE - EXPANDED FROM 30 TO 40 ===
             MAX_FEATURES_TO_CHECK = 40
             
             if len(all_available_indices) > MAX_FEATURES_TO_CHECK:
@@ -294,20 +353,15 @@ class AkinatorEngine:
                 sampled_indices_map = {idx: old_idx for idx, old_idx in enumerate(all_available_indices)}
                 available_features_to_check = all_available_indices
         
+        # Calculate information gains
         gains_tensor = self.info_gain_batch(prior, available_features_to_check)
         sorted_indices_of_gains = torch.argsort(gains_tensor, descending=True)
 
         if len(sorted_indices_of_gains) == 0:
             return None, None
 
-        # Q1-4: Random from top 5 (expanded from 3)
-        if question_count < 5:
-            top_n = min(5, len(sorted_indices_of_gains))
-            chosen_local_idx = sorted_indices_of_gains[np.random.randint(top_n)]
-        else:
-            # Q5+: Always best
-            chosen_local_idx = sorted_indices_of_gains[0]
-        
+        # Always pick the best feature (no randomness after Q1)
+        chosen_local_idx = sorted_indices_of_gains[0]
         idx = sampled_indices_map[chosen_local_idx.item()]
         
         feature = self.feature_cols[idx]
@@ -316,7 +370,7 @@ class AkinatorEngine:
     
     def should_guess(self, prior, question_count):
         """
-        More conservative guessing strategy to improve accuracy.
+        Conservative guessing strategy to maximize accuracy.
         
         Returns: (should_guess, confidence, top_animal_idx)
         """
@@ -331,13 +385,16 @@ class AkinatorEngine:
         # Calculate separation ratio
         separation = top_prob / (second_prob + 1e-10)
         
-        # More conservative thresholds
+        # Conservative thresholds that increase accuracy
         if question_count < 8:
             # Need very high confidence early on
-            should_guess = top_prob > 0.70 and separation > 5.0
+            should_guess = top_prob > 0.75 and separation > 6.0
         elif question_count < 12:
             # Moderate confidence needed
-            should_guess = top_prob > 0.55 and separation > 3.5
+            should_guess = top_prob > 0.60 and separation > 4.0
+        elif question_count < 15:
+            # Standard confidence
+            should_guess = top_prob > 0.50 and separation > 3.0
         else:
             # More lenient after many questions
             should_guess = top_prob > 0.40 and separation > 2.5
