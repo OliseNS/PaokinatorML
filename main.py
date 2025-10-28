@@ -401,6 +401,36 @@ async def suggest_feature(payload: SuggestFeaturePayload):
     return result
 
 
+# --- NEW DATA COLLECTION ENDPOINT ---
+@app.get("/features_for_data_collection/{domain_name}", summary="Get features for data collection")
+async def get_features_for_data_collection(domain_name: str, item_name: str):
+    """
+    Gets 5 features for a specific item to collect data from the user.
+    
+    Prioritizes features that are 'null' (NaN) for that item,
+    then pads the list with globally 'sparse' features
+    to ensure 5 questions are always returned for data collection.
+    """
+    srv = get_service()
+    try:
+        features = srv.get_data_collection_features(domain_name, item_name)
+        
+        # This could happen if the engine has no allowed features at all
+        if not features and len(srv.engines.get(domain_name).animals) > 0:
+            print(f"Warning: No data collection features found for {item_name} in {domain_name}.")
+        
+        return {"features": features, "item_name": item_name, "domain_name": domain_name}
+    
+    except ValueError as e:
+        # Raised by service if domain not found
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        # General error
+        print(f"Error in /features_for_data_collection: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+# --- END NEW ENDPOINT ---
+
+
 @app.get("/stats", summary="Get server statistics")
 async def get_stats():
     """

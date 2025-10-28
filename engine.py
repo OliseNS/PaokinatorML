@@ -435,3 +435,77 @@ class AkinatorEngine:
             return feature, question
 
         return None, None
+
+    # --- NEW METHOD ---
+    def get_features_for_data_collection(self, item_name: str, num_features: int = 5) -> list[dict]:
+        """
+        Gets a list of features for data collection for a specific item.
+        
+        1. Prioritizes features that are NULL (NaN) for this specific item.
+        2. Pads with globally sparse features (high NaN count).
+        3. Pads with any other allowed feature to meet num_features.
+        """
+        final_feature_indices = []
+        
+        # --- 1. Find item-specific NULLs ---
+        item_idx_list = np.where(self.animals == item_name)[0]
+        
+        if len(item_idx_list) > 0:
+            # Item was found
+            item_idx = item_idx_list[0]
+            item_row = self.features[item_idx]
+            
+            # Find all NaN indices in this item's row
+            null_indices_tensor = torch.where(torch.isnan(item_row))[0]
+            
+            # Filter these to only include "allowed" features
+            allowed_indices_set = set(self.allowed_feature_indices)
+            item_null_features = list(set(null_indices_tensor.tolist()).intersection(allowed_indices_set))
+            
+            # Shuffle them to get a random subset
+            np.random.shuffle(item_null_features)
+            final_feature_indices = item_null_features[:num_features]
+        
+        # --- 2. Pad with globally sparse features (if needed) ---
+        num_needed = num_features - len(final_feature_indices)
+        if num_needed > 0:
+            # Get sparse features that are not already in our list
+            sparse_pool = set(self.sparse_feature_indices)
+            sparse_pool = sparse_pool - set(final_feature_indices)
+            
+            padding_pool = list(sparse_pool)
+            np.random.shuffle(padding_pool)
+            
+            final_feature_indices.extend(padding_pool[:num_needed])
+
+        # --- 3. Pad with ANY allowed feature (if still needed) ---
+        num_needed = num_features - len(final_feature_indices)
+        if num_needed > 0:
+            all_allowed_pool = set(self.allowed_feature_indices)
+            all_allowed_pool = all_allowed_pool - set(final_feature_indices)
+
+            padding_pool = list(all_allowed_pool)
+            np.random.shuffle(padding_pool)
+            
+            final_feature_indices.extend(padding_pool[:num_needed])
+            
+        # --- 4. Format the output ---
+        output_list = []
+        for idx in final_feature_indices:
+            feature_name = self.feature_cols[idx]
+            
+            # Re-format question to be more open-ended for data entry
+            q_base = self.questions_map.get(feature_name, f"Is it {feature_name.replace('_', ' ')}?")
+            if q_base.lower().startswith("is it"):
+                 q_text = f"For '{item_name}', {q_base[3:]}" # e.g., "For 'Lion', a large cat?"
+            elif q_base.lower().startswith("does it"):
+                 q_text = f"For '{item_name}', {q_base[8:]}" # e.g., "For 'Lion', have a mane?"
+            else:
+                 q_text = q_base # Use as-is
+            
+            output_list.append({
+                "feature_name": feature_name,
+                "question": q_text
+            })
+        
+        return output_list

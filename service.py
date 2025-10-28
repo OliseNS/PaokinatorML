@@ -349,6 +349,21 @@ class AkinatorService:
             
         return game_state
 
+    # --- NEW METHOD ---
+    def get_data_collection_features(self, domain_name: str, item_name: str) -> list[dict]:
+        """
+        Gets 5 features for data collection for a specific item.
+        Prioritizes nulls for that item, then pads with sparse features.
+        """
+        with self.engines_lock:
+            engine = self.engines.get(domain_name)
+            if not engine:
+                raise ValueError(f"Domain '{domain_name}' not found.")
+        
+        # Call the engine method (it handles item-not-found logic)
+        # We don't need the lock for this part as it's read-only
+        return engine.get_features_for_data_collection(item_name, num_features=5)
+
     def record_suggestion(self, animal_name: str, answered_features: dict, domain_name: str) -> str:
         """
         Persists a "suggestion" (a completed game for an EXISTING
