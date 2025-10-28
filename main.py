@@ -3,17 +3,17 @@ import uuid
 import time
 import gzip
 import json
-import random  # <-- ADDED IMPORT
+import random
 from fastapi import FastAPI, HTTPException, Request, Header, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
 
-# Import from our project files
+# Import from our project files (Assumed to exist for the server to run)
 import config
 from service import AkinatorService
-import db  # We still need db for session functions
+import db
 
 # --- Pydantic Models for Request Bodies ---
 
@@ -134,6 +134,18 @@ async def get_question(session_id: str):
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
+    # --- NEW HELPER FUNCTION ---
+    def get_article(word: str) -> str:
+        """Determines if 'a' or 'an' should precede the word."""
+        if not word:
+            return ""
+        # Check if the first non-space character is a vowel (case-insensitive)
+        first_char = word.strip()[0].lower()
+        if first_char in 'aeiou':
+            return "an"
+        return "a"
+    # --- END NEW HELPER FUNCTION ---
+    
     try:
         should_guess, guess_animal, guess_type = srv.should_make_guess(game_state)
         
@@ -151,9 +163,13 @@ async def get_question(session_id: str):
             
             q_num = game_state['question_count'] 
             top_pred = srv.get_top_predictions(game_state, n=1)
+            
+            # --- MODIFIED LOGIC TO USE CORRECT ARTICLE ---
+            article = get_article(guess_animal)
+            
             return {
                 'should_guess': False,
-                'question': f"Is it a/an {guess_animal}?",
+                'question': f"Is it {article} {guess_animal}?",
                 'feature': 'sneaky_guess',
                 'animal_name': guess_animal,
                 'is_sneaky_guess': True,
