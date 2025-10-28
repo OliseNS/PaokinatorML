@@ -17,6 +17,5 @@ dependencies = [
     "redis",
     "msgpack",
     "msgpack-numpy",
-    "python-dotenv",
-    "fastapi-limiter"
+    "python-dotenv"
 ]

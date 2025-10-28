@@ -4,45 +4,20 @@ import time
 import gzip
 import json
 import random
-import re # <-- For validation
-from fastapi import FastAPI, HTTPException, Request, Header, Response, Depends
+from fastapi import FastAPI, HTTPException, Request, Header, Response
 from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel
 from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
 
-# --- NEW: Import for Rate Limiter ---
-from fastapi_limiter import FastAPILimiter
-from fastapi_limiter.depends import RateLimiter
-import redis.asyncio as aioredis # <-- Use async redis for the limiter
-
-# Import from our project files
+# Import from our project files (Assumed to exist for the server to run)
 import config
 from service import AkinatorService
 import db
 
-# --- Helper for Validation ---
-# Disallow URLs and excessively long strings
-# Allows basic letters, numbers, spaces, and punctuation.
-SAFE_STRING_REGEX = re.compile(r"^[a-zA-Z0-9\s.,'!?()-]{1,100}$")
-# A more permissive regex for questions
-SAFE_QUESTION_REGEX = re.compile(r"^[a-zA-Z0-9\s.,'!?()-?\/]{1,250}$")
-
-def validate_safe_string(name: str) -> str:
-    if not name or not SAFE_STRING_REGEX.match(name):
-        raise ValueError("Invalid input: Must be 1-100 chars, no special characters or URLs.")
-    return name.strip()
-
-def validate_question(text: str) -> str:
-    if not text or not SAFE_QUESTION_REGEX.match(text):
-        raise ValueError("Invalid question: Must be 1-250 chars, no special characters or URLs.")
-    return text.strip()
-
-
-# --- Pydantic Models with Validation ---
 
 class StartPayload(BaseModel):
-    domain_name: str = "animals"
+    domain_name: str = "animals" # Default to "animals"
 
 class AnswerPayload(BaseModel):
     feature: str
@@ -53,27 +28,18 @@ class RejectPayload(BaseModel):
     animal_name: str
 
 class WinPayload(BaseModel):
-    # Validation: Check animal_name for spam
-    animal_name: str = Field(..., max_length=100)
-    _validate_name = field_validator("animal_name")(validate_safe_string)
+    animal_name: str
 
 class LearnPayload(BaseModel):
-    # Validation: Check animal_name for spam
-    animal_name: str = Field(..., max_length=100)
-    _validate_name = field_validator("animal_name")(validate_safe_string)
+    animal_name: str
 
+# --- NEW: Model for suggesting a feature ---
 class SuggestFeaturePayload(BaseModel):
-    domain_name: str = Field(..., max_length=50)
-    feature_name: str = Field(..., max_length=100)
-    question_text: str = Field(..., max_length=250)
-    item_name: str = Field(..., max_length=100)
-    fuzzy_value: float
-
-    # Validation: Check all text fields for spam
-    _validate_domain = field_validator("domain_name")(validate_safe_string)
-    _validate_feature = field_validator("feature_name")(validate_safe_string)
-    _validate_item = field_validator("item_name")(validate_safe_string)
-    _validate_question = field_validator("question_text")(validate_question)
+    domain_name: str
+    feature_name: str
+    question_text: str
+    item_name: str     # Changed from animal_name to be generic
+    fuzzy_value: float # The answer for that item (e.g., 1.0 for 'yes')
 
 # --- Global Service Variable ---
 service: AkinatorService | None = None
@@ -83,26 +49,6 @@ service: AkinatorService | None = None
 async def lifespan(app: FastAPI):
     global service
     print("FastAPI server starting up...")
-    
-    # --- NEW: Initialize Rate Limiter ---
-    try:
-        # Use your existing config.py variables
-        redis_url = f"redis://{config.REDIS_HOST}:{config.REDIS_PORT}"
-        print(f"Connecting to Redis for Rate Limiting at: {redis_url}")
-        redis_connection = aioredis.from_url(
-            redis_url,
-            password=config.REDIS_PASSWORD,
-            encoding="utf-8",
-            decode_responses=True
-        )
-        await FastAPILimiter.init(redis_connection)
-        print("✓ Connected to Redis for Rate Limiting")
-    except Exception as e:
-        print(f"✗ CRITICAL: Failed to init FastAPILimiter: {e}")
-        # In production, you might want to exit if this fails
-        # raise e 
-    
-    # --- Your existing startup code ---
     try:
         service = AkinatorService()
         
@@ -123,15 +69,13 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # --- NEW: Shutdown limiter ---
-    await FastAPILimiter.close()
     print("FastAPI server shutting down...")
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Akinator API",
     description="Multi-domain Akinator-style game server.",
-    version="1.2.0-secure", # Updated version
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -141,7 +85,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
-    process_time = (time.time() - start_time) * 1000 # Corrected calculation
+    process_time = (time.time() * 1000)
     response.headers["X-Process-Time-ms"] = f"{process_time:.2f}"
     return response
 
@@ -219,6 +163,7 @@ async def get_question(session_id: str):
             q_num = game_state['question_count'] 
             top_pred = srv.get_top_predictions(game_state, n=1)
             
+            # --- MODIFIED LOGIC TO USE CORRECT ARTICLE ---
             article = get_article(guess_animal)
             
             return {
@@ -355,14 +300,11 @@ async def reject_animal(session_id: str, payload: RejectPayload):
     }
 
 
-@app.post("/win/{session_id}", 
-          summary="Confirm a final guess",
-          dependencies=[Depends(RateLimiter(times=20, seconds=60))]) # 20 votes/min
-async def confirm_win(session_id: str, payload: WinPayload, request: Request):
+@app.post("/win/{session_id}", summary="Confirm a final guess")
+async def confirm_win(session_id: str, payload: WinPayload):
     """
     Confirms the engine's final guess was correct.
     This saves the session data as a suggestion.
-    (Rate Limited: 20 times per minute per IP)
     """
     srv = get_service()
     game_state = db.get_session(session_id)
@@ -382,14 +324,10 @@ async def confirm_win(session_id: str, payload: WinPayload, request: Request):
     }
 
 
-@app.post("/learn/{session_id}", 
-          summary="Learn a new animal",
-          dependencies=[Depends(RateLimiter(times=5, seconds=300))]) # 5 items/5 min
-async def learn_animal(session_id: str, payload: LearnPayload, request: Request):
+@app.post("/learn/{session_id}", summary="Learn a new animal")
+async def learn_animal(session_id: str, payload: LearnPayload):
     """
     Finishes the game and teaches the engine a new animal.
-    New animals are added to a 'suggested' queue for approval.
-    (Rate Limited: 5 times per 5 minutes per IP)
     """
     srv = get_service()
     game_state = db.get_session(session_id)
@@ -404,11 +342,12 @@ async def learn_animal(session_id: str, payload: LearnPayload, request: Request)
     db.delete_session(session_id)
     
     return {
-        'message': f"Thank you! Your suggestion for '{payload.animal_name}' has been submitted for review.",
+        'message': f"Thank you! I've learned about {payload.animal_name}.",
         'features_learned': len(answered_features),
         'db_status': result
     }
 
+# --- NEW ENDPOINT AS REQUESTED ---
 @app.get("/items_for_questions/{domain_name}", summary="Get random items for feature suggestion")
 async def get_items_for_questions(domain_name: str):
     """
@@ -423,26 +362,27 @@ async def get_items_for_questions(domain_name: str):
         if not engine:
             raise HTTPException(status_code=404, detail=f"Domain '{domain_name}' not found.")
         
+        # engine.animals is the list of item names
         all_items = list(engine.animals)
         
         if len(all_items) == 0:
+            # Handle empty domain, though unlikely
             return {"items": []}
         
+        # Select 5 random items, or all items if fewer than 5
         num_to_select = min(5, len(all_items))
         selected_items = random.sample(all_items, num_to_select)
         
         return {"items": selected_items}
+# --- END NEW ENDPOINT ---
 
 
-@app.post("/suggest_feature", 
-          summary="Suggest a new feature",
-          dependencies=[Depends(RateLimiter(times=2, seconds=300))]) # 2 features/5 min
-async def suggest_feature(payload: SuggestFeaturePayload, request: Request):
+@app.post("/suggest_feature", summary="Suggest a new feature")
+async def suggest_feature(payload: SuggestFeaturePayload):
     """
     Allows a user to suggest a new feature (question) and
     provide the first answer for a specific item.
-    New features are added to a 'suggested' queue for approval.
-    (Rate Limited: 2 times per 5 minutes per IP)
+    This does not require a session ID.
     """
     srv = get_service() # Just to check if service is up
     
@@ -460,25 +400,34 @@ async def suggest_feature(payload: SuggestFeaturePayload, request: Request):
     return result
 
 
+# --- NEW DATA COLLECTION ENDPOINT ---
 @app.get("/features_for_data_collection/{domain_name}", summary="Get features for data collection")
 async def get_features_for_data_collection(domain_name: str, item_name: str):
     """
     Gets 5 features for a specific item to collect data from the user.
+    
+    Prioritizes features that are 'null' (NaN) for that item,
+    then pads the list with globally 'sparse' features
+    to ensure 5 questions are always returned for data collection.
     """
     srv = get_service()
     try:
         features = srv.get_data_collection_features(domain_name, item_name)
         
+        # This could happen if the engine has no allowed features at all
         if not features and len(srv.engines.get(domain_name).animals) > 0:
             print(f"Warning: No data collection features found for {item_name} in {domain_name}.")
         
         return {"features": features, "item_name": item_name, "domain_name": domain_name}
     
     except ValueError as e:
+        # Raised by service if domain not found
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        # General error
         print(f"Error in /features_for_data_collection: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+# --- END NEW ENDPOINT ---
 
 
 @app.get("/stats", summary="Get server statistics")
