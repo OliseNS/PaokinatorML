@@ -4,8 +4,8 @@ import torch
 
 class AkinatorEngine:
     """
-    Highly optimized PyTorch Akinator engine with strategic sparse feature handling
-    and balanced question selection for maximum accuracy.
+    Highly optimized PyTorch Akinator engine with improved accuracy for niche animals
+    and faster performance through better batching and threshold tuning.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -14,8 +14,9 @@ class AkinatorEngine:
         self.questions_map = questions_map
 
         self.answer_values = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0], dtype=torch.float32)
-        self.definite_exp = -6.0
-        self.uncertain_exp = -3.0
+        # Softer penalties for better niche animal handling
+        self.definite_exp = -4.5  # Was -6.0
+        self.uncertain_exp = -2.5  # Was -3.0
 
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0, 'usually': 0.75,
@@ -23,17 +24,16 @@ class AkinatorEngine:
             'no': 0.0, 'n': 0.0
         }
         
-        # Randomly select 2 questions out of first 10 for sparse features
-        sparse_positions = np.random.choice(10, size=2, replace=False)
-        self.sparse_question_positions = set(sparse_positions)
-        self.sparse_questions_asked = 0
+        # Single sparse question at random position 5-10
+        self.sparse_question_position = np.random.randint(5, 11)
+        self.sparse_question_asked = False
         
         self.sorted_initial_feature_indices = []
         self._precompute_likelihood_tables()
         self._build_tensors()
         
     def _precompute_likelihood_tables(self):
-        """Precompute all possible likelihoods for instant lookup."""
+        """Precompute all possible likelihoods with gentler penalties."""
         feature_grid = torch.linspace(0.0, 1.0, 21)
         n_grid = len(feature_grid)
         n_answers = len(self.answer_values)
@@ -46,14 +46,15 @@ class AkinatorEngine:
                 dist = abs(fval - aval)
                 
                 like_def = np.exp(self.definite_exp * dist)
+                # Gentler penalties for niche animals
                 if dist > 0.7:
-                    like_def *= 0.001
+                    like_def *= 0.01  # Was 0.001
                 elif dist > 0.3:
-                    like_def *= 0.2
-                self.likelihood_table_definite[i, j] = np.clip(like_def, 0.0001, 1.0)
+                    like_def *= 0.3  # Was 0.2
+                self.likelihood_table_definite[i, j] = np.clip(like_def, 0.001, 1.0)
                 
                 like_unc = np.exp(self.uncertain_exp * dist)
-                self.likelihood_table_uncertain[i, j] = np.clip(like_unc, 0.0001, 1.0)
+                self.likelihood_table_uncertain[i, j] = np.clip(like_unc, 0.001, 1.0)
         
         self.feature_grid = feature_grid
         
@@ -71,15 +72,13 @@ class AkinatorEngine:
         col_var = np.nanvar(features_np, axis=0)
         col_var = np.where(np.isnan(col_var), 0.0, col_var)
         
-        # Store NaN fractions for sparse feature selection
         self.col_nan_frac = col_nan_frac
         
         # Allow features with <99% NaN and some variance
         self.allowed_feature_mask = (col_nan_frac < 0.99) & (col_var > 1e-4)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
-        # Identify sparse features (50-100% NaN) - good candidates for data population
-        # Even features with very high NaN can be useful for collecting new data
+        # Sparse features (50-100% NaN) for data population
         self.sparse_feature_mask = (col_nan_frac >= 0.50) & (col_nan_frac < 1.0) & (col_var > 1e-6)
         self.sparse_feature_indices = np.where(self.sparse_feature_mask)[0].tolist()
         
@@ -102,7 +101,7 @@ class AkinatorEngine:
             self.sorted_initial_feature_indices = []
 
     def _fast_info_gain_numpy(self, prior_np, feature_indices):
-        """Fast info gain using precomputed likelihood tables."""
+        """Fast info gain using precomputed likelihood tables - batched."""
         curr_entropy = self._entropy_numpy(prior_np)
         if curr_entropy < 0.01:
             return np.zeros(len(feature_indices))
@@ -116,29 +115,31 @@ class AkinatorEngine:
         A = len(self.answer_values)
         n = len(features_np)
         
+        # Vectorized likelihood computation
         likelihoods = np.zeros((n, k, A))
         for a_idx, aval in enumerate(self.answer_values):
             is_definite = abs(aval - 0.5) > 0.3
             table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
-            
-            for f_idx in range(k):
-                indices = quantized[:, f_idx]
-                likelihoods[:, f_idx, a_idx] = table[indices, a_idx].numpy()
+            likelihoods[:, :, a_idx] = table.numpy()[quantized, a_idx]
         
         likelihoods = np.where(nan_mask_np[:, :, None], 1.0, likelihoods)
         
+        # Vectorized probability computation
         prob_answer = prior_np @ likelihoods.reshape(n, -1)
         prob_answer = prob_answer.reshape(k, A)
         
+        # Vectorized entropy computation
         gains = np.zeros(k)
         for f_idx in range(k):
+            posteriors = prior_np[:, None] * likelihoods[:, f_idx, :]
+            post_sums = posteriors.sum(axis=0)
+            
             exp_ent = 0.0
             for a_idx in range(A):
-                posterior = prior_np * likelihoods[:, f_idx, a_idx]
-                post_sum = posterior.sum()
-                if post_sum > 1e-10:
-                    posterior = posterior / post_sum
+                if post_sums[a_idx] > 1e-10:
+                    posterior = posteriors[:, a_idx] / post_sums[a_idx]
                     exp_ent += prob_answer[f_idx, a_idx] * self._entropy_numpy(posterior)
+            
             gains[f_idx] = curr_entropy - exp_ent
         
         return gains
@@ -188,11 +189,12 @@ class AkinatorEngine:
         return posterior / (posterior.sum() + 1e-10)
 
     def info_gain_batch(self, prior, feature_indices):
-        """Compute information gain using efficient matmul operations."""
+        """Compute information gain with active set optimization."""
         curr_entropy = self.entropy(prior)
         if curr_entropy < 0.01 or not feature_indices:
             return torch.zeros(len(feature_indices))
 
+        # Active set optimization - focus on high-probability candidates
         active_thresh = 1e-8
         active_idx = torch.where(prior > active_thresh)[0]
         
@@ -201,7 +203,8 @@ class AkinatorEngine:
             prior = torch.ones_like(prior) / len(prior)
             curr_entropy = self.entropy(prior)
 
-        if len(active_idx) < len(prior):
+        # Use active subset for faster computation
+        if len(active_idx) < len(prior) * 0.8:  # Only optimize if significant reduction
             prior_sub = prior[active_idx]
             prior_sub = prior_sub / (prior_sub.sum() + 1e-12)
             feature_batch = self.features_filled[active_idx][:, feature_indices]
@@ -218,6 +221,7 @@ class AkinatorEngine:
         quantized = torch.clamp(torch.round(feature_batch * 20).long(), 0, 20)
         likelihoods = torch.zeros(n, k, A)
         
+        # Vectorized likelihood lookup
         for a_idx, aval in enumerate(self.answer_values):
             is_definite = abs(aval.item() - 0.5) > 0.3
             table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
@@ -226,10 +230,12 @@ class AkinatorEngine:
         likelihoods = torch.where(nan_mask_batch.unsqueeze(-1), 
                                   torch.ones_like(likelihoods), likelihoods)
         
+        # Fast matmul for probability computation
         prior_2d = prior_sub.unsqueeze(0)
         like_2d = likelihoods.view(n, k * A)
         prob_answer = torch.matmul(prior_2d, like_2d).view(k, A)
         
+        # Vectorized gain computation
         gains = torch.zeros(k)
         for f_idx in range(k):
             expected_ent = 0.0
@@ -247,10 +253,7 @@ class AkinatorEngine:
         return gains
 
     def select_sparse_question(self, asked):
-        """
-        Select a sparse feature (50-100% NaN) to help populate missing data.
-        These questions are strategically placed at Q2 and Q6 to collect new data.
-        """
+        """Select a sparse feature (50-100% NaN) to populate missing data."""
         available_sparse = [
             idx for idx in self.sparse_feature_indices
             if self.feature_cols[idx] not in asked
@@ -259,20 +262,18 @@ class AkinatorEngine:
         if not available_sparse:
             return None, None
         
-        # Prefer features with higher NaN ratios (more data to collect)
+        # Weight by NaN ratio - prefer higher NaN
         nan_ratios = [self.col_nan_frac[idx] for idx in available_sparse]
-        
-        # Weight by NaN ratio - prefer higher NaN (more unknown data to populate)
         weights = []
         for ratio in nan_ratios:
             if 0.80 <= ratio < 1.0:
-                weights.append(3.0)  # Highest priority - lots of missing data
+                weights.append(3.0)
             elif 0.70 <= ratio < 0.80:
-                weights.append(2.0)  # High priority
+                weights.append(2.0)
             elif 0.60 <= ratio < 0.70:
-                weights.append(1.5)  # Good priority
-            else:  # 0.50 <= ratio < 0.60
-                weights.append(1.0)  # Standard priority
+                weights.append(1.5)
+            else:
+                weights.append(1.0)
         
         weights = np.array(weights)
         weights = weights / weights.sum()
@@ -285,26 +286,24 @@ class AkinatorEngine:
 
     def select_question(self, prior, asked, question_count):
         """
-        Strategic question selection for maximum accuracy:
-        
-        Q0-1: Random from top 8 highest info gain features (variety + quality)
-        2 SPARSE questions: Randomly placed within first 10 questions (changes each game)
-        Other questions: Best from progressively larger pools for accuracy
+        Strategic question selection:
+        Q0-2: Random from top 5 highest info gain (variety + quality)
+        Q5-10: 1 sparse question at random position (data collection)
+        Q3+: Best from progressively larger pools (accuracy)
         """
         
-        # === CHECK IF THIS POSITION SHOULD BE SPARSE ===
-        if question_count in self.sparse_question_positions and self.sparse_questions_asked < 2:
+        # === SPARSE QUESTION AT RANDOM POSITION 5-10 ===
+        if question_count == self.sparse_question_position and not self.sparse_question_asked:
             feature, question = self.select_sparse_question(asked)
             if feature is not None:
-                self.sparse_questions_asked += 1
+                self.sparse_question_asked = True
                 return feature, question
-            # Fall through to normal selection if no sparse features available
         
-        # === Q0-1: RANDOM FROM TOP 8 FOR VARIETY ===
-        if question_count < 2:
+        # === Q0-2: RANDOM FROM TOP 5 FOR VARIETY ===
+        if question_count < 3:
             if self.sorted_initial_feature_indices:
                 available_top = [
-                    idx for idx in self.sorted_initial_feature_indices[:8]
+                    idx for idx in self.sorted_initial_feature_indices[:5]
                     if self.feature_cols[idx] not in asked
                 ]
                 
@@ -323,35 +322,33 @@ class AkinatorEngine:
         if not all_available_indices:
             return None, None
         
-        # === Q2-5: TOP 30 FEATURES (BALANCED) ===
-        if question_count < 6:
-            MAX_FEATURES_TO_CHECK = 30
-            
-            available_set = set(all_available_indices)
-            top_available_features = [
-                idx for idx in self.sorted_initial_feature_indices
-                if idx in available_set
-            ][:MAX_FEATURES_TO_CHECK]
-
-            if not top_available_features:
-                top_available_features = all_available_indices[:MAX_FEATURES_TO_CHECK]
-            
-            available_features_to_check = top_available_features
-            sampled_indices_map = {
-                new_idx: old_idx for new_idx, old_idx in enumerate(available_features_to_check)
-            }
-
-        # === Q6+: TOP 40 FEATURES (MAXIMUM ACCURACY) ===
+        # === ADAPTIVE FEATURE POOL SIZE ===
+        # Start small, grow larger for better accuracy
+        if question_count < 5:
+            MAX_FEATURES_TO_CHECK = 20  # Small pool early
+        elif question_count < 8:
+            MAX_FEATURES_TO_CHECK = 35  # Medium pool
+        elif question_count < 12:
+            MAX_FEATURES_TO_CHECK = 50  # Large pool
         else:
-            MAX_FEATURES_TO_CHECK = 40
-            
-            if len(all_available_indices) > MAX_FEATURES_TO_CHECK:
-                sampled = np.random.choice(all_available_indices, MAX_FEATURES_TO_CHECK, replace=False)
-                sampled_indices_map = {new_idx: old_idx for new_idx, old_idx in enumerate(sampled)}
-                available_features_to_check = sampled.tolist()
-            else:
-                sampled_indices_map = {idx: old_idx for idx, old_idx in enumerate(all_available_indices)}
-                available_features_to_check = all_available_indices
+            MAX_FEATURES_TO_CHECK = 70  # Maximum accuracy
+        
+        # Use pre-sorted high-gain features when possible
+        available_set = set(all_available_indices)
+        top_available_features = [
+            idx for idx in self.sorted_initial_feature_indices
+            if idx in available_set
+        ][:MAX_FEATURES_TO_CHECK]
+
+        if len(top_available_features) < MAX_FEATURES_TO_CHECK and len(all_available_indices) > len(top_available_features):
+            remaining = list(available_set - set(top_available_features))
+            np.random.shuffle(remaining)
+            top_available_features.extend(remaining[:MAX_FEATURES_TO_CHECK - len(top_available_features)])
+        
+        available_features_to_check = top_available_features[:MAX_FEATURES_TO_CHECK]
+        sampled_indices_map = {
+            new_idx: old_idx for new_idx, old_idx in enumerate(available_features_to_check)
+        }
         
         # Calculate information gains
         gains_tensor = self.info_gain_batch(prior, available_features_to_check)
@@ -360,7 +357,7 @@ class AkinatorEngine:
         if len(sorted_indices_of_gains) == 0:
             return None, None
 
-        # Always pick the best feature (no randomness after Q1)
+        # Always pick the best feature for maximum accuracy
         chosen_local_idx = sorted_indices_of_gains[0]
         idx = sampled_indices_map[chosen_local_idx.item()]
         
@@ -370,9 +367,7 @@ class AkinatorEngine:
     
     def should_guess(self, prior, question_count):
         """
-        Conservative guessing strategy to maximize accuracy.
-        
-        Returns: (should_guess, confidence, top_animal_idx)
+        Stricter guessing thresholds for better accuracy with niche animals.
         """
         top_prob, top_idx = torch.max(prior, dim=0)
         top_prob = top_prob.item()
@@ -385,19 +380,19 @@ class AkinatorEngine:
         # Calculate separation ratio
         separation = top_prob / (second_prob + 1e-10)
         
-        # Conservative thresholds that increase accuracy
-        if question_count < 8:
-            # Need very high confidence early on
-            should_guess = top_prob > 0.75 and separation > 6.0
-        elif question_count < 12:
-            # Moderate confidence needed
-            should_guess = top_prob > 0.60 and separation > 4.0
+        # Much stricter thresholds to avoid premature guessing
+        if question_count < 10:
+            # Need very high confidence early
+            should_guess = top_prob > 0.85 and separation > 8.0
         elif question_count < 15:
-            # Standard confidence
-            should_guess = top_prob > 0.50 and separation > 3.0
+            # High confidence needed
+            should_guess = top_prob > 0.75 and separation > 6.0
+        elif question_count < 20:
+            # Moderate confidence
+            should_guess = top_prob > 0.65 and separation > 4.5
         else:
-            # More lenient after many questions
-            should_guess = top_prob > 0.40 and separation > 2.5
+            # Still conservative late game
+            should_guess = top_prob > 0.55 and separation > 3.5
         
         return should_guess, top_prob, top_idx.item()
     
@@ -436,139 +431,48 @@ class AkinatorEngine:
 
         return None, None
 
-    # --- NEW METHOD ---
     def get_features_for_data_collection(self, item_name: str, num_features: int = 5) -> list[dict]:
         """
         Gets a list of features for data collection for a specific item.
-        
-        1. Prioritizes features that are NULL (NaN) for this specific item.
-        2. Pads with globally sparse features (high NaN count).
-        3. Pads with any other allowed feature to meet num_features.
+        Prioritizes NULL features for the item, then sparse features, then any allowed.
         """
         final_feature_indices = []
         
-        # --- 1. Find item-specific NULLs ---
+        # Find item-specific NULLs
         item_idx_list = np.where(self.animals == item_name)[0]
         
         if len(item_idx_list) > 0:
-            # Item was found
             item_idx = item_idx_list[0]
             item_row = self.features[item_idx]
-            
-            # Find all NaN indices in this item's row
             null_indices_tensor = torch.where(torch.isnan(item_row))[0]
             
-            # Filter these to only include "allowed" features
             allowed_indices_set = set(self.allowed_feature_indices)
             item_null_features = list(set(null_indices_tensor.tolist()).intersection(allowed_indices_set))
             
-            # Shuffle them to get a random subset
             np.random.shuffle(item_null_features)
             final_feature_indices = item_null_features[:num_features]
         
-        # --- 2. Pad with globally sparse features (if needed) ---
+        # Pad with globally sparse features
         num_needed = num_features - len(final_feature_indices)
         if num_needed > 0:
-            # Get sparse features that are not already in our list
-            sparse_pool = set(self.sparse_feature_indices)
-            sparse_pool = sparse_pool - set(final_feature_indices)
-            
+            sparse_pool = set(self.sparse_feature_indices) - set(final_feature_indices)
             padding_pool = list(sparse_pool)
             np.random.shuffle(padding_pool)
-            
             final_feature_indices.extend(padding_pool[:num_needed])
 
-        # --- 3. Pad with ANY allowed feature (if still needed) ---
+        # Pad with any allowed feature
         num_needed = num_features - len(final_feature_indices)
         if num_needed > 0:
-            all_allowed_pool = set(self.allowed_feature_indices)
-            all_allowed_pool = all_allowed_pool - set(final_feature_indices)
-
+            all_allowed_pool = set(self.allowed_feature_indices) - set(final_feature_indices)
             padding_pool = list(all_allowed_pool)
             np.random.shuffle(padding_pool)
-            
             final_feature_indices.extend(padding_pool[:num_needed])
             
-        # --- 4. Format the output ---
+        # Format output
         output_list = []
         for idx in final_feature_indices:
             feature_name = self.feature_cols[idx]
-            
-            # --- MODIFICATION ---
-            # Get the raw question_text. The "For '{item_name}'..."
-            # formatting has been removed per your request.
             q_text = self.questions_map.get(feature_name, f"Does it have {feature_name.replace('_', ' ')}?")
-            
-            output_list.append({
-                "feature_name": feature_name,
-                "question": q_text
-            })
-        
-        return output_list
-        """
-        Gets a list of features for data collection for a specific item.
-        
-        1. Prioritizes features that are NULL (NaN) for this specific item.
-        2. Pads with globally sparse features (high NaN count).
-        3. Pads with any other allowed feature to meet num_features.
-        """
-        final_feature_indices = []
-        
-        # --- 1. Find item-specific NULLs ---
-        item_idx_list = np.where(self.animals == item_name)[0]
-        
-        if len(item_idx_list) > 0:
-            # Item was found
-            item_idx = item_idx_list[0]
-            item_row = self.features[item_idx]
-            
-            # Find all NaN indices in this item's row
-            null_indices_tensor = torch.where(torch.isnan(item_row))[0]
-            
-            # Filter these to only include "allowed" features
-            allowed_indices_set = set(self.allowed_feature_indices)
-            item_null_features = list(set(null_indices_tensor.tolist()).intersection(allowed_indices_set))
-            
-            # Shuffle them to get a random subset
-            np.random.shuffle(item_null_features)
-            final_feature_indices = item_null_features[:num_features]
-        
-        # --- 2. Pad with globally sparse features (if needed) ---
-        num_needed = num_features - len(final_feature_indices)
-        if num_needed > 0:
-            # Get sparse features that are not already in our list
-            sparse_pool = set(self.sparse_feature_indices)
-            sparse_pool = sparse_pool - set(final_feature_indices)
-            
-            padding_pool = list(sparse_pool)
-            np.random.shuffle(padding_pool)
-            
-            final_feature_indices.extend(padding_pool[:num_needed])
-
-        # --- 3. Pad with ANY allowed feature (if still needed) ---
-        num_needed = num_features - len(final_feature_indices)
-        if num_needed > 0:
-            all_allowed_pool = set(self.allowed_feature_indices)
-            all_allowed_pool = all_allowed_pool - set(final_feature_indices)
-
-            padding_pool = list(all_allowed_pool)
-            np.random.shuffle(padding_pool)
-            
-            final_feature_indices.extend(padding_pool[:num_needed])
-            
-        # --- 4. Format the output ---
-        output_list = []
-        for idx in final_feature_indices:
-            feature_name = self.feature_cols[idx]
-            
-            # Re-format question to be more open-ended for data entry
-            q_base = self.questions_map.get(feature_name, f"Is it {feature_name.replace('_', ' ')}?")
-            if q_base.lower().startswith("is it"):
-                 q_text = f"For '{item_name}', {q_base[3:]}" # e.g., "For 'Lion', a large cat?"
-            elif q_base.lower().startswith("does it"):
-                 q_text = f"For '{item_name}', {q_base[8:]}" # e.g., "For 'Lion', have a mane?"
-            else:
-                 q_text = q_base # Use as-is
             
             output_list.append({
                 "feature_name": feature_name,
