@@ -1,6 +1,5 @@
 import json
 import threading
-import torch
 import numpy as np
 
 # Import our project files
@@ -13,7 +12,7 @@ class AkinatorService:
     
     This class handles the "hot-swap" of all engines when new
     data is learned, and seamlessly migrates active game sessions
-    to the new engine's tensor shapes.
+    to the new engine's array shapes.
     """
     
     def __init__(self):
@@ -107,7 +106,7 @@ class AkinatorService:
 
     def _migrate_state(self, game_state: dict, engine: AkinatorEngine) -> dict:
         """
-        Ensures the game state tensors match the current engine's dimensions.
+        Ensures the game state arrays match the current engine's dimensions.
         This is the core of the seamless "hot-swap".
         """
         current_n = len(engine.animals)
@@ -121,14 +120,14 @@ class AkinatorService:
         
         # --- Migrate Probabilities ---
         old_probs = game_state['probabilities']
-        new_probs = torch.ones(current_n, dtype=torch.float32)
+        new_probs = np.ones(current_n, dtype=np.float32)
         
         copy_len = min(state_n, current_n)
         if copy_len > 0:
             new_probs[:copy_len] = old_probs[:copy_len]
         
         if current_n > state_n:
-            fill_prob = torch.mean(old_probs).item() if state_n > 0 else (1.0 / current_n)
+            fill_prob = np.mean(old_probs) if state_n > 0 else (1.0 / current_n)
             new_probs[state_n:] = max(fill_prob, 1e-9) # Ensure non-zero
         
         # Re-normalize
@@ -137,7 +136,7 @@ class AkinatorService:
         
         # --- Migrate Rejected Mask ---
         old_mask = game_state['rejected_mask']
-        new_mask = torch.zeros(current_n, dtype=torch.bool)
+        new_mask = np.zeros(current_n, dtype=bool)
         if copy_len > 0:
             new_mask[:copy_len] = old_mask[:copy_len]
         game_state['rejected_mask'] = new_mask
@@ -173,12 +172,12 @@ class AkinatorService:
             n_animals = len(engine.animals)
             
             # Initial prior: uniform distribution
-            probabilities = torch.ones(n_animals, dtype=torch.float32) / (n_animals + 1e-10)
+            probabilities = np.ones(n_animals, dtype=np.float32) / (n_animals + 1e-10)
             
             state = {
                 'domain_name': domain_name, # CRITICAL: Store the domain
                 'probabilities': probabilities,
-                'rejected_mask': torch.zeros(n_animals, dtype=torch.bool),
+                'rejected_mask': np.zeros(n_animals, dtype=bool),
                 'asked_features': [],
                 'answered_features': {},
                 'question_count': 0,
@@ -199,23 +198,24 @@ class AkinatorService:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
             
         # Now we have a valid state and engine, proceed without the lock
-        probs = game_state['probabilities'].clone() # Clone to avoid mutation
+        probs = game_state['probabilities'].copy() # Copy to avoid mutation
         mask = game_state['rejected_mask']
         
         probs[mask] = 0.0
         
-        sorted_probs, indices = torch.sort(probs, descending=True)
+        # Get sorted indices
+        sorted_indices = np.argsort(probs)[::-1]
         
-        top_n = min(n, len(indices))
+        top_n = min(n, len(sorted_indices))
         results = []
         for i in range(top_n):
-            idx = indices[i].item()
-            prob = sorted_probs[i].item()
+            idx = sorted_indices[i]
+            prob = probs[idx]
             if prob < 0.001:
                 break
             results.append({
                 'animal': engine.animals[idx], # 'animal' is generic item name
-                'probability': prob
+                'probability': float(prob)
             })
         
         with self._cache_lock:
@@ -233,33 +233,33 @@ class AkinatorService:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
             
         q_count = game_state['question_count']
-        probs = game_state['probabilities'].clone()
+        probs = game_state['probabilities'].copy()
         mask = game_state['rejected_mask']
         probs[mask] = 0.0 
 
         if probs.sum() < 1e-10:
             return False, None, None
         
-        top_prob, top_idx = torch.max(probs, dim=0)
-        top_animal = engine.animals[top_idx.item()]
-        top_prob_val = top_prob.item()
+        top_idx = np.argmax(probs)
+        top_prob = probs[top_idx]
+        top_animal = engine.animals[top_idx]
         
         probs[top_idx] = 0.0
-        second_prob_val = torch.max(probs, dim=0)[0].item()
+        second_prob = np.max(probs)
         
-        confidence_ratio = top_prob_val / (second_prob_val + 1e-9)
+        confidence_ratio = top_prob / (second_prob + 1e-9)
         
         if (
             q_count in [5, 10, 15] and 
-            top_prob_val > 0.3 and
+            top_prob > 0.3 and
             not game_state['middle_guess_made']
         ):
             game_state['middle_guess_made'] = True # Mutates state
             return True, top_animal, 'middle'
             
-        if (top_prob_val > 0.7 and confidence_ratio > 5.0 and q_count > 5):
+        if (top_prob > 0.7 and confidence_ratio > 5.0 and q_count > 5):
             return True, top_animal, 'final'
-        if (top_prob_val > 0.5 and confidence_ratio > 10.0 and q_count > 8):
+        if (top_prob > 0.5 and confidence_ratio > 10.0 and q_count > 8):
             return True, top_animal, 'final'
         if q_count >= 20:
             return True, top_animal, 'final'
@@ -271,12 +271,12 @@ class AkinatorService:
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
 
-        prior = game_state['probabilities'].clone()
+        prior = game_state['probabilities'].copy()
         prior[game_state['rejected_mask']] = 0.0
         
         prior_sum = prior.sum()
         if prior_sum < 1e-10:
-            prior = torch.ones_like(prior)
+            prior = np.ones_like(prior)
             prior[game_state['rejected_mask']] = 0.0
             prior_sum = prior.sum()
             if prior_sum < 1e-10:
@@ -291,7 +291,8 @@ class AkinatorService:
             feature, q = engine.select_question(prior, asked, q_count)
             return feature, q, game_state
         
-        top_prob, top_idx = torch.max(prior, dim=0)
+        top_idx = np.argmax(prior)
+        top_prob = prior[top_idx]
         if top_prob > 0.2:
             feature, q = engine.get_discriminative_question(top_idx, prior, asked)
             if feature:
@@ -311,7 +312,7 @@ class AkinatorService:
             
         feature_idx = engine.feature_cols.index(feature)
         
-        prior = game_state['probabilities'].clone()
+        prior = game_state['probabilities'].copy()
         prior[game_state['rejected_mask']] = 0.0
         
         prior_sum = prior.sum()

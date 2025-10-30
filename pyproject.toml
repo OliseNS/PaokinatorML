@@ -10,7 +10,6 @@ dependencies = [
     "uvicorn[standard]",  # [standard] includes performance extras
     "gunicorn",           # The production-grade server
     "pydantic",
-    "torch",
     "numpy",
     "pandas",
     "supabase",

@@ -1,6 +1,6 @@
 import redis
 import pandas as pd
-import torch
+import numpy as np
 import msgpack
 import msgpack_numpy as m
 from supabase import create_client, Client
@@ -33,20 +33,25 @@ except Exception as e:
 
 
 # --- Session Management ---
-def _convert_tensors_to_numpy(state: dict) -> dict:
-    """Convert torch tensors to numpy arrays for serialization."""
+def _convert_to_serializable(state: dict) -> dict:
+    """Convert numpy arrays to serializable format."""
     state_copy = state.copy()
     for key in ['probabilities', 'rejected_mask']:
-        if key in state_copy and isinstance(state_copy[key], torch.Tensor):
-            state_copy[key] = state_copy[key].numpy()
+        if key in state_copy and isinstance(state_copy[key], np.ndarray):
+            # msgpack_numpy will handle numpy arrays automatically
+            pass
     return state_copy
 
 
-def _convert_numpy_to_tensors(state: dict) -> dict:
-    """Convert numpy arrays back to torch tensors."""
+def _convert_from_serializable(state: dict) -> dict:
+    """Convert serializable format back to numpy arrays."""
+    # msgpack_numpy handles this automatically, but ensure correct types
     for key in ['probabilities', 'rejected_mask']:
-        if key in state:
-            state[key] = torch.from_numpy(state[key].copy())
+        if key in state and isinstance(state[key], np.ndarray):
+            if key == 'probabilities':
+                state[key] = state[key].astype(np.float32)
+            elif key == 'rejected_mask':
+                state[key] = state[key].astype(bool)
     return state
 
 
@@ -56,7 +61,7 @@ def set_session(session_id: str, state: dict):
         return print("✗ Redis client not initialized")
     
     try:
-        packed = msgpack.packb(_convert_tensors_to_numpy(state), use_bin_type=True)
+        packed = msgpack.packb(_convert_to_serializable(state), use_bin_type=True)
         redis_client.setex(f"session:{session_id}", config.SESSION_TTL_SECONDS, packed)
     except Exception as e:
         print(f"✗ Error setting session {session_id}: {e}")
@@ -76,7 +81,7 @@ def get_session(session_id: str) -> dict | None:
         
         redis_client.expire(key, config.SESSION_TTL_SECONDS)
         state = msgpack.unpackb(packed, raw=False)
-        return _convert_numpy_to_tensors(state)
+        return _convert_from_serializable(state)
     except Exception as e:
         print(f"✗ Error getting session {session_id}: {e}")
         return None

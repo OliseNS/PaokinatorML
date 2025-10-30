@@ -1,10 +1,9 @@
 import pandas as pd
 import numpy as np
-import torch
 
 class AkinatorEngine:
     """
-    Highly optimized PyTorch Akinator engine with improved accuracy for niche animals
+    Highly optimized NumPy Akinator engine with improved accuracy for niche animals
     and faster performance through better batching and threshold tuning.
     """
     
@@ -13,7 +12,7 @@ class AkinatorEngine:
         self.feature_cols = feature_cols
         self.questions_map = questions_map
 
-        self.answer_values = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0], dtype=torch.float32)
+        self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         # Further softened penalties for better niche animal handling
         self.definite_exp = -3.5  # Was -4.5, even gentler
         self.uncertain_exp = -2.0  # Was -2.5, even gentler
@@ -30,17 +29,17 @@ class AkinatorEngine:
         
         self.sorted_initial_feature_indices = []
         self._precompute_likelihood_tables()
-        self._build_tensors()
+        self._build_arrays()
         
     def _precompute_likelihood_tables(self):
         """Precompute all possible likelihoods with gentler penalties."""
         # Increase resolution for better accuracy
-        feature_grid = torch.linspace(0.0, 1.0, 41)  # Was 21, now 41 for finer granularity
+        feature_grid = np.linspace(0.0, 1.0, 41, dtype=np.float32)  # Was 21, now 41 for finer granularity
         n_grid = len(feature_grid)
         n_answers = len(self.answer_values)
         
-        self.likelihood_table_definite = torch.zeros(n_grid, n_answers)
-        self.likelihood_table_uncertain = torch.zeros(n_grid, n_answers)
+        self.likelihood_table_definite = np.zeros((n_grid, n_answers), dtype=np.float32)
+        self.likelihood_table_uncertain = np.zeros((n_grid, n_answers), dtype=np.float32)
         
         for i, fval in enumerate(feature_grid):
             for j, aval in enumerate(self.answer_values):
@@ -59,14 +58,14 @@ class AkinatorEngine:
         
         self.feature_grid = feature_grid
         
-    def _build_tensors(self):
-        """Builds all tensors from the DataFrame - CPU optimized."""
+    def _build_arrays(self):
+        """Builds all arrays from the DataFrame - optimized for NumPy."""
         self.animals = self.df['animal_name'].values
         features_np = self.df[self.feature_cols].values.astype(np.float32)
         
-        self.features = torch.from_numpy(features_np)
-        self.nan_mask = torch.isnan(self.features)
-        self.features_filled = torch.nan_to_num(self.features, nan=0.5)
+        self.features = features_np
+        self.nan_mask = np.isnan(self.features)
+        self.features_filled = np.where(self.nan_mask, 0.5, self.features)
         
         # Calculate NaN fractions and variance for each column
         col_nan_frac = np.isnan(features_np).mean(axis=0)
@@ -107,8 +106,8 @@ class AkinatorEngine:
         if curr_entropy < 0.01:
             return np.zeros(len(feature_indices))
         
-        features_np = self.features_filled.numpy()[:, feature_indices]
-        nan_mask_np = self.nan_mask.numpy()[:, feature_indices]
+        features_np = self.features_filled[:, feature_indices]
+        nan_mask_np = self.nan_mask[:, feature_indices]
         
         # Higher resolution quantization
         quantized = np.clip(np.round(features_np * 40).astype(int), 0, 40)  # Was 20, now 40
@@ -118,11 +117,11 @@ class AkinatorEngine:
         n = len(features_np)
         
         # Vectorized likelihood computation
-        likelihoods = np.zeros((n, k, A))
+        likelihoods = np.zeros((n, k, A), dtype=np.float32)
         for a_idx, aval in enumerate(self.answer_values):
             is_definite = abs(aval - 0.5) > 0.3
             table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
-            likelihoods[:, :, a_idx] = table.numpy()[quantized, a_idx]
+            likelihoods[:, :, a_idx] = table[quantized, a_idx]
         
         likelihoods = np.where(nan_mask_np[:, :, None], 1.0, likelihoods)
         
@@ -152,11 +151,11 @@ class AkinatorEngine:
         probs_safe = np.clip(probs, 1e-10, 1.0)
         return -np.sum(probs_safe * np.log(probs_safe))
 
-    def calc_likelihood(self, feature_vec: torch.Tensor, target: float, 
-                        definite_exp: float, uncertain_exp: float) -> torch.Tensor:
+    def calc_likelihood(self, feature_vec: np.ndarray, target: float, 
+                        definite_exp: float, uncertain_exp: float) -> np.ndarray:
         """Calculate likelihood using precomputed table - ultra fast."""
-        quantized = torch.clamp(torch.round(feature_vec * 40).long(), 0, 40)  # Was 20, now 40
-        target_idx = torch.argmin(torch.abs(self.answer_values - target))
+        quantized = np.clip(np.round(feature_vec * 40).astype(int), 0, 40)  # Was 20, now 40
+        target_idx = np.argmin(np.abs(self.answer_values - target))
         
         is_definite = abs(target - 0.5) > 0.3
         table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
@@ -164,13 +163,13 @@ class AkinatorEngine:
         return table[quantized, target_idx]
     
     @staticmethod
-    def entropy(probs: torch.Tensor) -> torch.Tensor:
+    def entropy(probs: np.ndarray) -> float:
         """Calculate entropy."""
-        probs_safe = torch.clamp(probs, min=1e-10)
-        return -torch.sum(probs_safe * torch.log(probs_safe))
+        probs_safe = np.clip(probs, 1e-10, None)
+        return -np.sum(probs_safe * np.log(probs_safe))
     
     def get_prior(self, rejected_mask):
-        prior = torch.ones(len(self.animals), dtype=torch.float32)
+        prior = np.ones(len(self.animals), dtype=np.float32)
         prior[rejected_mask] = 0.0
         return prior / (prior.sum() + 1e-10)
     
@@ -184,8 +183,8 @@ class AkinatorEngine:
         likelihood = self.calc_likelihood(feature_vec, fuzzy_val, 
                                           self.definite_exp, self.uncertain_exp)
         
-        likelihood = torch.where(self.nan_mask[:, feature_idx], 
-                                 torch.ones_like(likelihood), likelihood)
+        likelihood = np.where(self.nan_mask[:, feature_idx], 
+                             np.ones_like(likelihood), likelihood)
         
         posterior = prior * likelihood
         return posterior / (posterior.sum() + 1e-10)
@@ -194,15 +193,15 @@ class AkinatorEngine:
         """Compute information gain with active set optimization."""
         curr_entropy = self.entropy(prior)
         if curr_entropy < 0.01 or not feature_indices:
-            return torch.zeros(len(feature_indices))
+            return np.zeros(len(feature_indices))
 
         # More aggressive active set optimization
         active_thresh = 1e-9  # Was 1e-8, now stricter
-        active_idx = torch.where(prior > active_thresh)[0]
+        active_idx = np.where(prior > active_thresh)[0]
         
         if len(active_idx) == 0:
-            active_idx = torch.arange(len(prior))
-            prior = torch.ones_like(prior) / len(prior)
+            active_idx = np.arange(len(prior))
+            prior = np.ones_like(prior) / len(prior)
             curr_entropy = self.entropy(prior)
 
         # Use active subset for faster computation
@@ -220,8 +219,8 @@ class AkinatorEngine:
         A = len(self.answer_values)
         n = len(prior_sub)
         
-        quantized = torch.clamp(torch.round(feature_batch * 40).long(), 0, 40)  # Was 20, now 40
-        likelihoods = torch.zeros(n, k, A)
+        quantized = np.clip(np.round(feature_batch * 40).astype(int), 0, 40)  # Was 20, now 40
+        likelihoods = np.zeros((n, k, A), dtype=np.float32)
         
         # Vectorized likelihood lookup
         for a_idx, aval in enumerate(self.answer_values):
@@ -229,16 +228,16 @@ class AkinatorEngine:
             table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
             likelihoods[:, :, a_idx] = table[quantized, a_idx]
         
-        likelihoods = torch.where(nan_mask_batch.unsqueeze(-1), 
-                                  torch.ones_like(likelihoods), likelihoods)
+        likelihoods = np.where(nan_mask_batch[:, :, None], 
+                              np.ones_like(likelihoods), likelihoods)
         
         # Fast matmul for probability computation
-        prior_2d = prior_sub.unsqueeze(0)
-        like_2d = likelihoods.view(n, k * A)
-        prob_answer = torch.matmul(prior_2d, like_2d).view(k, A)
+        prior_2d = prior_sub.reshape(1, -1)
+        like_2d = likelihoods.reshape(n, k * A)
+        prob_answer = (prior_2d @ like_2d).reshape(k, A)
         
         # Vectorized gain computation
-        gains = torch.zeros(k)
+        gains = np.zeros(k)
         for f_idx in range(k):
             expected_ent = 0.0
             for a_idx in range(A):
@@ -352,8 +351,8 @@ class AkinatorEngine:
         }
         
         # Calculate information gains
-        gains_tensor = self.info_gain_batch(prior, available_features_to_check)
-        sorted_indices_of_gains = torch.argsort(gains_tensor, descending=True)
+        gains_array = self.info_gain_batch(prior, available_features_to_check)
+        sorted_indices_of_gains = np.argsort(gains_array)[::-1]
 
         if len(sorted_indices_of_gains) == 0:
             return None, None
@@ -372,7 +371,7 @@ class AkinatorEngine:
             # Always pick the best feature for early questions
             chosen_local_idx = sorted_indices_of_gains[0]
         
-        idx = sampled_indices_map[chosen_local_idx.item()]
+        idx = sampled_indices_map[int(chosen_local_idx)]
         
         feature = self.feature_cols[idx]
         question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
@@ -382,19 +381,19 @@ class AkinatorEngine:
         """
         Adaptive guessing thresholds that consider entropy and separation.
         """
-        top_prob, top_idx = torch.max(prior, dim=0)
-        top_prob = top_prob.item()
+        top_idx = np.argmax(prior)
+        top_prob = prior[top_idx]
         
         # Get second highest probability
-        prior_copy = prior.clone()
+        prior_copy = prior.copy()
         prior_copy[top_idx] = 0.0
-        second_prob = torch.max(prior_copy).item()
+        second_prob = np.max(prior_copy)
         
         # Calculate separation ratio
         separation = top_prob / (second_prob + 1e-10)
         
         # Calculate entropy for additional confidence measure
-        entropy = self.entropy(prior).item()
+        entropy = self.entropy(prior)
         
         # Adaptive thresholds based on question count and entropy
         if question_count < 10:
@@ -410,15 +409,15 @@ class AkinatorEngine:
             # Still conservative late game
             should_guess = (top_prob > 0.50 and separation > 3.0) or (top_prob > 0.65 and entropy < 1.2)
         
-        return should_guess, top_prob, top_idx.item()
+        return should_guess, top_prob, int(top_idx)
     
     def get_discriminative_question(self, top_idx, prior, asked):
         """Find question that best separates top candidate from others."""
-        top_prob = prior[top_idx].item()
+        top_prob = prior[top_idx]
         # More lenient similarity threshold
         similar_mask = (prior > top_prob * 0.05)  # Was 0.1, now 0.05
         similar_mask[top_idx] = False
-        similar_indices = torch.where(similar_mask)[0]
+        similar_indices = np.where(similar_mask)[0]
         
         if len(similar_indices) == 0:
             return None, None
@@ -432,18 +431,19 @@ class AkinatorEngine:
         
         top_features = self.features[top_idx]
         similar_features = self.features[similar_indices]
-        diffs = torch.abs(top_features.unsqueeze(0) - similar_features)
-        avg_diffs = torch.nanmean(diffs, dim=0)
+        diffs = np.abs(top_features[None, :] - similar_features)
+        avg_diffs = np.nanmean(diffs, axis=0)
         
-        mask = torch.full_like(avg_diffs, -1.0)
+        mask = np.full_like(avg_diffs, -1.0)
         mask[available_indices] = avg_diffs[available_indices]
-        mask[torch.isnan(top_features)] = -1.0
+        mask[np.isnan(top_features)] = -1.0
         
-        best_diff, best_idx = torch.max(mask, dim=0)
+        best_idx = np.argmax(mask)
+        best_diff = mask[best_idx]
         
         # Lower threshold for more aggressive discrimination
-        if best_diff.item() > 0.25:  # Was 0.3, now 0.25
-            feature = self.feature_cols[best_idx.item()]
+        if best_diff > 0.25:  # Was 0.3, now 0.25
+            feature = self.feature_cols[best_idx]
             question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
             return feature, question
 
@@ -462,10 +462,10 @@ class AkinatorEngine:
         if len(item_idx_list) > 0:
             item_idx = item_idx_list[0]
             item_row = self.features[item_idx]
-            null_indices_tensor = torch.where(torch.isnan(item_row))[0]
+            null_indices = np.where(np.isnan(item_row))[0]
             
             allowed_indices_set = set(self.allowed_feature_indices)
-            item_null_features = list(set(null_indices_tensor.tolist()).intersection(allowed_indices_set))
+            item_null_features = list(set(null_indices.tolist()).intersection(allowed_indices_set))
             
             np.random.shuffle(item_null_features)
             final_feature_indices = item_null_features[:num_features]
