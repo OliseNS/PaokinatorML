@@ -14,9 +14,9 @@ class AkinatorEngine:
         self.questions_map = questions_map
 
         self.answer_values = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0], dtype=torch.float32)
-        # Softer penalties for better niche animal handling
-        self.definite_exp = -4.5  # Was -6.0
-        self.uncertain_exp = -2.5  # Was -3.0
+        # Further softened penalties for better niche animal handling
+        self.definite_exp = -3.5  # Was -4.5, even gentler
+        self.uncertain_exp = -2.0  # Was -2.5, even gentler
 
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0, 'usually': 0.75,
@@ -34,7 +34,8 @@ class AkinatorEngine:
         
     def _precompute_likelihood_tables(self):
         """Precompute all possible likelihoods with gentler penalties."""
-        feature_grid = torch.linspace(0.0, 1.0, 21)
+        # Increase resolution for better accuracy
+        feature_grid = torch.linspace(0.0, 1.0, 41)  # Was 21, now 41 for finer granularity
         n_grid = len(feature_grid)
         n_answers = len(self.answer_values)
         
@@ -46,11 +47,11 @@ class AkinatorEngine:
                 dist = abs(fval - aval)
                 
                 like_def = np.exp(self.definite_exp * dist)
-                # Gentler penalties for niche animals
+                # Even gentler penalties for niche animals
                 if dist > 0.7:
-                    like_def *= 0.01  # Was 0.001
+                    like_def *= 0.05  # Was 0.01, now 0.05
                 elif dist > 0.3:
-                    like_def *= 0.3  # Was 0.2
+                    like_def *= 0.5  # Was 0.3, now 0.5
                 self.likelihood_table_definite[i, j] = np.clip(like_def, 0.001, 1.0)
                 
                 like_unc = np.exp(self.uncertain_exp * dist)
@@ -74,8 +75,8 @@ class AkinatorEngine:
         
         self.col_nan_frac = col_nan_frac
         
-        # Allow features with <99% NaN and some variance
-        self.allowed_feature_mask = (col_nan_frac < 0.99) & (col_var > 1e-4)
+        # More lenient feature selection for better coverage
+        self.allowed_feature_mask = (col_nan_frac < 0.95) & (col_var > 5e-5)  # Was 0.99 and 1e-4
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
         # Sparse features (50-100% NaN) for data population
@@ -109,7 +110,8 @@ class AkinatorEngine:
         features_np = self.features_filled.numpy()[:, feature_indices]
         nan_mask_np = self.nan_mask.numpy()[:, feature_indices]
         
-        quantized = np.clip(np.round(features_np * 20).astype(int), 0, 20)
+        # Higher resolution quantization
+        quantized = np.clip(np.round(features_np * 40).astype(int), 0, 40)  # Was 20, now 40
         
         k = len(feature_indices)
         A = len(self.answer_values)
@@ -153,7 +155,7 @@ class AkinatorEngine:
     def calc_likelihood(self, feature_vec: torch.Tensor, target: float, 
                         definite_exp: float, uncertain_exp: float) -> torch.Tensor:
         """Calculate likelihood using precomputed table - ultra fast."""
-        quantized = torch.clamp(torch.round(feature_vec * 20).long(), 0, 20)
+        quantized = torch.clamp(torch.round(feature_vec * 40).long(), 0, 40)  # Was 20, now 40
         target_idx = torch.argmin(torch.abs(self.answer_values - target))
         
         is_definite = abs(target - 0.5) > 0.3
@@ -194,8 +196,8 @@ class AkinatorEngine:
         if curr_entropy < 0.01 or not feature_indices:
             return torch.zeros(len(feature_indices))
 
-        # Active set optimization - focus on high-probability candidates
-        active_thresh = 1e-8
+        # More aggressive active set optimization
+        active_thresh = 1e-9  # Was 1e-8, now stricter
         active_idx = torch.where(prior > active_thresh)[0]
         
         if len(active_idx) == 0:
@@ -204,7 +206,7 @@ class AkinatorEngine:
             curr_entropy = self.entropy(prior)
 
         # Use active subset for faster computation
-        if len(active_idx) < len(prior) * 0.8:  # Only optimize if significant reduction
+        if len(active_idx) < len(prior) * 0.9:  # Was 0.8, now more aggressive
             prior_sub = prior[active_idx]
             prior_sub = prior_sub / (prior_sub.sum() + 1e-12)
             feature_batch = self.features_filled[active_idx][:, feature_indices]
@@ -218,7 +220,7 @@ class AkinatorEngine:
         A = len(self.answer_values)
         n = len(prior_sub)
         
-        quantized = torch.clamp(torch.round(feature_batch * 20).long(), 0, 20)
+        quantized = torch.clamp(torch.round(feature_batch * 40).long(), 0, 40)  # Was 20, now 40
         likelihoods = torch.zeros(n, k, A)
         
         # Vectorized likelihood lookup
@@ -287,7 +289,7 @@ class AkinatorEngine:
     def select_question(self, prior, asked, question_count):
         """
         Strategic question selection:
-        Q0-2: Random from top 5 highest info gain (variety + quality)
+        Q0-2: Random from top 7 highest info gain (more variety)
         Q5-10: 1 sparse question at random position (data collection)
         Q3+: Best from progressively larger pools (accuracy)
         """
@@ -299,11 +301,11 @@ class AkinatorEngine:
                 self.sparse_question_asked = True
                 return feature, question
         
-        # === Q0-2: RANDOM FROM TOP 5 FOR VARIETY ===
+        # === Q0-2: RANDOM FROM TOP 7 FOR MORE VARIETY ===
         if question_count < 3:
             if self.sorted_initial_feature_indices:
                 available_top = [
-                    idx for idx in self.sorted_initial_feature_indices[:5]
+                    idx for idx in self.sorted_initial_feature_indices[:7]  # Was 5, now 7
                     if self.feature_cols[idx] not in asked
                 ]
                 
@@ -322,16 +324,15 @@ class AkinatorEngine:
         if not all_available_indices:
             return None, None
         
-        # === ADAPTIVE FEATURE POOL SIZE ===
-        # Start small, grow larger for better accuracy
+        # === ADAPTIVE FEATURE POOL SIZE - LARGER FOR BETTER ACCURACY ===
         if question_count < 5:
-            MAX_FEATURES_TO_CHECK = 20  # Small pool early
+            MAX_FEATURES_TO_CHECK = 30  # Was 20, now 30
         elif question_count < 8:
-            MAX_FEATURES_TO_CHECK = 35  # Medium pool
+            MAX_FEATURES_TO_CHECK = 50  # Was 35, now 50
         elif question_count < 12:
-            MAX_FEATURES_TO_CHECK = 50  # Large pool
+            MAX_FEATURES_TO_CHECK = 75  # Was 50, now 75
         else:
-            MAX_FEATURES_TO_CHECK = 70  # Maximum accuracy
+            MAX_FEATURES_TO_CHECK = 100  # Was 70, now 100
         
         # Use pre-sorted high-gain features when possible
         available_set = set(all_available_indices)
@@ -357,8 +358,20 @@ class AkinatorEngine:
         if len(sorted_indices_of_gains) == 0:
             return None, None
 
-        # Always pick the best feature for maximum accuracy
-        chosen_local_idx = sorted_indices_of_gains[0]
+        # Add slight randomness to top 3 choices for variety while maintaining quality
+        if question_count >= 3 and len(sorted_indices_of_gains) >= 3:
+            # 70% pick best, 20% pick 2nd best, 10% pick 3rd best
+            rand = np.random.random()
+            if rand < 0.70:
+                chosen_local_idx = sorted_indices_of_gains[0]
+            elif rand < 0.90:
+                chosen_local_idx = sorted_indices_of_gains[1]
+            else:
+                chosen_local_idx = sorted_indices_of_gains[2]
+        else:
+            # Always pick the best feature for early questions
+            chosen_local_idx = sorted_indices_of_gains[0]
+        
         idx = sampled_indices_map[chosen_local_idx.item()]
         
         feature = self.feature_cols[idx]
@@ -367,7 +380,7 @@ class AkinatorEngine:
     
     def should_guess(self, prior, question_count):
         """
-        Stricter guessing thresholds for better accuracy with niche animals.
+        Adaptive guessing thresholds that consider entropy and separation.
         """
         top_prob, top_idx = torch.max(prior, dim=0)
         top_prob = top_prob.item()
@@ -380,26 +393,30 @@ class AkinatorEngine:
         # Calculate separation ratio
         separation = top_prob / (second_prob + 1e-10)
         
-        # Much stricter thresholds to avoid premature guessing
+        # Calculate entropy for additional confidence measure
+        entropy = self.entropy(prior).item()
+        
+        # Adaptive thresholds based on question count and entropy
         if question_count < 10:
             # Need very high confidence early
-            should_guess = top_prob > 0.85 and separation > 8.0
+            should_guess = (top_prob > 0.80 and separation > 6.0) or (top_prob > 0.90 and separation > 4.0)
         elif question_count < 15:
             # High confidence needed
-            should_guess = top_prob > 0.75 and separation > 6.0
+            should_guess = (top_prob > 0.70 and separation > 5.0) or (top_prob > 0.85 and entropy < 0.5)
         elif question_count < 20:
             # Moderate confidence
-            should_guess = top_prob > 0.65 and separation > 4.5
+            should_guess = (top_prob > 0.60 and separation > 4.0) or (top_prob > 0.75 and entropy < 0.8)
         else:
             # Still conservative late game
-            should_guess = top_prob > 0.55 and separation > 3.5
+            should_guess = (top_prob > 0.50 and separation > 3.0) or (top_prob > 0.65 and entropy < 1.2)
         
         return should_guess, top_prob, top_idx.item()
     
     def get_discriminative_question(self, top_idx, prior, asked):
         """Find question that best separates top candidate from others."""
         top_prob = prior[top_idx].item()
-        similar_mask = (prior > top_prob * 0.1)
+        # More lenient similarity threshold
+        similar_mask = (prior > top_prob * 0.05)  # Was 0.1, now 0.05
         similar_mask[top_idx] = False
         similar_indices = torch.where(similar_mask)[0]
         
@@ -424,7 +441,8 @@ class AkinatorEngine:
         
         best_diff, best_idx = torch.max(mask, dim=0)
         
-        if best_diff.item() > 0.3:
+        # Lower threshold for more aggressive discrimination
+        if best_diff.item() > 0.25:  # Was 0.3, now 0.25
             feature = self.feature_cols[best_idx.item()]
             question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
             return feature, question
