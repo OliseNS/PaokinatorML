@@ -402,7 +402,7 @@ class AkinatorEngine:
         elif question_count < 15:
             # High confidence needed
             should_guess = (top_prob > 0.70 and separation > 5.0) or (top_prob > 0.85 and entropy < 0.5)
-        elif question_count < 20:
+        elif question_count < 25:
             # Moderate confidence
             should_guess = (top_prob > 0.60 and separation > 4.0) or (top_prob > 0.75 and entropy < 0.8)
         else:
