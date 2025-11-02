@@ -17,7 +17,7 @@ RELOAD_SECRET_TOKEN = os.getenv("RELOAD_SECRET_TOKEN")
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
-SESSION_TTL_SECONDS = 10 * 60  # 10 minutes
+SESSION_TTL_SECONDS = 30 * 60  # 30 minutes
 
 if not all([SUPABASE_URL, SUPABASE_KEY, REDIS_HOST, REDIS_PASSWORD]):
     print("WARNING: One or more environment variables are missing.")
