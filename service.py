@@ -182,7 +182,10 @@ class AkinatorService:
                 'answered_features': {},
                 'question_count': 0,
                 'middle_guess_made': False,
-                'animal_count': n_animals  # CRITICAL: Stamp the state with animal count
+                'animal_count': n_animals,  # CRITICAL: Stamp the state with animal count
+                'continue_mode': False, # <-- NEW
+                'questions_since_last_guess': 0, # <-- NEW
+                'last_guess_type': None # <-- NEW
             }
             return state
 
@@ -228,7 +231,10 @@ class AkinatorService:
         return results
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
-        """Determines if the engine should make a guess."""
+        """
+        Determines if the engine should make a guess.
+        This method mutates the game_state for 'middle_guess_made' and 'continue_mode'.
+        """
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
             
@@ -249,6 +255,17 @@ class AkinatorService:
         
         confidence_ratio = top_prob / (second_prob + 1e-9)
         
+        # --- NEW CONTINUE LOGIC ---
+        QUESTIONS_TO_WAIT = 3 # Ask 3 more questions before re-guessing
+        if game_state.get('continue_mode', False):
+            if game_state.get('questions_since_last_guess', 0) < QUESTIONS_TO_WAIT:
+                return False, None, None # Force more questions
+            else:
+                # Time to guess again. Reset flags and fall through to final guess.
+                game_state['continue_mode'] = False
+                game_state['questions_since_last_guess'] = 0
+        # --- END NEW LOGIC ---
+
         if (
             q_count in [5, 10, 15] and 
             top_prob > 0.3 and
@@ -265,6 +282,15 @@ class AkinatorService:
             return True, top_animal, 'final'
             
         return False, None, None
+
+    # --- NEW METHOD ---
+    def activate_continue_mode(self, game_state: dict) -> dict:
+        """Sets the game state to continue asking questions."""
+        game_state['continue_mode'] = True
+        game_state['questions_since_last_guess'] = 0
+        game_state['middle_guess_made'] = False # Allow another middle guess
+        return game_state
+    # --- END NEW METHOD ---
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
         """Gets the next best question, returns (feature, question, modified_state)."""
@@ -350,7 +376,6 @@ class AkinatorService:
             
         return game_state
 
-    # --- NEW METHOD ---
     def get_data_collection_features(self, domain_name: str, item_name: str) -> list[dict]:
         """
         Gets 5 features for data collection for a specific item.

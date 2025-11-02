@@ -4,6 +4,7 @@ import time
 import gzip
 import json
 import random
+import traceback # For better error logging
 from fastapi import FastAPI, HTTPException, Request, Header, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -75,7 +76,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Akinator API",
     description="Multi-domain Akinator-style game server.",
-    version="1.1.0",
+    version="1.2.0", # Incremented version
     lifespan=lifespan
 )
 
@@ -85,7 +86,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
-    process_time = (time.time() * 1000)
+    process_time = (time.time() - start_time) * 1000 # Corrected process time calculation
     response.headers["X-Process-Time-ms"] = f"{process_time:.2f}"
     return response
 
@@ -133,24 +134,30 @@ async def get_question(session_id: str):
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
-    # --- NEW HELPER FUNCTION ---
     def get_article(word: str) -> str:
         """Determines if 'a' or 'an' should precede the word."""
         if not word:
-            return ""
-        # Check if the first non-space character is a vowel (case-insensitive)
-        first_char = word.strip()[0].lower()
-        if first_char in 'aeiou':
-            return "an"
+            return "a"
+        try:
+            # Check if the first non-space character is a vowel (case-insensitive)
+            first_char = word.strip()[0].lower()
+            if first_char in 'aeiou':
+                return "an"
+        except IndexError:
+            return "a" # Default for empty string
         return "a"
-    # --- END NEW HELPER FUNCTION ---
     
     try:
+        # should_make_guess *mutates* state (middle_guess_made, continue_mode)
         should_guess, guess_animal, guess_type = srv.should_make_guess(game_state)
         
+        # --- NEW: Store guess type in session ---
+        game_state['last_guess_type'] = guess_type
+        # --- END NEW ---
+
         if should_guess:
             top_predictions = srv.get_top_predictions(game_state, n=5)
-            db.set_session(session_id, game_state) # Save state changes (like 'middle_guess_made')
+            db.set_session(session_id, game_state) # Save state changes
             
             if guess_type == 'final':
                 return {
@@ -160,14 +167,14 @@ async def get_question(session_id: str):
                     'top_predictions': top_predictions
                 }
             
-            q_num = game_state['question_count'] 
+            # --- This must be 'middle' guess (sneaky_guess) ---
+            q_num = game_state.get('question_count', 0)
             top_pred = srv.get_top_predictions(game_state, n=1)
             
-            # --- MODIFIED LOGIC TO USE CORRECT ARTICLE ---
             article = get_article(guess_animal)
             
             return {
-                'should_guess': False,
+                'should_guess': False, # It's a question, not a final guess
                 'question': f"Is it {article} {guess_animal}?",
                 'feature': 'sneaky_guess',
                 'animal_name': guess_animal,
@@ -176,8 +183,9 @@ async def get_question(session_id: str):
                 'top_prediction': top_pred[0] if top_pred else None
             }
         
+        # --- Not guessing, so get next question ---
         feature, question, game_state = srv.get_next_question(game_state)
-        db.set_session(session_id, game_state) 
+        db.set_session(session_id, game_state) # Save state
 
         if not feature or not question:
             top_preds = srv.get_top_predictions(game_state, n=3)
@@ -190,6 +198,7 @@ async def get_question(session_id: str):
                     'is_sneaky_guess': False
                 }
 
+            # Out of questions, force a final guess
             return {
                 'should_guess': True,
                 'guess': top_preds[0]['animal'],
@@ -197,7 +206,7 @@ async def get_question(session_id: str):
                 'top_predictions': top_preds
             }
         
-        q_num = game_state['question_count'] + 1
+        q_num = game_state.get('question_count', 0) + 1 # Get from state, default to 0
         top_pred = srv.get_top_predictions(game_state, n=1)
         
         return {
@@ -210,6 +219,7 @@ async def get_question(session_id: str):
         }
     except Exception as e:
         print(f"Error in /question: {e}")
+        print(traceback.format_exc()) # More detailed error
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 
@@ -270,6 +280,12 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
             game_state['answered_features'][feature] = fuzzy_value
             game_state = srv.process_answer(game_state, feature, brain_answer)
             game_state['question_count'] += 1
+            
+            # --- NEW: Increment continue counter ---
+            if game_state.get('continue_mode', False):
+                game_state['questions_since_last_guess'] = game_state.get('questions_since_last_guess', 0) + 1
+            # --- END NEW ---
+                
             status = 'ok'
 
     db.set_session(session_id, game_state)
@@ -279,11 +295,29 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
         'top_predictions': srv.get_top_predictions(game_state, n=5)
     }
 
+# --- NEW ENDPOINT ---
+@app.post("/continue/{session_id}", summary="Continue game after wrong guess")
+async def continue_game(session_id: str):
+    """
+    Sets the game state to 'continue mode' to ask more questions
+    after a final guess was rejected.
+    """
+    srv = get_service()
+    game_state = db.get_session(session_id)
+    if not game_state:
+        raise HTTPException(status_code=404, detail="Session expired or not found")
+    
+    game_state = srv.activate_continue_mode(game_state)
+    db.set_session(session_id, game_state)
+    
+    return {"status": "continuing"}
+# --- END NEW ENDPOINT ---
 
 @app.post("/reject/{session_id}", summary="Reject a guess")
 async def reject_animal(session_id: str, payload: RejectPayload):
     """
     Tells the engine its guess was wrong.
+    This now returns 'ask_to_continue' for final guesses.
     """
     srv = get_service()
     game_state = db.get_session(session_id)
@@ -291,10 +325,14 @@ async def reject_animal(session_id: str, payload: RejectPayload):
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
     game_state = srv.reject_guess(game_state, payload.animal_name)
+    
+    # We assume this endpoint is only for final guesses, as 'middle'
+    # is handled by /answer. The user's request confirms this.
+    
     db.set_session(session_id, game_state)
     
     return {
-        'status': 'rejected',
+        'status': 'ask_to_continue', # <-- CHANGED
         'animal': payload.animal_name,
         'top_predictions': srv.get_top_predictions(game_state, n=5)
     }
@@ -328,6 +366,8 @@ async def confirm_win(session_id: str, payload: WinPayload):
 async def learn_animal(session_id: str, payload: LearnPayload):
     """
     Finishes the game and teaches the engine a new animal.
+    This is called when the user declines to continue and
+    wants to add their animal.
     """
     srv = get_service()
     game_state = db.get_session(session_id)
@@ -347,7 +387,6 @@ async def learn_animal(session_id: str, payload: LearnPayload):
         'db_status': result
     }
 
-# --- NEW ENDPOINT AS REQUESTED ---
 @app.get("/items_for_questions/{domain_name}", summary="Get random items for feature suggestion")
 async def get_items_for_questions(domain_name: str):
     """
@@ -374,7 +413,6 @@ async def get_items_for_questions(domain_name: str):
         selected_items = random.sample(all_items, num_to_select)
         
         return {"items": selected_items}
-# --- END NEW ENDPOINT ---
 
 
 @app.post("/suggest_feature", summary="Suggest a new feature")
@@ -400,7 +438,6 @@ async def suggest_feature(payload: SuggestFeaturePayload):
     return result
 
 
-# --- NEW DATA COLLECTION ENDPOINT ---
 @app.get("/features_for_data_collection/{domain_name}", summary="Get features for data collection")
 async def get_features_for_data_collection(domain_name: str, item_name: str):
     """
@@ -415,8 +452,10 @@ async def get_features_for_data_collection(domain_name: str, item_name: str):
         features = srv.get_data_collection_features(domain_name, item_name)
         
         # This could happen if the engine has no allowed features at all
-        if not features and len(srv.engines.get(domain_name).animals) > 0:
-            print(f"Warning: No data collection features found for {item_name} in {domain_name}.")
+        if not features:
+             engine = srv.engines.get(domain_name)
+             if engine and len(engine.animals) > 0:
+                print(f"Warning: No data collection features found for {item_name} in {domain_name}.")
         
         return {"features": features, "item_name": item_name, "domain_name": domain_name}
     
@@ -427,7 +466,6 @@ async def get_features_for_data_collection(domain_name: str, item_name: str):
         # General error
         print(f"Error in /features_for_data_collection: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
-# --- END NEW ENDPOINT ---
 
 
 @app.get("/stats", summary="Get server statistics")
