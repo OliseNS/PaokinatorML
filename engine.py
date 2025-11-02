@@ -3,8 +3,9 @@ import numpy as np
 
 class AkinatorEngine:
     """
-    Highly optimized NumPy Akinator engine with improved accuracy for niche animals
-    and faster performance through better batching and threshold tuning.
+    Highly optimized NumPy Akinator engine with a robust "minimax" gain
+    strategy for resilience to wrong answers, blended with expected gain
+    for late-game speed.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -13,9 +14,9 @@ class AkinatorEngine:
         self.questions_map = questions_map
 
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
-        # Further softened penalties for better niche animal handling
-        self.definite_exp = -3.5  # Was -4.5, even gentler
-        self.uncertain_exp = -2.0  # Was -2.5, even gentler
+        # Softened penalties for better niche animal handling
+        self.definite_exp = -3.5
+        self.uncertain_exp = -2.0
 
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0, 'usually': 0.75,
@@ -34,7 +35,7 @@ class AkinatorEngine:
     def _precompute_likelihood_tables(self):
         """Precompute all possible likelihoods with gentler penalties."""
         # Increase resolution for better accuracy
-        feature_grid = np.linspace(0.0, 1.0, 41, dtype=np.float32)  # Was 21, now 41 for finer granularity
+        feature_grid = np.linspace(0.0, 1.0, 41, dtype=np.float32) # 41 for finer granularity
         n_grid = len(feature_grid)
         n_answers = len(self.answer_values)
         
@@ -48,9 +49,9 @@ class AkinatorEngine:
                 like_def = np.exp(self.definite_exp * dist)
                 # Even gentler penalties for niche animals
                 if dist > 0.7:
-                    like_def *= 0.05  # Was 0.01, now 0.05
+                    like_def *= 0.05
                 elif dist > 0.3:
-                    like_def *= 0.5  # Was 0.3, now 0.5
+                    like_def *= 0.5
                 self.likelihood_table_definite[i, j] = np.clip(like_def, 0.001, 1.0)
                 
                 like_unc = np.exp(self.uncertain_exp * dist)
@@ -75,7 +76,7 @@ class AkinatorEngine:
         self.col_nan_frac = col_nan_frac
         
         # More lenient feature selection for better coverage
-        self.allowed_feature_mask = (col_nan_frac < 0.95) & (col_var > 5e-5)  # Was 0.99 and 1e-4
+        self.allowed_feature_mask = (col_nan_frac < 0.95) & (col_var > 5e-5)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
         # Sparse features (50-100% NaN) for data population
@@ -110,7 +111,7 @@ class AkinatorEngine:
         nan_mask_np = self.nan_mask[:, feature_indices]
         
         # Higher resolution quantization
-        quantized = np.clip(np.round(features_np * 40).astype(int), 0, 40)  # Was 20, now 40
+        quantized = np.clip(np.round(features_np * 40).astype(int), 0, 40)
         
         k = len(feature_indices)
         A = len(self.answer_values)
@@ -154,7 +155,7 @@ class AkinatorEngine:
     def calc_likelihood(self, feature_vec: np.ndarray, target: float, 
                         definite_exp: float, uncertain_exp: float) -> np.ndarray:
         """Calculate likelihood using precomputed table - ultra fast."""
-        quantized = np.clip(np.round(feature_vec * 40).astype(int), 0, 40)  # Was 20, now 40
+        quantized = np.clip(np.round(feature_vec * 40).astype(int), 0, 40)
         target_idx = np.argmin(np.abs(self.answer_values - target))
         
         is_definite = abs(target - 0.5) > 0.3
@@ -184,19 +185,19 @@ class AkinatorEngine:
                                           self.definite_exp, self.uncertain_exp)
         
         likelihood = np.where(self.nan_mask[:, feature_idx], 
-                             np.ones_like(likelihood), likelihood)
+                              np.ones_like(likelihood), likelihood)
         
         posterior = prior * likelihood
         return posterior / (posterior.sum() + 1e-10)
 
     def info_gain_batch(self, prior, feature_indices):
-        """Compute information gain with active set optimization."""
+        """Compute information gain (Expected Value) with active set optimization."""
         curr_entropy = self.entropy(prior)
         if curr_entropy < 0.01 or not feature_indices:
             return np.zeros(len(feature_indices))
 
         # More aggressive active set optimization
-        active_thresh = 1e-9  # Was 1e-8, now stricter
+        active_thresh = 1e-9
         active_idx = np.where(prior > active_thresh)[0]
         
         if len(active_idx) == 0:
@@ -205,7 +206,7 @@ class AkinatorEngine:
             curr_entropy = self.entropy(prior)
 
         # Use active subset for faster computation
-        if len(active_idx) < len(prior) * 0.9:  # Was 0.8, now more aggressive
+        if len(active_idx) < len(prior) * 0.9:
             prior_sub = prior[active_idx]
             prior_sub = prior_sub / (prior_sub.sum() + 1e-12)
             feature_batch = self.features_filled[active_idx][:, feature_indices]
@@ -219,7 +220,7 @@ class AkinatorEngine:
         A = len(self.answer_values)
         n = len(prior_sub)
         
-        quantized = np.clip(np.round(feature_batch * 40).astype(int), 0, 40)  # Was 20, now 40
+        quantized = np.clip(np.round(feature_batch * 40).astype(int), 0, 40)
         likelihoods = np.zeros((n, k, A), dtype=np.float32)
         
         # Vectorized likelihood lookup
@@ -229,14 +230,14 @@ class AkinatorEngine:
             likelihoods[:, :, a_idx] = table[quantized, a_idx]
         
         likelihoods = np.where(nan_mask_batch[:, :, None], 
-                              np.ones_like(likelihoods), likelihoods)
+                               np.ones_like(likelihoods), likelihoods)
         
         # Fast matmul for probability computation
         prior_2d = prior_sub.reshape(1, -1)
         like_2d = likelihoods.reshape(n, k * A)
         prob_answer = (prior_2d @ like_2d).reshape(k, A)
         
-        # Vectorized gain computation
+        # Vectorized gain computation (Expected Gain)
         gains = np.zeros(k)
         for f_idx in range(k):
             expected_ent = 0.0
@@ -252,6 +253,83 @@ class AkinatorEngine:
             gains[f_idx] = curr_entropy - expected_ent
         
         return gains
+
+    # --- NEW METHOD ---
+    def info_gain_robust_batch(self, prior, feature_indices):
+        """
+        Compute information gain using a "Max-Min" strategy (like minimax).
+        Picks the question that maximizes the *minimum* information gain
+        (i.e., minimizes the *maximum* possible posterior entropy).
+        This makes the engine highly robust to confusing or "worst-case" answers.
+        """
+        curr_entropy = self.entropy(prior)
+        if curr_entropy < 0.01 or not feature_indices:
+            return np.zeros(len(feature_indices))
+
+        # Active set optimization (from your original function)
+        active_thresh = 1e-9
+        active_idx = np.where(prior > active_thresh)[0]
+        
+        if len(active_idx) == 0:
+            active_idx = np.arange(len(prior))
+            prior = np.ones_like(prior) / len(prior)
+            curr_entropy = self.entropy(prior)
+
+        if len(active_idx) < len(prior) * 0.9:
+            prior_sub = prior[active_idx]
+            prior_sub = prior_sub / (prior_sub.sum() + 1e-12)
+            feature_batch = self.features_filled[active_idx][:, feature_indices]
+            nan_mask_batch = self.nan_mask[active_idx][:, feature_indices]
+        else:
+            prior_sub = prior
+            feature_batch = self.features_filled[:, feature_indices]
+            nan_mask_batch = self.nan_mask[:, feature_indices]
+
+        k = len(feature_indices)
+        A = len(self.answer_values)
+        n = len(prior_sub)
+        
+        quantized = np.clip(np.round(feature_batch * 40).astype(int), 0, 40)
+        likelihoods = np.zeros((n, k, A), dtype=np.float32)
+        
+        for a_idx, aval in enumerate(self.answer_values):
+            is_definite = abs(aval.item() - 0.5) > 0.3
+            table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
+            likelihoods[:, :, a_idx] = table[quantized, a_idx]
+        
+        likelihoods = np.where(nan_mask_batch[:, :, None], 
+                               np.ones_like(likelihoods), likelihoods)
+        
+        # Fast matmul for probability computation
+        prior_2d = prior_sub.reshape(1, -1)
+        like_2d = likelihoods.reshape(n, k * A)
+        prob_answer = (prior_2d @ like_2d).reshape(k, A)
+        
+        # === ROBUST GAIN CALCULATION (THE MINIMAX PART) ===
+        gains = np.zeros(k)
+        for f_idx in range(k):
+            max_posterior_entropy = 0.0  # Find the entropy of the "worst" answer
+            
+            for a_idx in range(A):
+                posterior = prior_sub * likelihoods[:, f_idx, a_idx]
+                post_sum = posterior.sum()
+                
+                ent = 0.0
+                if post_sum > 1e-10:
+                    posterior = posterior / post_sum
+                    ent = self.entropy(posterior)
+                
+                # Use current entropy as upper bound if something goes wrong
+                # (e.g., if post_sum is 0, ent will be 0, which is good)
+                
+                if ent > max_posterior_entropy:
+                    max_posterior_entropy = ent
+            
+            # Gain is the reduction from current entropy to the *worst-case* posterior entropy
+            gains[f_idx] = curr_entropy - max_posterior_entropy
+            
+        return gains
+    # --- END OF NEW METHOD ---
 
     def select_sparse_question(self, asked):
         """Select a sparse feature (50-100% NaN) to populate missing data."""
@@ -277,7 +355,7 @@ class AkinatorEngine:
                 weights.append(1.0)
         
         weights = np.array(weights)
-        weights = weights / weights.sum()
+        weights = weights / (weights.sum() + 1e-10)
         
         chosen_idx = np.random.choice(available_sparse, p=weights)
         feature = self.feature_cols[chosen_idx]
@@ -285,12 +363,15 @@ class AkinatorEngine:
         
         return feature, question
 
+    # --- UPDATED METHOD ---
     def select_question(self, prior, asked, question_count):
         """
-        Strategic question selection:
-        Q0-2: Random from top 7 highest info gain (more variety)
-        Q5-10: 1 sparse question at random position (data collection)
-        Q3+: Best from progressively larger pools (accuracy)
+        Strategic question selection with:
+        1. Blended Gain Strategy: Uses "Robust/Minimax" gain in early game (high entropy)
+           and "Expected" gain in late game (low entropy) for speed.
+        2. Sparse Question: Injects a data-collection question at a random point.
+        3. Enhanced Variety: Uses a larger random pool for early questions and
+           weighted random choice for later questions.
         """
         
         # === SPARSE QUESTION AT RANDOM POSITION 5-10 ===
@@ -300,11 +381,11 @@ class AkinatorEngine:
                 self.sparse_question_asked = True
                 return feature, question
         
-        # === Q0-2: RANDOM FROM TOP 7 FOR MORE VARIETY ===
+        # === Q0-2: RANDOM FROM TOP 10 FOR MORE VARIETY ===
         if question_count < 3:
             if self.sorted_initial_feature_indices:
                 available_top = [
-                    idx for idx in self.sorted_initial_feature_indices[:7]  # Was 5, now 7
+                    idx for idx in self.sorted_initial_feature_indices[:10]  # Was 7, now 10
                     if self.feature_cols[idx] not in asked
                 ]
                 
@@ -323,17 +404,16 @@ class AkinatorEngine:
         if not all_available_indices:
             return None, None
         
-        # === ADAPTIVE FEATURE POOL SIZE - LARGER FOR BETTER ACCURACY ===
+        # === ADAPTIVE FEATURE POOL SIZE ===
         if question_count < 5:
-            MAX_FEATURES_TO_CHECK = 30  # Was 20, now 30
+            MAX_FEATURES_TO_CHECK = 30
         elif question_count < 8:
-            MAX_FEATURES_TO_CHECK = 50  # Was 35, now 50
+            MAX_FEATURES_TO_CHECK = 50
         elif question_count < 12:
-            MAX_FEATURES_TO_CHECK = 75  # Was 50, now 75
+            MAX_FEATURES_TO_CHECK = 75
         else:
-            MAX_FEATURES_TO_CHECK = 100  # Was 70, now 100
+            MAX_FEATURES_TO_CHECK = 100
         
-        # Use pre-sorted high-gain features when possible
         available_set = set(all_available_indices)
         top_available_features = [
             idx for idx in self.sorted_initial_feature_indices
@@ -346,36 +426,47 @@ class AkinatorEngine:
             top_available_features.extend(remaining[:MAX_FEATURES_TO_CHECK - len(top_available_features)])
         
         available_features_to_check = top_available_features[:MAX_FEATURES_TO_CHECK]
+        if not available_features_to_check: # Handle edge case
+             return None, None
+             
         sampled_indices_map = {
             new_idx: old_idx for new_idx, old_idx in enumerate(available_features_to_check)
         }
         
-        # Calculate information gains
-        gains_array = self.info_gain_batch(prior, available_features_to_check)
+        # === BLENDED GAIN STRATEGY ===
+        curr_entropy = self.entropy(prior)
+        
+        # Tune this entropy threshold as needed.
+        # 2.5 is a good starting point (high confusion)
+        if curr_entropy > 2.5:
+            # High entropy: Be robust. Use the minimax strategy.
+            gains_array = self.info_gain_robust_batch(prior, available_features_to_check)
+        else:
+            # Low entropy: Be fast. Use the expected value strategy.
+            gains_array = self.info_gain_batch(prior, available_features_to_check)
+        # === END OF BLENDED STRATEGY ===
+            
         sorted_indices_of_gains = np.argsort(gains_array)[::-1]
 
         if len(sorted_indices_of_gains) == 0:
             return None, None
 
-        # Add slight randomness to top 3 choices for variety while maintaining quality
+        # === WEIGHTED RANDOM CHOICE FROM TOP 3 ===
         if question_count >= 3 and len(sorted_indices_of_gains) >= 3:
             # 70% pick best, 20% pick 2nd best, 10% pick 3rd best
-            rand = np.random.random()
-            if rand < 0.70:
-                chosen_local_idx = sorted_indices_of_gains[0]
-            elif rand < 0.90:
-                chosen_local_idx = sorted_indices_of_gains[1]
-            else:
-                chosen_local_idx = sorted_indices_of_gains[2]
+            top_3_choices = sorted_indices_of_gains[:3]
+            chosen_local_idx = np.random.choice(top_3_choices, p=[0.7, 0.2, 0.1])
         else:
-            # Always pick the best feature for early questions
+            # Always pick the best feature
             chosen_local_idx = sorted_indices_of_gains[0]
-        
+        # === END OF WEIGHTED CHOICE ===
+            
         idx = sampled_indices_map[int(chosen_local_idx)]
         
         feature = self.feature_cols[idx]
         question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
         return feature, question
+    # --- END OF UPDATED METHOD ---
     
     def should_guess(self, prior, question_count):
         """
@@ -415,7 +506,7 @@ class AkinatorEngine:
         """Find question that best separates top candidate from others."""
         top_prob = prior[top_idx]
         # More lenient similarity threshold
-        similar_mask = (prior > top_prob * 0.05)  # Was 0.1, now 0.05
+        similar_mask = (prior > top_prob * 0.05) # Was 0.1, now 0.05
         similar_mask[top_idx] = False
         similar_indices = np.where(similar_mask)[0]
         
@@ -442,7 +533,7 @@ class AkinatorEngine:
         best_diff = mask[best_idx]
         
         # Lower threshold for more aggressive discrimination
-        if best_diff > 0.25:  # Was 0.3, now 0.25
+        if best_diff > 0.25: # Was 0.3, now 0.25
             feature = self.feature_cols[best_idx]
             question = self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
             return feature, question
