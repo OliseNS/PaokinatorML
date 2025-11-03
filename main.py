@@ -240,9 +240,6 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
     
     if feature == 'sneaky_guess':
         if client_answer in ['yes', 'y', 'usually']:
-            answered_features = game_state['answered_features']
-            srv.record_suggestion(payload.animal_name, answered_features, domain_name) # Pass domain
-            db.delete_session(session_id)
             return {
                 'status': 'guess_correct',
                 'animal': payload.animal_name,
