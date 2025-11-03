@@ -263,17 +263,16 @@ class AkinatorEngine:
         
         # Tiered thresholds
         thresholds = [
-            (8, 0.92, 10.0, 0.3),   # < 8 questions
-            (12, 0.85, 8.0, 0.5),   # 8-12
-            (18, 0.75, 6.0, 0.8),   # 12-18
-            (25, 0.65, 5.0, 1.2),   # 18-25
-            (999, 0.55, 4.0, 999)   # 25+
+            (8, 0.99, 10.0, 0.3),   # < 8 questions
+            (12, 0.98, 8.0, 0.5),   # 8-12
+            (18, 0.95, 6.0, 0.8),   # 12-18
+            (25, 0.93, 5.0, 1.2),   # 18-25
+            (999, 0.80, 4.0, 999)   # 25+
         ]
         
         for q_limit, min_prob, min_sep, max_ent in thresholds:
             if question_count < q_limit:
-                should_guess = (top_prob > min_prob and separation > min_sep and entropy < max_ent) or \
-                               (top_prob > min_prob + 0.05 and separation > min_sep - 1.0)
+                should_guess = (top_prob > min_prob and separation > min_sep and entropy < max_ent)
                 break
         
         # Don't guess if too many candidates early
