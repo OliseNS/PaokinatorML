@@ -12,7 +12,7 @@ class AkinatorEngine:
         self.definite_exp = -5.0
         self.uncertain_exp = -2.5
         self.fuzzy_map = {'yes': 1.0, 'y': 1.0, 'usually': 0.75, 'sometimes': 0.5, 
-                         'maybe': 0.5, 'rarely': 0.25, 'no': 0.0, 'n': 0.0}
+                          'maybe': 0.5, 'rarely': 0.25, 'no': 0.0, 'n': 0.0}
         self.sparse_question_position = np.random.randint(5, 11)
         self.sparse_question_asked = False
         
@@ -68,7 +68,7 @@ class AkinatorEngine:
             uniform_prior = np.ones(len(self.animals), dtype=np.float32) / len(self.animals)
             gains = self._compute_gains(uniform_prior, self.allowed_feature_indices, robust=False)
             self.feature_importance = {self.feature_cols[idx]: float(gains[i]) 
-                                      for i, idx in enumerate(self.allowed_feature_indices)}
+                                       for i, idx in enumerate(self.allowed_feature_indices)}
             sorted_idx = np.argsort(gains)[::-1]
             self.sorted_initial_feature_indices = [self.allowed_feature_indices[i] for i in sorted_idx]
         else:
@@ -104,7 +104,7 @@ class AkinatorEngine:
         # Vectorized likelihood lookup
         for a_idx, aval in enumerate(self.answer_values):
             table = (self.likelihood_table_definite if abs(aval.item() - 0.5) > 0.3 
-                    else self.likelihood_table_uncertain)
+                     else self.likelihood_table_uncertain)
             likelihoods[:, :, a_idx] = table[quantized, a_idx]
         
         likelihoods = np.where(nan_mask_batch[:, :, None], 1.0, likelihoods)
@@ -115,9 +115,9 @@ class AkinatorEngine:
             if robust:
                 # Minimax: worst-case entropy
                 max_ent = max((self._entropy(prior_sub * likelihoods[:, f_idx, a_idx] / 
-                              (prior_sub * likelihoods[:, f_idx, a_idx]).sum()) 
-                              if (prior_sub * likelihoods[:, f_idx, a_idx]).sum() > 1e-10 else 0.0)
-                             for a_idx in range(A))
+                                (prior_sub * likelihoods[:, f_idx, a_idx]).sum()) 
+                                if (prior_sub * likelihoods[:, f_idx, a_idx]).sum() > 1e-10 else 0.0)
+                               for a_idx in range(A))
                 gains[f_idx] = curr_entropy - max_ent
             else:
                 # Expected gain
@@ -164,20 +164,28 @@ class AkinatorEngine:
             hard_contradiction = (~self.nan_mask[:, feature_idx]) & (contradictions > 0.6)
             likelihood = np.where(hard_contradiction, 0.0001, likelihood)
         
-        likelihood = np.where(self.nan_mask[:, feature_idx], 1.0, likelihood)
+        # --- START FIX ---
+        # Only treat NaN as a 1.0 match if the user's answer was uncertain 
+        # (e.g., "maybe"). If the answer was definite ("yes" or "no"),
+        # we keep the penalized likelihood calculated earlier (where NaN was 
+        # treated as 0.5 via features_filled), which is the correct behavior.
+        if not is_definite:
+            likelihood = np.where(self.nan_mask[:, feature_idx], 1.0, likelihood)
+        # --- END FIX ---
+            
         posterior = prior * likelihood
         return posterior / (posterior.sum() + 1e-10)
 
     def select_sparse_question(self, asked):
         """Select sparse feature for data collection."""
         available = [idx for idx in self.sparse_feature_indices 
-                    if self.feature_cols[idx] not in asked]
+                     if self.feature_cols[idx] not in asked]
         if not available:
             return None, None
         
         # Weight by NaN ratio
         weights = np.array([3.0 if r >= 0.8 else 2.0 if r >= 0.7 else 1.5 if r >= 0.6 else 1.0
-                           for r in [self.col_nan_frac[idx] for idx in available]])
+                            for r in [self.col_nan_frac[idx] for idx in available]])
         weights /= (weights.sum() + 1e-10)
         
         chosen_idx = np.random.choice(available, p=weights)
@@ -196,7 +204,7 @@ class AkinatorEngine:
         # Early game: random from top 10
         if question_count < 3 and self.sorted_initial_feature_indices:
             available_top = [idx for idx in self.sorted_initial_feature_indices[:10]
-                           if self.feature_cols[idx] not in asked]
+                             if self.feature_cols[idx] not in asked]
             if available_top:
                 idx = np.random.choice(available_top)
                 feature = self.feature_cols[idx]
@@ -204,7 +212,7 @@ class AkinatorEngine:
         
         # Get available features
         available = [i for i, f in enumerate(self.feature_cols)
-                    if f not in asked and self.allowed_feature_mask[i]]
+                     if f not in asked and self.allowed_feature_mask[i]]
         if not available:
             return None, None
         
@@ -215,7 +223,7 @@ class AkinatorEngine:
         # Build candidate pool
         available_set = set(available)
         candidates = [idx for idx in self.sorted_initial_feature_indices 
-                     if idx in available_set][:max_features]
+                      if idx in available_set][:max_features]
         
         if len(candidates) < max_features:
             remaining = list(available_set - set(candidates))
@@ -265,7 +273,7 @@ class AkinatorEngine:
         for q_limit, min_prob, min_sep, max_ent in thresholds:
             if question_count < q_limit:
                 should_guess = (top_prob > min_prob and separation > min_sep and entropy < max_ent) or \
-                              (top_prob > min_prob + 0.05 and separation > min_sep - 1.0)
+                               (top_prob > min_prob + 0.05 and separation > min_sep - 1.0)
                 break
         
         # Don't guess if too many candidates early
@@ -284,7 +292,7 @@ class AkinatorEngine:
             return None, None
         
         available = [i for i, f in enumerate(self.feature_cols)
-                    if f not in asked and self.allowed_feature_mask[i]]
+                     if f not in asked and self.allowed_feature_mask[i]]
         if not available:
             return None, None
         
@@ -323,6 +331,6 @@ class AkinatorEngine:
                 final_indices.extend(candidates[:needed])
         
         return [{"feature_name": self.feature_cols[idx],
-                "question": self.questions_map.get(self.feature_cols[idx], 
-                           f"Does it have {self.feature_cols[idx].replace('_', ' ')}?")}
-               for idx in final_indices]
+                 "question": self.questions_map.get(self.feature_cols[idx], 
+                                     f"Does it have {self.feature_cols[idx].replace('_', ' ')}?")}
+                for idx in final_indices]
