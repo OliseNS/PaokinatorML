@@ -81,11 +81,15 @@ def push_session_state(session_id: str, state: dict):
         # --- MODIFICATION ---
         # Push to the head of the list
         redis_client.lpush(key, packed)
-        # Keep only the last 20 states (1 initial + 19 undo-able steps)
-        redis_client.ltrim(key, 0, 19) 
+        
+        # --- SMART FIX: INCREASED LIMIT ---
+        # Keep only the last 60 states (1 initial + ~29 Q/A pairs)
+        # This fixes the error after ~7 undos.
+        redis_client.ltrim(key, 0, 59) 
+        # --- END MODIFICATION ---
+        
         # Set/refresh the expiration for the *entire list*
         redis_client.expire(key, config.SESSION_TTL_SECONDS)
-        # --- END MODIFICATION ---
         
     except Exception as e:
         print(f"✗ Error pushing session {session_id}: {e}")

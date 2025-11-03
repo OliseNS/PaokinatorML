@@ -25,7 +25,8 @@ class StateManager:
             'animal_count': n_animals,
             'continue_mode': False,
             'questions_since_last_guess': 0,
-            'last_guess_type': None
+            'last_guess_type': None,
+            'state_type': 'initial'  # --- SMART FIX ---
         }
     
     @staticmethod

@@ -4,6 +4,7 @@ Extracted from main.py for better testability and maintainability.
 """
 import db
 from typing import Dict, Optional, Tuple
+import traceback
 
 
 class UndoHandler:
@@ -25,116 +26,174 @@ class UndoHandler:
         """
         history_len = db.get_session_history_length(session_id)
         
-        # Need at least 3 states: [S1_Q2, S1, S0_Q1]
-        if history_len < 3:
+        # Need at least 2 states: [S_Answer, S_Question] or [S_Question, S_Initial]
+        if history_len < 2:
             return False, "Cannot undo at the first question"
         
         return True, None
-    
+
+    # --- START OF REPLACEMENT ---
     def perform_undo(self, session_id: str) -> Tuple[Optional[dict], Optional[str]]:
         """
-        Performs the undo operation.
+        Performs the undo operation intelligently based on state_type.
         
         Returns:
             (reverted_state: Optional[dict], error: Optional[str])
         """
         try:
+            current_state = db.get_current_session_state(session_id)
+            if not current_state:
+                print(f"[UNDO] ERROR: No current state found for {session_id[:8]}")
+                return None, "Session expired or not found"
+
+            state_type = current_state.get('state_type')
             history_len = db.get_session_history_length(session_id)
-            print(f"[UNDO] Session {session_id[:8]}... has {history_len} states in history")
             
-            # Need at least 3 states: [S1_Q2, S1, S0_Q1]
-            # If we have less, we can't undo
-            if history_len < 3:
-                # Return current state with error
-                current_state = db.get_current_session_state(session_id)
-                print(f"[UNDO] Can't undo - returning current state with error")
-                if current_state:
-                    print(f"[UNDO] Current state: asked={len(current_state.get('asked_features', []))}, count={current_state.get('question_count', 0)}")
+            print(f"[UNDO] Session {session_id[:8]}: history_len={history_len}, state_type='{state_type}'")
+
+            # Cannot undo from initial state
+            if state_type == 'initial' or history_len < 2:
+                print(f"[UNDO] Can't undo - at initial state or history too short")
                 return current_state, "Cannot undo at the first question"
             
-            # Pop answer state
-            popped_answer = db.pop_session_state(session_id)
-            if not popped_answer:
-                print(f"[UNDO] ERROR: Failed to pop answer state")
-                return None, "Session expired or not found"
+            reverted_state = None
             
-            # Pop question state
-            popped_question = db.pop_session_state(session_id)
-            if not popped_question:
-                print(f"[UNDO] ERROR: Failed to pop question state, restoring answer")
-                # Restore answer state
-                db.push_session_state(session_id, popped_answer)
-                return None, "Session history corrupted"
-            
-            # Get the now-current state
-            reverted_state = db.get_current_session_state(session_id)
+            if state_type == 'answer':
+                # We are on an 'answer' state. (e.g., [S_Answer, S_Question, ...])
+                # Pop 1 state to get to the 'question' state.
+                db.pop_session_state(session_id)
+                reverted_state = db.get_current_session_state(session_id)
+                
+            elif state_type == 'question':
+                # We are on a 'question' state. (e.g., [S_Question, S_Answer, ...])
+                
+                # --- SMART FIX: This check is robust and prevents the 404 ---
+                # If history_len is 2, we are at [S0_Q1, S_Initial]. We can't pop 2.
+                if history_len < 3: 
+                     print(f"[UNDO] Can't undo - at first question (history_len={history_len})")
+                     return current_state, "Cannot undo at the first question"
+                
+                db.pop_session_state(session_id) # Pop 'question' state
+                db.pop_session_state(session_id) # Pop 'answer' state
+                reverted_state = db.get_current_session_state(session_id)
+                
+            else:
+                # Fallback for unknown state or old states without state_type
+                print(f"[UNDO] WARN: Unknown state_type '{state_type}'. Popping 2.")
+                if history_len < 3:
+                    return current_state, "Cannot undo at the first question"
+                db.pop_session_state(session_id)
+                db.pop_session_state(session_id)
+                reverted_state = db.get_current_session_state(session_id)
+
             if not reverted_state:
-                print(f"[UNDO] ERROR: No current state after pops")
+                print(f"[UNDO] ERROR: No state after popping")
+                # This can happen if the stack is corrupted or empty
                 return None, "Session state corrupted after undo"
+
+            print(f"[UNDO] Reverted to state: asked={len(reverted_state.get('asked_features', []))}, count={reverted_state.get('question_count', 0)}, type={reverted_state.get('state_type')}")
             
-            print(f"[UNDO] Reverted to state: asked={len(reverted_state.get('asked_features', []))}, count={reverted_state.get('question_count', 0)}")
-            
-            # Loop to skip past any guess states
+            # Loop to skip past any final guess states we landed on
             reverted_state = self._skip_past_guesses(session_id, reverted_state)
             
-            print(f"[UNDO] After skip guesses: asked={len(reverted_state.get('asked_features', []))}, count={reverted_state.get('question_count', 0)}")
+            print(f"[UNDO] Final reverted state: asked={len(reverted_state.get('asked_features', []))}, count={reverted_state.get('question_count', 0)}, type={reverted_state.get('state_type')}")
             
             return reverted_state, None
+        
         except Exception as e:
             print(f"[UNDO] Exception in perform_undo: {e}")
-            import traceback
             traceback.print_exc()
             return None, f"Undo failed: {str(e)}"
-    
+
     def _skip_past_guesses(self, session_id: str, state: dict) -> dict:
         """
-        Continues undoing if we're on a guess state.
-        This ensures we land on a real question.
+        Continues undoing if we're on a state that should be skipped.
+        This ensures we land on a real question or the initial state.
+        
+        *** SMART FIX: Now only skips 'final_guess' and ensures it
+            always lands on a 'question' or 'initial' state. ***
         """
         max_iterations = 20  # Safety limit
         iterations = 0
+        current_state = state
         
         while iterations < max_iterations:
-            asked_features = state.get('asked_features', [])
-            if not asked_features:
+            if not current_state:
+                print("[UNDO] Skip loop lost state, bailing.")
+                return state # Return original state
+                
+            state_type = current_state.get('state_type')
+            
+            # --- Valid Stopping Points ---
+            
+            # 1. Valid stopping point: initial state
+            if state_type == 'initial':
+                print("[UNDO] Skip loop stopped at initial state")
                 break
+                
+            # 2. Valid stopping point: a 'question' that is NOT a final guess
+            if state_type == 'question':
+                asked_features = current_state.get('asked_features', [])
+                if not asked_features:
+                    # This is S0_Q1 (question 1), a valid state
+                    print("[UNDO] Skip loop stopped at first question")
+                    break 
+                    
+                last_feature = asked_features[-1]
+                
+                # --- SMART FIX #1 ---
+                # Only 'final_guess' is skipped. 'sneaky_guess' is a valid stop.
+                if last_feature != 'final_guess':
+                    print(f"[UNDO] Skip loop stopped on non-final-guess: '{last_feature}'")
+                    break
+                
+                # If we are here, state_type is 'question' AND last_feature is 'final_guess'
+                # This state must be skipped.
+                print(f"[UNDO] Landed on guess '{last_feature}', undoing again...")
+
+            # --- State Must Be Skipped ---
+            # --- SMART FIX #2 ---
+            # If we are here, the current_state must be skipped.
+            # It's either:
+            # 1. state_type == 'answer' (which we always skip)
+            # 2. state_type == 'question' AND last_feature == 'final_guess'
             
-            last_feature = asked_features[-1]
-            
-            # If not a guess, we're done
-            if last_feature not in ['final_guess', 'sneaky_guess']:
-                break
-            
-            print(f"Undo found guess '{last_feature}', undoing again...")
-            
-            # Check if we can undo further
+            # Check if we can undo
             history_len = db.get_session_history_length(session_id)
-            if history_len < 3:
-                print("Undo loop stopped at history base")
+            if history_len < 2:
+                print("[UNDO] Skip loop stopped at history base")
                 break
             
-            # Pop answer to guess
-            popped_answer = db.pop_session_state(session_id)
-            if not popped_answer:
-                print("Failed to pop answer during guess skip")
-                break
+            # Pop the state we're on
+            popped_state = db.pop_session_state(session_id)
+            if not popped_state:
+                print("[UNDO] Failed to pop state during skip")
+                break # Return the last valid state we had
             
-            # Pop guess question
-            popped_question = db.pop_session_state(session_id)
-            if not popped_question:
-                db.push_session_state(session_id, popped_answer)
-                print("Failed to pop question during guess skip")
-                break
-            
-            # Get new current state
-            state = db.get_current_session_state(session_id)
-            if not state:
-                print("Lost state during guess skip")
-                break
+            # If we just popped a 'final_guess' question, we must ALSO pop its preceding answer
+            if state_type == 'question': # (and we know from above it was a final_guess)
+                if db.get_session_history_length(session_id) < 1:
+                    print("[UNDO] History empty after popping guess, stopping")
+                    current_state = db.get_current_session_state(session_id)
+                    break
+                
+                answer_pop = db.pop_session_state(session_id) # Pop the answer
+                if not answer_pop:
+                    print("[UNDO] Failed to pop answer during guess skip")
+                    db.push_session_state(session_id, popped_state) # Restore
+                    current_state = db.get_current_session_state(session_id)
+                    break
+
+            # Get the new current state to evaluate in the next loop
+            current_state = db.get_current_session_state(session_id)
+            if not current_state:
+                 print("[UNDO] Lost state during guess skip loop")
+                 return state # Return original state
             
             iterations += 1
         
-        return state
+        return current_state
+    # --- END OF REPLACEMENT ---
     
     def build_response_from_state(self, state: dict, session_id: str,
                                    error: Optional[str] = None) -> dict:
@@ -156,11 +215,17 @@ class UndoHandler:
             return {'error': f"Domain {domain_name} not found"}
         
         asked_features = state.get('asked_features', [])
+        state_type = state.get('state_type')
         
-        # Handle case where we've undone to S0 (no questions asked yet)
-        if not asked_features:
+        # --- SMART FIX ---
+        # Handle case where we've undone to S0 (initial state)
+        if state_type == 'initial':
             return self._build_first_question_response(state, engine, error, session_id)
         
+        # Handle empty features just in case
+        if not asked_features:
+             return self._build_first_question_response(state, engine, error, session_id)
+
         last_feature = asked_features[-1]
         
         # If we have an error (like "can't undo"), we still need to show the current question
@@ -180,11 +245,17 @@ class UndoHandler:
                                        engine, error: Optional[str],
                                        session_id: str) -> dict:
         """Builds response for the first question (S0 -> S0_Q1)."""
+        
+        # We are at 'initial' state (S0). We need to get the first question
+        # and push its state (S0_Q1) so the stack is correct.
+        
         feature, question, updated_state = self.service.get_next_question(state)
         
         if feature:
             updated_state['asked_features'].append(feature)
         
+        # --- SMART FIX ---
+        updated_state['state_type'] = 'question'
         db.push_session_state(session_id, updated_state)
         
         top_pred = self.service.get_top_predictions(updated_state, n=1)

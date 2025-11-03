@@ -130,6 +130,7 @@ async def start_game(payload: StartPayload):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     
+    # Initial state is set to 'initial' by state_manager
     db.push_session_state(session_id, game_state)
     return {"session_id": session_id, "domain_name": payload.domain_name}
 
@@ -153,6 +154,8 @@ async def get_question(session_id: str):
             else:
                 game_state['asked_features'].append('sneaky_guess')
 
+            # --- SMART FIX ---
+            game_state['state_type'] = 'question'
             db.push_session_state(session_id, game_state)
             
             if guess_type == 'final':
@@ -184,6 +187,8 @@ async def get_question(session_id: str):
         if feature and feature not in game_state['asked_features']:
             game_state['asked_features'].append(feature)
 
+        # --- SMART FIX ---
+        game_state['state_type'] = 'question'
         db.push_session_state(session_id, game_state)
 
         if not feature or not question:
@@ -234,6 +239,9 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
     
     if feature == 'sneaky_guess':
         if client_answer in ['yes', 'y', 'usually']:
+            # --- SMART FIX ---
+            game_state['state_type'] = 'answer'
+            db.push_session_state(session_id, game_state) # Push state before returning
             return {
                 'status': 'guess_correct',
                 'animal': payload.animal_name,
@@ -241,6 +249,8 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
             }
 
         game_state = srv.reject_guess(game_state, payload.animal_name)
+        # --- SMART FIX ---
+        game_state['state_type'] = 'answer'
         db.push_session_state(session_id, game_state)
         return {
             'status': 'ok',
@@ -273,6 +283,8 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
                     
                 status = 'ok'
 
+    # --- SMART FIX ---
+    game_state['state_type'] = 'answer'
     db.push_session_state(session_id, game_state)
     
     return {
