@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Akinator API",
     description="Multi-domain Akinator-style game server.",
-    version="1.2.0", # Incremented version
+    version="1.3.2", # Incremented version for Undo fix
     lifespan=lifespan
 )
 
@@ -119,7 +119,8 @@ async def start_game(payload: StartPayload):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     
-    db.set_session(session_id, game_state)
+    # MODIFIED: Use push_session_state
+    db.push_session_state(session_id, game_state)
     return {"session_id": session_id, "domain_name": payload.domain_name}
 
 
@@ -130,7 +131,8 @@ async def get_question(session_id: str):
     This endpoint will also return a guess if the engine is confident.
     """
     srv = get_service()
-    game_state = db.get_session(session_id)
+    # MODIFIED: Use get_current_session_state
+    game_state = db.get_current_session_state(session_id)
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
@@ -157,7 +159,16 @@ async def get_question(session_id: str):
 
         if should_guess:
             top_predictions = srv.get_top_predictions(game_state, n=5)
-            db.set_session(session_id, game_state) # Save state changes
+            
+            # --- NEW FIX: Add guess type to asked_features before saving ---
+            if guess_type == 'final':
+                game_state['asked_features'].append('final_guess')
+            else: # 'middle'
+                game_state['asked_features'].append('sneaky_guess')
+            # --- END FIX ---
+
+            # MODIFIED: Use push_session_state
+            db.push_session_state(session_id, game_state) # Save state changes
             
             if guess_type == 'final':
                 return {
@@ -185,7 +196,15 @@ async def get_question(session_id: str):
         
         # --- Not guessing, so get next question ---
         feature, question, game_state = srv.get_next_question(game_state)
-        db.set_session(session_id, game_state) # Save state
+
+        # --- NEW FIX: Add the new question to the state *before* pushing ---
+        if feature and feature not in game_state['asked_features']:
+            # This state now represents the question being asked
+            game_state['asked_features'].append(feature)
+        # --- END FIX ---
+
+        # MODIFIED: Use push_session_state
+        db.push_session_state(session_id, game_state) # Save state (which now includes the new question)
 
         if not feature or not question:
             top_preds = srv.get_top_predictions(game_state, n=3)
@@ -229,7 +248,8 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
     Processes a user's answer to a question.
     """
     srv = get_service()
-    game_state = db.get_session(session_id)
+    # MODIFIED: Use get_current_session_state
+    game_state = db.get_current_session_state(session_id)
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
@@ -247,17 +267,19 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
             }
 
         game_state = srv.reject_guess(game_state, payload.animal_name)
-        if 'sneaky_guess' not in game_state['asked_features']:
-            game_state['asked_features'].append('sneaky_guess')
+        # Redundant check removed, 'sneaky_guess' is already in asked_features
+        # from the /question endpoint.
 
-        db.set_session(session_id, game_state)
+        # MODIFIED: Use push_session_state
+        db.push_session_state(session_id, game_state)
         return {
             'status': 'ok',
             'top_predictions': srv.get_top_predictions(game_state, n=5)
         }
     
-    if feature not in game_state['asked_features']:
-        game_state['asked_features'].append(feature)
+    # This check is now correctly false, as /question added the feature
+    # if feature not in game_state['asked_features']:
+    #     game_state['asked_features'].append(feature)
 
     answer_map = {
         'yes': 'yes', 'y': 'yes',
@@ -285,14 +307,232 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
                 
             status = 'ok'
 
-    db.set_session(session_id, game_state)
+    # MODIFIED: Use push_session_state
+    db.push_session_state(session_id, game_state)
     
     return {
         'status': status,
         'top_predictions': srv.get_top_predictions(game_state, n=5)
     }
 
-# --- NEW ENDPOINT ---
+# --- MODIFIED ENDPOINT ---
+@app.post("/undo/{session_id}", summary="Undo the last action")
+async def undo_last_action(session_id: str):
+    """
+    Reverts the game state to the previous question by popping
+    the current state from the history.
+    """
+    srv = get_service() # Just to check service
+    
+    # Check history length.
+    # We need at least 3 states to undo: [S1_Q2, S1, S0_Q1]
+    # Popping S1_Q2 and S1 leaves S0_Q1 (the state for Q1)
+    history_len = db.get_session_history_length(session_id)
+    if history_len < 3:
+        # Can't undo, just return the current (initial) state
+        current_state = db.get_current_session_state(session_id)
+        if not current_state:
+            raise HTTPException(status_code=404, detail="Session expired or not found")
+        
+        # Convert to JSON-safe and add error status
+        json_safe_state = db.convert_state_to_json_safe(current_state)
+        if not json_safe_state:
+             raise HTTPException(status_code=404, detail="Session expired or not found")
+        
+        json_safe_state['undo_status'] = 'failed_at_start'
+        json_safe_state['error'] = 'Cannot undo at the first question.'
+        
+        # Re-build the current question view
+        # This is likely state S0_Q1, which is fine
+        if not json_safe_state.get('asked_features'):
+             # This is state S0, before Q1. Re-run get_question logic.
+             print("Undo called on S0, re-running get_question")
+             # We must NOT push the state again, so we can't call get_question directly.
+             # Re-create S0_Q1 logic here.
+             feature, question, game_state = srv.get_next_question(current_state)
+             if feature:
+                 game_state['asked_features'].append(feature)
+             db.push_session_state(session_id, game_state) # Push S0_Q1
+             
+             top_pred = srv.get_top_predictions(game_state, n=1)
+             return {
+                 'question': question,
+                 'feature': feature,
+                 'question_number': 1, # It's the first question
+                 'top_prediction': top_pred[0] if top_pred else None,
+                 'should_guess': False,
+                 'is_sneaky_guess': False,
+                 'undo_status': 'failed_at_start'
+             }
+
+        # It's S0_Q1 (or later), reconstruct the *current* question
+        last_feature_asked = json_safe_state.get('asked_features', [])[-1]
+        domain_name = json_safe_state.get('domain_name')
+        engine = srv.engines.get(domain_name)
+        if not engine:
+            raise HTTPException(status_code=404, detail=f"Domain {domain_name} not found")
+            
+        question_text = engine.questions_map.get(last_feature_asked, f"Does it have {last_feature_asked.replace('_', ' ')}?")
+        top_pred = srv.get_top_predictions(current_state, n=1)
+        
+        response = {
+            'question': question_text,
+            'feature': last_feature_asked,
+            # FIX 1: Add 1 to the question count
+            'question_number': json_safe_state.get('question_count', 0) + 1,
+            'top_prediction': top_pred[0] if top_pred else None,
+            'should_guess': False,
+            'is_sneaky_guess': False,
+            'undo_status': 'failed_at_start' # Add flag
+        }
+        return response
+
+    # Pop the current "answer" state (e.g., S1)
+    popped_a_state = db.pop_session_state(session_id)
+    if not popped_a_state:
+        raise HTTPException(status_code=404, detail="Session expired or not found")
+
+    # Pop the current "question" state (e.g., S0_Q1)
+    popped_q_state = db.pop_session_state(session_id)
+    if not popped_q_state:
+        # This is bad, we're in a weird state. Push the a_state back on.
+        db.push_session_state(session_id, popped_a_state)
+        raise HTTPException(status_code=500, detail="Session history corrupted")
+    
+    reverted_state = db.get_current_session_state(session_id)
+    if not reverted_state:
+        raise HTTPException(status_code=404, detail="Session state corrupted after undo")
+
+    # --- FIX 2: Loop to undo past guesses ---
+    last_feature_list = reverted_state.get('asked_features', [])
+    last_feature = last_feature_list[-1] if last_feature_list else None
+    
+    while last_feature in ['final_guess', 'sneaky_guess']:
+        print(f"Undo found guess '{last_feature}', undoing again...")
+        history_len = db.get_session_history_length(session_id)
+        if history_len < 3:
+            # We've undone as far as we can. This is the first question (which was a guess).
+            print("Undo loop stopped at history base")
+            break # Exit loop, will handle S0 or S0_Q_Guess state below
+
+        # Pop the answer to the guess (e.g., S_Reject)
+        popped_a_state = db.pop_session_state(session_id)
+        if not popped_a_state:
+            raise HTTPException(status_code=500, detail="Session history corrupted during undo loop")
+            
+        # Pop the guess-question (e.g., S1_Guess)
+        popped_q_state = db.pop_session_state(session_id)
+        if not popped_q_state:
+            db.push_session_state(session_id, popped_a_state) # Restore
+            raise HTTPException(status_code=500, detail="Session history corrupted during undo loop")
+
+        reverted_state = db.get_current_session_state(session_id)
+        if not reverted_state:
+             raise HTTPException(status_code=500, detail="Session history corrupted during undo loop")
+             
+        last_feature_list = reverted_state.get('asked_features', [])
+        last_feature = last_feature_list[-1] if last_feature_list else None
+        
+        if last_feature is None:
+            # We've landed on S0
+            print("Undo loop stopped at S0")
+            break
+    # --- END FIX 2 ---
+
+    # --- THIS IS THE FIX ---
+    # We cannot return 'reverted_state' as it contains numpy arrays.
+    # We must build a JSON-safe response, just like /question does.
+    
+    # Handle S0 state (we've undone all the way to the start)
+    if not reverted_state.get('asked_features', []):
+        # This means we reverted to S0. We need to show Q1.
+        print("Undo reverted to S0, re-running get_question")
+        # We must NOT push the state again, so we can't call get_question directly.
+        # Re-create S0_Q1 logic here.
+        feature, question, game_state = srv.get_next_question(reverted_state)
+        if feature:
+            game_state['asked_features'].append(feature)
+        db.push_session_state(session_id, game_state) # Push S0_Q1
+        
+        top_pred = srv.get_top_predictions(game_state, n=1)
+        return {
+            'question': question,
+            'feature': feature,
+            'question_number': 1, # It's the first question
+            'top_prediction': top_pred[0] if top_pred else None,
+            'should_guess': False,
+            'is_sneaky_guess': False,
+            'undo_status': 'ok'
+        }
+
+    # The 'reverted_state' (e.g., S0_Q1) has the question info we want to display.
+    
+    domain_name = reverted_state.get('domain_name')
+    engine = srv.engines.get(domain_name)
+    if not engine:
+        raise HTTPException(status_code=404, detail=f"Domain {domain_name} not found")
+
+    asked_features_list = reverted_state.get('asked_features', [])
+    last_feature_asked = asked_features_list[-1]
+    response = {}
+
+    # Handle sneaky guess reconstruction
+    if last_feature_asked == 'sneaky_guess':
+        top_pred = srv.get_top_predictions(reverted_state, n=1)
+        animal_name = top_pred[0]['animal'] if top_pred else "your animal"
+        
+        def get_article(word: str) -> str:
+            if not word: return "a"
+            try:
+                first_char = word.strip()[0].lower()
+                if first_char in 'aeiou': return "an"
+            except IndexError: return "a"
+            return "a"
+        
+        article = get_article(animal_name)
+        
+        response = {
+            'question': f"Is it {article} {animal_name}?",
+            'feature': 'sneaky_guess',
+            'animal_name': animal_name,
+            'is_sneaky_guess': True,
+            # FIX 1: Add 1 to the question count
+            'question_number': reverted_state.get('question_count', 0) + 1,
+            'top_prediction': top_pred[0] if top_pred else None,
+            'should_guess': False,
+            'undo_status': 'ok'
+        }
+    
+    # Handle final guess reconstruction
+    elif last_feature_asked == 'final_guess': # Check against the feature we added
+        top_preds = srv.get_top_predictions(reverted_state, n=5)
+        response = {
+            'should_guess': True,
+            'guess': top_preds[0]['animal'] if top_preds else "your animal",
+            'guess_type': 'final',
+            'top_predictions': top_preds,
+            'undo_status': 'ok'
+        }
+        
+    # Handle regular question reconstruction
+    else:
+        question_text = engine.questions_map.get(last_feature_asked, f"Does it have {last_feature_asked.replace('_', ' ')}?")
+        top_pred = srv.get_top_predictions(reverted_state, n=1)
+        response = {
+            'question': question_text,
+            'feature': last_feature_asked,
+            # FIX 1: Add 1 to the question count
+            'question_number': reverted_state.get('question_count', 0) + 1,
+            'top_prediction': top_pred[0] if top_pred else None,
+            'should_guess': False,
+            'is_sneaky_guess': False,
+            'undo_status': 'ok'
+        }
+    
+    return response
+# --- END MODIFIED ENDPOINT ---
+
+
 @app.post("/continue/{session_id}", summary="Continue game after wrong guess")
 async def continue_game(session_id: str):
     """
@@ -300,15 +540,17 @@ async def continue_game(session_id: str):
     after a final guess was rejected.
     """
     srv = get_service()
-    game_state = db.get_session(session_id)
+    # MODIFIED: Use get_current_session_state
+    game_state = db.get_current_session_state(session_id)
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
     game_state = srv.activate_continue_mode(game_state)
-    db.set_session(session_id, game_state)
+    # MODIFIED: Use push_session_state
+    db.push_session_state(session_id, game_state)
     
     return {"status": "continuing"}
-# --- END NEW ENDPOINT ---
+
 
 @app.post("/reject/{session_id}", summary="Reject a guess")
 async def reject_animal(session_id: str, payload: RejectPayload):
@@ -317,7 +559,8 @@ async def reject_animal(session_id: str, payload: RejectPayload):
     This now returns 'ask_to_continue' for final guesses.
     """
     srv = get_service()
-    game_state = db.get_session(session_id)
+    # MODIFIED: Use get_current_session_state
+    game_state = db.get_current_session_state(session_id)
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
@@ -326,7 +569,8 @@ async def reject_animal(session_id: str, payload: RejectPayload):
     # We assume this endpoint is only for final guesses, as 'middle'
     # is handled by /answer. The user's request confirms this.
     
-    db.set_session(session_id, game_state)
+    # MODIFIED: Use push_session_state
+    db.push_session_state(session_id, game_state)
     
     return {
         'status': 'ask_to_continue', # <-- CHANGED
@@ -342,7 +586,8 @@ async def confirm_win(session_id: str, payload: WinPayload):
     This saves the session data as a suggestion.
     """
     srv = get_service()
-    game_state = db.get_session(session_id)
+    # MODIFIED: Use get_current_session_state
+    game_state = db.get_current_session_state(session_id)
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
@@ -367,7 +612,8 @@ async def learn_animal(session_id: str, payload: LearnPayload):
     wants to add their animal.
     """
     srv = get_service()
-    game_state = db.get_session(session_id)
+    # MODIFIED: Use get_current_session_state
+    game_state = db.get_current_session_state(session_id)
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
@@ -498,7 +744,8 @@ async def get_predictions(session_id: str):
     Debug endpoint to see the current top 10 predictions for a session.
     """
     srv = get_service()
-    game_state = db.get_session(session_id)
+    # MODIFIED: Use get_current_session_state
+    game_state = db.get_current_session_state(session_id)
     if not game_state:
         raise HTTPException(status_code=404, detail="Session expired or not found")
     
@@ -571,3 +818,4 @@ if __name__ == "__main__":
         port=config.PORT, 
         reload=False
     )
+

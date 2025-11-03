@@ -54,37 +54,103 @@ def _convert_from_serializable(state: dict) -> dict:
                 state[key] = state[key].astype(bool)
     return state
 
+# --- NEW FUNCTION ---
+def convert_state_to_json_safe(state: dict) -> dict:
+    """Converts state with numpy arrays to be JSON serializable."""
+    if not state:
+        return None
+    state_copy = state.copy()
+    for key in ['probabilities', 'rejected_mask']:
+        if key in state_copy and isinstance(state_copy[key], np.ndarray):
+            state_copy[key] = state_copy[key].tolist()
+    return state_copy
+# --- END NEW FUNCTION ---
 
-def set_session(session_id: str, state: dict):
-    """Save session state to Redis using msgpack."""
+
+def push_session_state(session_id: str, state: dict):
+    """
+    Pushes a new game state onto the session's history stack in Redis.
+    """
     if not redis_client:
         return print("✗ Redis client not initialized")
     
     try:
+        key = f"session:{session_id}"
         packed = msgpack.packb(_convert_to_serializable(state), use_bin_type=True)
-        redis_client.setex(f"session:{session_id}", config.SESSION_TTL_SECONDS, packed)
+        
+        # --- MODIFICATION ---
+        # Push to the head of the list
+        redis_client.lpush(key, packed)
+        # Keep only the last 20 states (1 initial + 19 undo-able steps)
+        redis_client.ltrim(key, 0, 19) 
+        # Set/refresh the expiration for the *entire list*
+        redis_client.expire(key, config.SESSION_TTL_SECONDS)
+        # --- END MODIFICATION ---
+        
     except Exception as e:
-        print(f"✗ Error setting session {session_id}: {e}")
+        print(f"✗ Error pushing session {session_id}: {e}")
 
 
-def get_session(session_id: str) -> dict | None:
-    """Retrieve session state from Redis."""
+def get_current_session_state(session_id: str) -> dict | None:
+    """Retrieve the *current* (most recent) session state from Redis."""
     if not redis_client:
         return None
     
     try:
         key = f"session:{session_id}"
-        packed = redis_client.get(key)
+        
+        # --- MODIFICATION ---
+        # Get the head of the list (index 0)
+        packed = redis_client.lindex(key, 0)
+        # --- END MODIFICATION ---
         
         if not packed:
             return None
         
+        # Refresh TTL on access
         redis_client.expire(key, config.SESSION_TTL_SECONDS)
         state = msgpack.unpackb(packed, raw=False)
         return _convert_from_serializable(state)
     except Exception as e:
-        print(f"✗ Error getting session {session_id}: {e}")
+        print(f"✗ Error getting current session {session_id}: {e}")
         return None
+
+
+# --- NEW FUNCTION ---
+def pop_session_state(session_id: str) -> dict | None:
+    """Removes the *current* (most recent) state and returns it."""
+    if not redis_client:
+        return None
+        
+    try:
+        key = f"session:{session_id}"
+        # --- NEW LOGIC ---
+        # Pop the head of the list
+        packed = redis_client.lpop(key)
+        
+        if not packed:
+            return None
+            
+        # Refresh TTL, since we interacted
+        redis_client.expire(key, config.SESSION_TTL_SECONDS)
+        state = msgpack.unpackb(packed, raw=False)
+        return _convert_from_serializable(state)
+        # --- END NEW LOGIC ---
+    except Exception as e:
+        print(f"✗ Error popping session {session_id}: {e}")
+        return None
+
+# --- NEW FUNCTION ---
+def get_session_history_length(session_id: str) -> int:
+    """Returns the number of states stored for a session."""
+    if not redis_client:
+        return 0
+    try:
+        key = f"session:{session_id}"
+        return redis_client.llen(key)
+    except Exception as e:
+        print(f"✗ Error getting session length for {session_id}: {e}")
+        return 0
 
 
 def delete_session(session_id: str):
