@@ -160,8 +160,16 @@ class AkinatorService:
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
         """
-        Determines if engine should guess.
-        May mutate game_state (middle_guess_made, continue_mode).
+        *** MASSIVELY STRICTER *** guessing logic.
+        
+        Now requires:
+        - Much higher confidence (0.85-0.99+)
+        - Much higher separation ratios (15x-50x+)
+        - Lower entropy thresholds
+        - Minimum question counts
+        - Active candidate analysis
+        
+        Returns: (should_guess, animal_name, guess_type)
         """
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
@@ -174,42 +182,107 @@ class AkinatorService:
         if probs.sum() < 1e-10:
             return False, None, None
         
+        # Normalize
+        probs = probs / probs.sum()
+        
         top_idx = np.argmax(probs)
         top_prob = probs[top_idx]
         top_animal = engine.animals[top_idx]
         
-        probs[top_idx] = 0.0
-        second_prob = np.max(probs)
+        # Calculate separation from second place
+        probs_copy = probs.copy()
+        probs_copy[top_idx] = 0.0
+        second_prob = np.max(probs_copy)
         confidence_ratio = top_prob / (second_prob + 1e-9)
         
-        # Continue mode logic
-        QUESTIONS_TO_WAIT = 3
+        # Calculate entropy
+        entropy = self._calculate_entropy(probs)
+        
+        # Count significant candidates (prob > 0.05)
+        significant_candidates = np.sum(probs > 0.05)
+        
+        # Count viable candidates (prob > 0.01)
+        viable_candidates = np.sum(probs > 0.01)
+        
+        # --- Continue Mode Logic ---
+        QUESTIONS_TO_WAIT = 4  # Increased from 3
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < QUESTIONS_TO_WAIT:
                 return False, None, None
             else:
-                # Reset and make final guess
+                # Reset and allow final guess with stricter threshold
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # Middle guess
-        if (
-            q_count in [5, 10, 15] and 
-            top_prob > 0.3 and
-            not game_state['middle_guess_made']
-        ):
-            game_state['middle_guess_made'] = True
-            return True, top_animal, 'middle'
-            
-        # Final guess thresholds
-        if (top_prob > 0.7 and confidence_ratio > 5.0 and q_count > 5):
-            return True, top_animal, 'final'
-        if (top_prob > 0.5 and confidence_ratio > 10.0 and q_count > 8):
-            return True, top_animal, 'final'
-        if q_count >= 20:
+        # --- REMOVED MIDDLE GUESSES ---
+        # Middle guesses are disruptive and don't help accuracy
+        # Removed entirely
+        
+        # --- STRICTER FINAL GUESS LOGIC ---
+        
+        # Early game (< 10 questions): NEVER guess unless absolutely certain
+        if q_count < 10:
+            if (top_prob > 0.98 and 
+                confidence_ratio > 50.0 and 
+                entropy < 0.15 and
+                significant_candidates <= 1):
+                print(f"[GUESS] Early game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Mid game (10-15 questions): Very strict
+        if q_count < 15:
+            if (top_prob > 0.95 and 
+                confidence_ratio > 30.0 and 
+                entropy < 0.25 and
+                significant_candidates <= 2):
+                print(f"[GUESS] Mid game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Late mid game (15-20 questions): Strict
+        if q_count < 20:
+            if (top_prob > 0.90 and 
+                confidence_ratio > 20.0 and 
+                entropy < 0.4 and
+                significant_candidates <= 3):
+                print(f"[GUESS] Late mid confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Late game (20-25 questions): Moderately strict
+        if q_count < 25:
+            if (top_prob > 0.85 and 
+                confidence_ratio > 15.0 and 
+                entropy < 0.6):
+                print(f"[GUESS] Late game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Very late game (25-30 questions): Still require decent confidence
+        if q_count < 30:
+            if (top_prob > 0.75 and 
+                confidence_ratio > 10.0 and
+                entropy < 1.0):
+                print(f"[GUESS] Very late confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Forced guess after 30 questions (but still with minimum standards)
+        if q_count >= 30:
+            if top_prob > 0.50 and confidence_ratio > 5.0:
+                print(f"[GUESS] Forced (30+): prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
+                return True, top_animal, 'final'
+            # If even forced guess fails, return top candidate anyway
+            print(f"[GUESS] Ultimate forced (30+): prob={top_prob:.3f}")
             return True, top_animal, 'final'
             
         return False, None, None
+
+    def _calculate_entropy(self, probs: np.ndarray) -> float:
+        """Calculate Shannon entropy of probability distribution."""
+        probs_safe = np.clip(probs, 1e-10, 1.0)
+        return -np.sum(probs_safe * np.log(probs_safe))
 
     def activate_continue_mode(self, game_state: dict) -> dict:
         """Sets game to continue asking questions after wrong guess."""
