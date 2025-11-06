@@ -1,7 +1,3 @@
-"""
-Service layer for Akinator game logic.
-Manages multiple engine instances and game state.
-"""
 import threading
 import numpy as np
 
@@ -218,13 +214,13 @@ class AkinatorService:
         # Middle guesses are disruptive and don't help accuracy
         # Removed entirely
         
-        # --- STRICTER FINAL GUESS LOGIC ---
+        # --- (NEW) STRICTER FINAL GUESS LOGIC ---
         
         # Early game (< 10 questions): NEVER guess unless absolutely certain
         if q_count < 10:
-            if (top_prob > 0.98 and 
-                confidence_ratio > 50.0 and 
-                entropy < 0.15 and
+            if (top_prob > 0.99 and  # TIGHTENED
+                confidence_ratio > 60.0 and  # TIGHTENED
+                entropy < 0.10 and  # TIGHTENED
                 significant_candidates <= 1):
                 print(f"[GUESS] Early game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
                 return True, top_animal, 'final'
@@ -232,9 +228,9 @@ class AkinatorService:
         
         # Mid game (10-15 questions): Very strict
         if q_count < 15:
-            if (top_prob > 0.95 and 
-                confidence_ratio > 30.0 and 
-                entropy < 0.25 and
+            if (top_prob > 0.97 and  # TIGHTENED
+                confidence_ratio > 40.0 and  # TIGHTENED
+                entropy < 0.20 and  # TIGHTENED
                 significant_candidates <= 2):
                 print(f"[GUESS] Mid game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
                 return True, top_animal, 'final'
@@ -242,35 +238,35 @@ class AkinatorService:
         
         # Late mid game (15-20 questions): Strict
         if q_count < 20:
-            if (top_prob > 0.90 and 
-                confidence_ratio > 20.0 and 
-                entropy < 0.4 and
+            if (top_prob > 0.92 and  # TIGHTENED
+                confidence_ratio > 25.0 and  # TIGHTENED
+                entropy < 0.35 and  # TIGHTENED
                 significant_candidates <= 3):
                 print(f"[GUESS] Late mid confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
-        # Late game (20-25 questions): Moderately strict
+        # Late game (20-25 questions): Moderately strict (USER'S TARGET)
         if q_count < 25:
-            if (top_prob > 0.85 and 
-                confidence_ratio > 15.0 and 
-                entropy < 0.6):
+            if (top_prob > 0.88 and  # TIGHTENED
+                confidence_ratio > 20.0 and  # TIGHTENED
+                entropy < 0.5):  # TIGHTENED
                 print(f"[GUESS] Late game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Very late game (25-30 questions): Still require decent confidence
         if q_count < 30:
-            if (top_prob > 0.75 and 
-                confidence_ratio > 10.0 and
-                entropy < 1.0):
+            if (top_prob > 0.80 and  # TIGHTENED
+                confidence_ratio > 12.0 and  # TIGHTENED
+                entropy < 0.8):  # TIGHTENED
                 print(f"[GUESS] Very late confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Forced guess after 30 questions (but still with minimum standards)
         if q_count >= 30:
-            if top_prob > 0.50 and confidence_ratio > 5.0:
+            if top_prob > 0.60 and confidence_ratio > 5.0:  # TIGHTENED
                 print(f"[GUESS] Forced (30+): prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
                 return True, top_animal, 'final'
             # If even forced guess fails, return top candidate anyway

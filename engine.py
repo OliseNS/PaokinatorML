@@ -64,13 +64,21 @@ class AkinatorEngine:
         self.allowed_feature_mask = (col_nan_frac < 0.95) & (col_var > 5e-5)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
-        # *** IMPROVED SPARSE FEATURE DEFINITION ***
-        # Sparse = 40-90% NaN and has variance
-        # This captures features that need more data
-        self.sparse_feature_mask = (col_nan_frac >= 0.40) & (col_nan_frac < 0.90) & (col_var > 1e-6)
-        self.sparse_feature_indices = np.where(self.sparse_feature_mask)[0].tolist()
+        # *** NEW: SEPARATE MASKS FOR ASKING vs. DATA COLLECTION ***
         
-        print(f"   Feature stats: {len(self.allowed_feature_indices)} allowed, {len(self.sparse_feature_indices)} sparse")
+        # Askable Sparse: 40-90% NaN. Good for injecting questions
+        # Must also be in the 'allowed' mask
+        self.askable_sparse_mask = (self.allowed_feature_mask) & (col_nan_frac >= 0.40) & (col_nan_frac < 0.90)
+        self.askable_sparse_indices = np.where(self.askable_sparse_mask)[0].tolist()
+
+        # Data Collection Sparse: 40%-100% NaN. Good for learning.
+        # We don't filter by allowed_feature_mask here, as we WANT to collect data for features
+        # that are currently "not allowed" due to high NaN.
+        # We also don't filter by variance, as 100% NaN columns have 0 variance.
+        self.data_collection_sparse_mask = (col_nan_frac >= 0.40)
+        self.data_collection_sparse_indices = np.where(self.data_collection_sparse_mask)[0].tolist()
+        
+        print(f"   Feature stats: {len(self.allowed_feature_indices)} allowed, {len(self.askable_sparse_indices)} askable-sparse, {len(self.data_collection_sparse_indices)} data-collection-sparse")
         
         # Initial feature ranking
         if len(self.animals) > 0 and self.allowed_feature_indices:
@@ -185,15 +193,16 @@ class AkinatorEngine:
         *** IMPROVED SPARSE QUESTION SELECTION ***
         
         Now prioritizes:
-        1. Features with highest NaN percentage (70-90%)
+        1. Features from 'askable_sparse_indices' (40-90% NaN)
         2. Features not yet asked
         3. Returns None if all sparse features exhausted
         """
-        available = [idx for idx in self.sparse_feature_indices 
+        # --- FIX: Use askable_sparse_indices ---
+        available = [idx for idx in self.askable_sparse_indices 
                      if self.feature_cols[idx] not in asked]
         
         if not available:
-            print(f"   [Q{question_count}] No sparse features available")
+            print(f"   [Q{question_count}] No askable sparse features available")
             return None, None
         
         # Weight heavily by NaN ratio - prioritize most sparse features
@@ -312,8 +321,8 @@ class AkinatorEngine:
         *** IMPROVED DATA COLLECTION ***
         
         Prioritizes:
-        1. Features this specific item is missing
-        2. Features that are generally sparse (high NaN%)
+        1. Features this specific item is missing (up to 100% NaN)
+        2. Features that are generally sparse (40-100% NaN)
         3. Features with high variance (discriminative power)
         """
         final_indices = []
@@ -322,7 +331,6 @@ class AkinatorEngine:
         item_idx_list = np.where(self.animals == item_name)[0]
         if len(item_idx_list) == 0:
             print(f"   Warning: Item '{item_name}' not found for data collection")
-            # Fall back to general sparse features
             item_idx = None
         else:
             item_idx = item_idx_list[0]
@@ -330,7 +338,11 @@ class AkinatorEngine:
         # Strategy 1: Item-specific NULLs (highest priority)
         if item_idx is not None:
             null_indices = np.where(np.isnan(self.features[item_idx]))[0]
-            item_nulls = list(set(null_indices.tolist()) & set(self.allowed_feature_indices))
+            
+            # --- FIX: Removed filter for self.allowed_feature_indices ---
+            # We WANT to collect data for features that are currently disallowed
+            # because they have too many NaNs.
+            item_nulls = null_indices.tolist()
             
             # Sort by global NaN% (prioritize features that are globally sparse)
             item_nulls_sorted = sorted(item_nulls, 
@@ -340,10 +352,12 @@ class AkinatorEngine:
             final_indices = item_nulls_sorted[:num_features]
             print(f"   Data collection for '{item_name}': {len(final_indices)} item-specific nulls")
         
-        # Strategy 2: Pad with globally sparse features
+        # Strategy 2: Pad with globally sparse features (40-100% NaN)
         if len(final_indices) < num_features:
             needed = num_features - len(final_indices)
-            sparse_candidates = [idx for idx in self.sparse_feature_indices 
+            
+            # --- FIX: Use data_collection_sparse_indices ---
+            sparse_candidates = [idx for idx in self.data_collection_sparse_indices 
                                 if idx not in final_indices]
             
             # Sort by NaN% descending
@@ -357,16 +371,22 @@ class AkinatorEngine:
         # Strategy 3: Pad with high-variance features
         if len(final_indices) < num_features:
             needed = num_features - len(final_indices)
+            
+            # --- FIX: Ensure we use 'allowed' features here, as 'variance'
+            # is only meaningful for features that aren't 100% NaN
             variance_candidates = [idx for idx in self.allowed_feature_indices 
                                   if idx not in final_indices]
             
             # Calculate variance for remaining features
-            variances = np.nanvar(self.features[:, variance_candidates], axis=0)
-            sorted_var_idx = np.argsort(variances)[::-1]
-            
-            high_var_indices = [variance_candidates[i] for i in sorted_var_idx[:needed]]
-            final_indices.extend(high_var_indices)
-            print(f"   Data collection: Added {len(high_var_indices)} high-variance features")
+            if variance_candidates: # Add check for empty list
+                variances = np.nanvar(self.features[:, variance_candidates], axis=0)
+                sorted_var_idx = np.argsort(variances)[::-1]
+                
+                high_var_indices = [variance_candidates[i] for i in sorted_var_idx[:needed]]
+                final_indices.extend(high_var_indices)
+                print(f"   Data collection: Added {len(high_var_indices)} high-variance features")
+            else:
+                print(f"   Data collection: No variance candidates left")
         
         return [{"feature_name": self.feature_cols[idx],
                  "question": self.questions_map.get(self.feature_cols[idx], 
