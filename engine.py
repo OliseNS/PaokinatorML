@@ -14,6 +14,12 @@ class AkinatorEngine:
         self.fuzzy_map = {'yes': 1.0, 'y': 1.0, 'usually': 0.75, 'sometimes': 0.5, 
                           'maybe': 0.5, 'rarely': 0.25, 'no': 0.0, 'n': 0.0}
         
+        # *** NEW: Smart Guessing Strategy Parameters ***
+        # These parameters control the new should_guess() logic.
+        self.MIN_GUESS_QUESTION = 8      # Won't guess before this question
+        self.ABSOLUTE_CONFIDENCE_THRESHOLD = 0.85  # (85%) Top guess must be at least this sure
+        self.RELATIVE_CONFIDENCE_RATIO = 10.0      # Top guess must be 10x more likely than 2nd
+        
         # *** IMPROVED SPARSE QUESTION STRATEGY ***
         # Inject multiple sparse questions at strategic intervals
         self.sparse_question_schedule = [6, 12, 18, 24]  # Questions where we ask sparse features
@@ -61,24 +67,23 @@ class AkinatorEngine:
         self.col_nan_frac = col_nan_frac
         
         # Feature masks
+        # 'allowed' features are used for normal gain-based question selection
         self.allowed_feature_mask = (col_nan_frac < 0.95) & (col_var > 5e-5)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
-        # *** NEW: SEPARATE MASKS FOR ASKING vs. DATA COLLECTION ***
-        
-        # Askable Sparse: 40-90% NaN. Good for injecting questions
-        # Must also be in the 'allowed' mask
-        self.askable_sparse_mask = (self.allowed_feature_mask) & (col_nan_frac >= 0.40) & (col_nan_frac < 0.90)
-        self.askable_sparse_indices = np.where(self.askable_sparse_mask)[0].tolist()
+        # --- CLARIFICATION: Removed askable_sparse_mask and askable_sparse_indices ---
+        # These variables were confusing and not used by select_sparse_question.
+        # We only need data_collection_sparse_mask.
 
-        # Data Collection Sparse: 40%-100% NaN. Good for learning.
-        # We don't filter by allowed_feature_mask here, as we WANT to collect data for features
-        # that are currently "not allowed" due to high NaN.
-        # We also don't filter by variance, as 100% NaN columns have 0 variance.
+        # 'data_collection_sparse' features are used for injecting sparse questions
+        # to gather new data. This is the *only* list used by select_sparse_question.
         self.data_collection_sparse_mask = (col_nan_frac >= 0.40)
         self.data_collection_sparse_indices = np.where(self.data_collection_sparse_mask)[0].tolist()
         
-        print(f"   Feature stats: {len(self.allowed_feature_indices)} allowed, {len(self.askable_sparse_indices)} askable-sparse, {len(self.data_collection_sparse_indices)} data-collection-sparse")
+        # --- CLARIFICATION: Updated print statement for clarity ---
+        # This log now accurately reflects what the code uses:
+        # 'allowed' for gain calculation, 'sparse' for data collection.
+        print(f"   Feature stats: {len(self.allowed_feature_indices)} allowed (for gain), {len(self.data_collection_sparse_indices)} sparse (for data collection)")
         
         # Initial feature ranking
         if len(self.animals) > 0 and self.allowed_feature_indices:
@@ -192,17 +197,16 @@ class AkinatorEngine:
         """
         *** IMPROVED SPARSE QUESTION SELECTION ***
         
-        Now prioritizes:
-        1. Features from 'data_collection_sparse_indices' (40-100% NaN)
-        2. Features not yet asked
-        3. Returns None if all sparse features exhausted
+        Pulls from 'data_collection_sparse_indices' (40-100% NaN) to
+        gather data on new or unknown features.
         """
-        # --- FIX: Use data_collection_sparse_indices to include new features ---
+        # This list correctly uses the 'data_collection' list.
         available = [idx for idx in self.data_collection_sparse_indices 
                      if self.feature_cols[idx] not in asked]
         
         if not available:
-            print(f"   [Q{question_count}] No askable sparse features available")
+            print(f"   [Q{question_count}] No *new* sparse features available to ask")
+            # This message is normal if all sparse features have been asked.
             return None, None
         
         # Weight heavily by NaN ratio - prioritize most sparse features
@@ -283,10 +287,59 @@ class AkinatorEngine:
     
     def should_guess(self, prior, question_count):
         """
-        *** DEPRECATED - Now handled by service.py ***
-        This method is kept for backwards compatibility but not used.
+        *** NEW: Smart Guessing Logic ***
+        
+        Decides if the engine is confident enough to make a guess based on
+        rules defined in __init__.
+        
+        To guess, two conditions must be met *after* a minimum number of questions:
+        1.  **Absolute Confidence:** The top candidate's probability must be above 
+            `ABSOLUTE_CONFIDENCE_THRESHOLD`.
+        2.  **Relative Confidence:** The top candidate must be `RELATIVE_CONFIDENCE_RATIO`
+            times more likely than the second-best candidate.
+            
+        This ensures the engine is "really confident" and "knows it is nothing else."
+        
+        Args:
+            prior (np.array): The current probability distribution.
+            question_count (int): The number of questions asked so far.
+            
+        Returns:
+            dict: A dictionary containing:
+                - 'guess' (bool): True if the engine should guess, False otherwise.
+                - 'animal' (str or None): The name of the guessed animal if 'guess' is True.
+                - 'confidence' (float): The probability of the top candidate.
         """
-        return False, 0.0, 0
+        # Rule 1: Don't guess too early (checks self.MIN_GUESS_QUESTION)
+        if question_count < self.MIN_GUESS_QUESTION:
+            return {'guess': False, 'animal': None, 'confidence': 0.0}
+
+        # Get top 2 candidates
+        sorted_idx = np.argsort(prior)[::-1]
+        top_idx = sorted_idx[0]
+        top_prob = prior[top_idx]
+        
+        second_prob = prior[sorted_idx[1]] if len(prior) > 1 else 0.0
+
+        # Calculate ratio, preventing division by zero
+        ratio = top_prob / (second_prob + 1e-12)
+
+        # Rule 2: Absolute confidence check (checks self.ABSOLUTE_CONFIDENCE_THRESHOLD)
+        is_absolutely_sure = top_prob > self.ABSOLUTE_CONFIDENCE_THRESHOLD
+
+        # Rule 3: Relative confidence check ("nothing else") (checks self.RELATIVE_CONFIDENCE_RATIO)
+        is_relatively_sure = ratio > self.RELATIVE_CONFIDENCE_RATIO
+        
+        # Final Decision: Must satisfy both rules
+        if is_absolutely_sure and is_relatively_sure:
+            return {
+                'guess': True, 
+                'animal': self.animals[top_idx], 
+                'confidence': float(top_prob)
+            }
+        
+        # Default: Not confident enough
+        return {'guess': False, 'animal': None, 'confidence': float(top_prob)}
     
     def get_discriminative_question(self, top_idx, prior, asked):
         """Find question that separates top candidate."""
