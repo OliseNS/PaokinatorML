@@ -193,12 +193,12 @@ class AkinatorEngine:
         *** IMPROVED SPARSE QUESTION SELECTION ***
         
         Now prioritizes:
-        1. Features from 'askable_sparse_indices' (40-90% NaN)
+        1. Features from 'data_collection_sparse_indices' (40-100% NaN)
         2. Features not yet asked
         3. Returns None if all sparse features exhausted
         """
-        # --- FIX: Use askable_sparse_indices ---
-        available = [idx for idx in self.askable_sparse_indices 
+        # --- FIX: Use data_collection_sparse_indices to include new features ---
+        available = [idx for idx in self.data_collection_sparse_indices 
                      if self.feature_cols[idx] not in asked]
         
         if not available:
