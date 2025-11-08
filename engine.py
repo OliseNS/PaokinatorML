@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 class AkinatorEngine:
-    """Improved Akinator with better accuracy and data collection."""
+    """Improved Akinator with adaptive confidence and error tolerance."""
     
     def __init__(self, df, feature_cols, questions_map):
         self.df = df
@@ -14,22 +14,35 @@ class AkinatorEngine:
         self.fuzzy_map = {'yes': 1.0, 'y': 1.0, 'usually': 0.75, 'sometimes': 0.5, 
                           'maybe': 0.5, 'rarely': 0.25, 'no': 0.0, 'n': 0.0}
         
-        # *** NEW: Smart Guessing Strategy Parameters ***
-        # These parameters control the new should_guess() logic.
-        self.MIN_GUESS_QUESTION = 8      # Won't guess before this question
-        self.ABSOLUTE_CONFIDENCE_THRESHOLD = 0.85  # (85%) Top guess must be at least this sure
-        self.RELATIVE_CONFIDENCE_RATIO = 10.0      # Top guess must be 10x more likely than 2nd
+        # *** IMPROVED: Adaptive Guessing Strategy ***
+        self.MAX_QUESTIONS = 25  # Hard cap before final guess
         
-        # *** IMPROVED SPARSE QUESTION STRATEGY ***
-        # Inject multiple sparse questions at strategic intervals
-        self.sparse_question_schedule = [6, 12, 18, 24]  # Questions where we ask sparse features
+        # Dynamic confidence requirements based on question count
+        # Early game: very strict, late game: more lenient
+        self.confidence_schedule = {
+            range(0, 8): (0.95, 20.0),   # Q1-7: 95% + 20x ratio (very strict)
+            range(8, 12): (0.92, 15.0),  # Q8-11: 92% + 15x ratio
+            range(12, 16): (0.88, 12.0), # Q12-15: 88% + 12x ratio
+            range(16, 20): (0.85, 10.0), # Q16-19: 85% + 10x ratio
+            range(20, 25): (0.80, 8.0),  # Q20-24: 80% + 8x ratio
+        }
+        
+        # *** NEW: Error Tolerance ***
+        # Track answer history to detect potential user errors
+        self.answer_history = []  # List of (feature, answer, prior_entropy)
+        self.error_dampening = 0.85  # Dampen likelihood impact to 85% to allow recovery
+        
+        # *** IMPROVED: Smart Sparse Question Strategy ***
+        # Ask sparse questions opportunistically when entropy is high
+        self.sparse_entropy_threshold = 3.5  # Only ask sparse when confused
         self.sparse_questions_asked = set()
+        self.max_sparse_questions = 4  # Limit total sparse questions
         
         self._precompute_likelihood_tables()
         self._build_arrays()
         
     def _precompute_likelihood_tables(self):
-        """Precompute likelihoods with strict penalties."""
+        """Precompute likelihoods with moderate penalties for error tolerance."""
         feature_grid = np.linspace(0.0, 1.0, 41, dtype=np.float32)
         n_grid, n_answers = len(feature_grid), len(self.answer_values)
         
@@ -41,14 +54,14 @@ class AkinatorEngine:
                 dist = abs(fval - aval)
                 like_def = np.exp(self.definite_exp * dist)
                 
-                # Strict penalties for contradictions
-                if dist > 0.7: like_def *= 0.001
-                elif dist > 0.5: like_def *= 0.05
-                elif dist > 0.3: like_def *= 0.3
+                # *** SOFTENED: Less aggressive penalties for error recovery ***
+                if dist > 0.7: like_def *= 0.01    # Was 0.001
+                elif dist > 0.5: like_def *= 0.1   # Was 0.05
+                elif dist > 0.3: like_def *= 0.4   # Was 0.3
                 
-                self.likelihood_table_definite[i, j] = np.clip(like_def, 0.0001, 1.0)
+                self.likelihood_table_definite[i, j] = np.clip(like_def, 0.001, 1.0)
                 self.likelihood_table_uncertain[i, j] = np.clip(
-                    np.exp(self.uncertain_exp * dist), 0.001, 1.0)
+                    np.exp(self.uncertain_exp * dist), 0.01, 1.0)
         
         self.feature_grid = feature_grid
         
@@ -67,23 +80,15 @@ class AkinatorEngine:
         self.col_nan_frac = col_nan_frac
         
         # Feature masks
-        # 'allowed' features are used for normal gain-based question selection
         self.allowed_feature_mask = (col_nan_frac < 0.95) & (col_var > 5e-5)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
-        # --- CLARIFICATION: Removed askable_sparse_mask and askable_sparse_indices ---
-        # These variables were confusing and not used by select_sparse_question.
-        # We only need data_collection_sparse_mask.
-
-        # 'data_collection_sparse' features are used for injecting sparse questions
-        # to gather new data. This is the *only* list used by select_sparse_question.
+        # Sparse features for data collection (40-100% NaN)
         self.data_collection_sparse_mask = (col_nan_frac >= 0.40)
         self.data_collection_sparse_indices = np.where(self.data_collection_sparse_mask)[0].tolist()
         
-        # --- CLARIFICATION: Updated print statement for clarity ---
-        # This log now accurately reflects what the code uses:
-        # 'allowed' for gain calculation, 'sparse' for data collection.
-        print(f"   Feature stats: {len(self.allowed_feature_indices)} allowed (for gain), {len(self.data_collection_sparse_indices)} sparse (for data collection)")
+        print(f"   Feature stats: {len(self.allowed_feature_indices)} allowed, "
+              f"{len(self.data_collection_sparse_indices)} sparse")
         
         # Initial feature ranking
         if len(self.animals) > 0 and self.allowed_feature_indices:
@@ -168,7 +173,7 @@ class AkinatorEngine:
         return prior / (prior.sum() + 1e-10)
     
     def update(self, prior, feature_idx, answer):
-        """Bayesian update with hard constraints."""
+        """Bayesian update with error tolerance and dampening."""
         fuzzy_val = self.fuzzy_map.get(answer.lower().strip())
         if fuzzy_val is None:
             return prior
@@ -180,65 +185,70 @@ class AkinatorEngine:
         table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
         likelihood = table[quantized, target_idx]
         
-        # Hard constraint for definite answers
+        # *** NEW: Error Dampening ***
+        # Soften the likelihood impact to allow recovery from user errors
+        # Move likelihood values closer to 1.0 (neutral) by dampening factor
+        likelihood = 1.0 + (likelihood - 1.0) * self.error_dampening
+        
+        # Hard constraint for definite answers (but softened)
         if fuzzy_val in [1.0, 0.0]:
             contradictions = np.abs(self.features[:, feature_idx] - fuzzy_val)
             hard_contradiction = (~self.nan_mask[:, feature_idx]) & (contradictions > 0.6)
-            likelihood = np.where(hard_contradiction, 0.0001, likelihood)
+            likelihood = np.where(hard_contradiction, 0.01, likelihood)  # Was 0.0001
         
         # Only treat NaN as neutral for uncertain answers
         if not is_definite:
             likelihood = np.where(self.nan_mask[:, feature_idx], 1.0, likelihood)
+        
+        # Record answer history for potential error detection
+        self.answer_history.append({
+            'feature_idx': feature_idx,
+            'answer': answer,
+            'prior_entropy': self._entropy(prior)
+        })
             
         posterior = prior * likelihood
         return posterior / (posterior.sum() + 1e-10)
 
     def select_sparse_question(self, asked, question_count):
-        """
-        *** IMPROVED SPARSE QUESTION SELECTION ***
-        
-        Pulls from 'data_collection_sparse_indices' (40-100% NaN) to
-        gather data on new or unknown features.
-        """
-        # This list correctly uses the 'data_collection' list.
+        """Select sparse question for data collection (only when confused)."""
         available = [idx for idx in self.data_collection_sparse_indices 
                      if self.feature_cols[idx] not in asked]
         
         if not available:
-            print(f"   [Q{question_count}] No *new* sparse features available to ask")
-            # This message is normal if all sparse features have been asked.
             return None, None
         
-        # Weight heavily by NaN ratio - prioritize most sparse features
+        # Weight heavily by NaN ratio
         nan_ratios = np.array([self.col_nan_frac[idx] for idx in available])
-        
-        # Exponential weighting: features with 80%+ NaN get much higher weight
-        weights = np.exp(10 * (nan_ratios - 0.5))  # Exponential scaling
+        weights = np.exp(10 * (nan_ratios - 0.5))
         weights = weights / weights.sum()
         
         chosen_idx = np.random.choice(available, p=weights)
         feature = self.feature_cols[chosen_idx]
         
-        print(f"   [Q{question_count}] SPARSE QUESTION: '{feature}' (NaN: {self.col_nan_frac[chosen_idx]:.1%})")
+        print(f"   [Q{question_count}] SPARSE: '{feature}' (NaN: {self.col_nan_frac[chosen_idx]:.1%})")
         
         return feature, self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
 
     def select_question(self, prior, asked, question_count):
         """
-        *** IMPROVED QUESTION SELECTION ***
+        *** IMPROVED: Adaptive Question Selection ***
         
-        Strategic question selection with multiple sparse question injection points.
+        Prioritizes discriminative questions and only asks sparse questions
+        when entropy is high (confused state).
         """
-        # *** SPARSE QUESTION INJECTION AT SCHEDULED INTERVALS ***
-        if question_count in self.sparse_question_schedule:
-            if question_count not in self.sparse_questions_asked:
-                feature, question = self.select_sparse_question(asked, question_count)
-                if feature:
-                    self.sparse_questions_asked.add(question_count)
-                    return feature, question
-                # If no sparse features available, continue to normal selection
+        # *** NEW: Opportunistic Sparse Questions (only when confused) ***
+        current_entropy = self._entropy(prior)
+        if (current_entropy > self.sparse_entropy_threshold and 
+            len(self.sparse_questions_asked) < self.max_sparse_questions and
+            question_count >= 5):  # Not too early
+            
+            feature, question = self.select_sparse_question(asked, question_count)
+            if feature:
+                self.sparse_questions_asked.add(feature)
+                return feature, question
         
-        # Early game: random from top 10
+        # Early game: random from top 10 for variety
         if question_count < 3 and self.sorted_initial_feature_indices:
             available_top = [idx for idx in self.sorted_initial_feature_indices[:10]
                              if self.feature_cols[idx] not in asked]
@@ -252,6 +262,19 @@ class AkinatorEngine:
                      if f not in asked and self.allowed_feature_mask[i]]
         if not available:
             return None, None
+        
+        # *** IMPROVED: Discriminative question when narrowing down ***
+        # When we have a clear frontrunner but not confident enough to guess,
+        # ask questions that separate it from similar candidates
+        sorted_prior = np.argsort(prior)[::-1]
+        top_prob = prior[sorted_prior[0]]
+        
+        if top_prob > 0.4 and question_count >= 5:  # Potential frontrunner
+            top_idx = sorted_prior[0]
+            feature, question = self.get_discriminative_question(top_idx, prior, asked)
+            if feature:
+                print(f"   [Q{question_count}] DISCRIMINATIVE for {self.animals[top_idx]}")
+                return feature, question
         
         # Adaptive pool size
         max_features = {range(0,5): 30, range(5,8): 50, range(8,12): 75}.get(
@@ -271,11 +294,11 @@ class AkinatorEngine:
             return None, None
         
         # Compute gains (robust if high entropy)
-        robust = self.entropy(prior) > 3.0
+        robust = current_entropy > 3.0
         gains = self._compute_gains(prior, candidates, robust=robust)
         sorted_idx = np.argsort(gains)[::-1]
         
-        # Weighted random from top 3
+        # Weighted random from top 3 for variety
         if question_count >= 3 and len(sorted_idx) >= 3:
             chosen = np.random.choice(sorted_idx[:3], p=[0.7, 0.2, 0.1])
         else:
@@ -287,62 +310,70 @@ class AkinatorEngine:
     
     def should_guess(self, prior, question_count):
         """
-        *** NEW: Smart Guessing Logic ***
+        *** IMPROVED: Adaptive Confidence Guessing ***
         
-        Decides if the engine is confident enough to make a guess based on
-        rules defined in __init__.
+        Uses dynamic confidence thresholds that become more lenient as
+        questions progress. Forces guess at MAX_QUESTIONS.
         
-        To guess, two conditions must be met *after* a minimum number of questions:
-        1.  **Absolute Confidence:** The top candidate's probability must be above 
-            `ABSOLUTE_CONFIDENCE_THRESHOLD`.
-        2.  **Relative Confidence:** The top candidate must be `RELATIVE_CONFIDENCE_RATIO`
-            times more likely than the second-best candidate.
-            
-        This ensures the engine is "really confident" and "knows it is nothing else."
-        
-        Args:
-            prior (np.array): The current probability distribution.
-            question_count (int): The number of questions asked so far.
-            
-        Returns:
-            dict: A dictionary containing:
-                - 'guess' (bool): True if the engine should guess, False otherwise.
-                - 'animal' (str or None): The name of the guessed animal if 'guess' is True.
-                - 'confidence' (float): The probability of the top candidate.
+        Early game: Very strict (avoid premature guessing)
+        Late game: More lenient (must make a guess eventually)
         """
-        # Rule 1: Don't guess too early (checks self.MIN_GUESS_QUESTION)
-        if question_count < self.MIN_GUESS_QUESTION:
-            return {'guess': False, 'animal': None, 'confidence': 0.0}
-
+        # Force guess at maximum questions
+        if question_count >= self.MAX_QUESTIONS:
+            sorted_idx = np.argsort(prior)[::-1]
+            top_idx = sorted_idx[0]
+            print(f"   [Q{question_count}] FORCED GUESS at max questions")
+            return {
+                'guess': True,
+                'animal': self.animals[top_idx],
+                'confidence': float(prior[top_idx])
+            }
+        
+        # Get confidence thresholds for current question count
+        confidence_threshold = 0.95  # Default (very strict)
+        ratio_threshold = 20.0
+        
+        for q_range, (conf, ratio) in self.confidence_schedule.items():
+            if question_count in q_range:
+                confidence_threshold = conf
+                ratio_threshold = ratio
+                break
+        
         # Get top 2 candidates
         sorted_idx = np.argsort(prior)[::-1]
         top_idx = sorted_idx[0]
         top_prob = prior[top_idx]
-        
         second_prob = prior[sorted_idx[1]] if len(prior) > 1 else 0.0
-
-        # Calculate ratio, preventing division by zero
-        ratio = top_prob / (second_prob + 1e-12)
-
-        # Rule 2: Absolute confidence check (checks self.ABSOLUTE_CONFIDENCE_THRESHOLD)
-        is_absolutely_sure = top_prob > self.ABSOLUTE_CONFIDENCE_THRESHOLD
-
-        # Rule 3: Relative confidence check ("nothing else") (checks self.RELATIVE_CONFIDENCE_RATIO)
-        is_relatively_sure = ratio > self.RELATIVE_CONFIDENCE_RATIO
         
-        # Final Decision: Must satisfy both rules
+        # Calculate ratio
+        ratio = top_prob / (second_prob + 1e-12)
+        
+        # *** NEW: Additional check for entropy ***
+        # Don't guess if entropy is still very high (still confused)
+        current_entropy = self._entropy(prior)
+        if current_entropy > 2.5 and question_count < 15:
+            return {'guess': False, 'animal': None, 'confidence': float(top_prob)}
+        
+        # Check both conditions
+        is_absolutely_sure = top_prob > confidence_threshold
+        is_relatively_sure = ratio > ratio_threshold
+        
         if is_absolutely_sure and is_relatively_sure:
+            print(f"   [Q{question_count}] Confident enough: {top_prob:.1%} confidence, "
+                  f"{ratio:.1f}x ratio (thresholds: {confidence_threshold:.1%}, {ratio_threshold:.1f}x)")
             return {
-                'guess': True, 
-                'animal': self.animals[top_idx], 
+                'guess': True,
+                'animal': self.animals[top_idx],
                 'confidence': float(top_prob)
             }
         
-        # Default: Not confident enough
         return {'guess': False, 'animal': None, 'confidence': float(top_prob)}
     
     def get_discriminative_question(self, top_idx, prior, asked):
-        """Find question that separates top candidate."""
+        """
+        *** IMPROVED: Find question that best separates top candidate from similar ones ***
+        """
+        # Find candidates similar to the top one (within 10% probability)
         similar_mask = (prior > prior[top_idx] * 0.1)
         similar_mask[top_idx] = False
         similar_indices = np.where(similar_mask)[0]
@@ -355,91 +386,63 @@ class AkinatorEngine:
         if not available:
             return None, None
         
+        # Find features where top candidate differs most from similar ones
         diffs = np.abs(self.features[top_idx] - self.features[similar_indices])
         avg_diffs = np.nanmean(diffs, axis=0)
         
+        # Mask unavailable features
         mask = np.full_like(avg_diffs, -1.0)
         mask[available] = avg_diffs[available]
         mask[np.isnan(self.features[top_idx])] = -1.0
         
+        # Get feature with maximum difference
         best_idx = np.argmax(mask)
-        if mask[best_idx] > 0.25:
+        if mask[best_idx] > 0.25:  # Significant difference
             feature = self.feature_cols[best_idx]
             return feature, self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
         
         return None, None
 
     def get_features_for_data_collection(self, item_name: str, num_features: int = 5) -> list[dict]:
-        """
-        *** IMPROVED DATA COLLECTION ***
-        
-        Prioritizes:
-        1. Features this specific item is missing (up to 100% NaN)
-        2. Features that are generally sparse (40-100% NaN)
-        3. Features with high variance (discriminative power)
-        """
+        """Collect data for sparse and missing features."""
         final_indices = []
         
         # Find item
         item_idx_list = np.where(self.animals == item_name)[0]
         if len(item_idx_list) == 0:
-            print(f"   Warning: Item '{item_name}' not found for data collection")
+            print(f"   Warning: Item '{item_name}' not found")
             item_idx = None
         else:
             item_idx = item_idx_list[0]
         
-        # Strategy 1: Item-specific NULLs (highest priority)
+        # Strategy 1: Item-specific NULLs
         if item_idx is not None:
             null_indices = np.where(np.isnan(self.features[item_idx]))[0]
-            
-            # --- FIX: Removed filter for self.allowed_feature_indices ---
-            # We WANT to collect data for features that are currently disallowed
-            # because they have too many NaNs.
-            item_nulls = null_indices.tolist()
-            
-            # Sort by global NaN% (prioritize features that are globally sparse)
-            item_nulls_sorted = sorted(item_nulls, 
+            item_nulls_sorted = sorted(null_indices.tolist(), 
                                       key=lambda idx: self.col_nan_frac[idx], 
                                       reverse=True)
-            
             final_indices = item_nulls_sorted[:num_features]
-            print(f"   Data collection for '{item_name}': {len(final_indices)} item-specific nulls")
         
-        # Strategy 2: Pad with globally sparse features (40-100% NaN)
+        # Strategy 2: Globally sparse features
         if len(final_indices) < num_features:
             needed = num_features - len(final_indices)
-            
-            # --- FIX: Use data_collection_sparse_indices ---
             sparse_candidates = [idx for idx in self.data_collection_sparse_indices 
                                 if idx not in final_indices]
-            
-            # Sort by NaN% descending
             sparse_sorted = sorted(sparse_candidates, 
                                   key=lambda idx: self.col_nan_frac[idx], 
                                   reverse=True)
-            
             final_indices.extend(sparse_sorted[:needed])
-            print(f"   Data collection: Added {min(needed, len(sparse_sorted))} globally sparse features")
         
-        # Strategy 3: Pad with high-variance features
+        # Strategy 3: High-variance features
         if len(final_indices) < num_features:
             needed = num_features - len(final_indices)
-            
-            # --- FIX: Ensure we use 'allowed' features here, as 'variance'
-            # is only meaningful for features that aren't 100% NaN
             variance_candidates = [idx for idx in self.allowed_feature_indices 
                                   if idx not in final_indices]
-            
-            # Calculate variance for remaining features
-            if variance_candidates: # Add check for empty list
+            if variance_candidates:
                 variances = np.nanvar(self.features[:, variance_candidates], axis=0)
                 sorted_var_idx = np.argsort(variances)[::-1]
-                
                 high_var_indices = [variance_candidates[i] for i in sorted_var_idx[:needed]]
                 final_indices.extend(high_var_indices)
-                print(f"   Data collection: Added {len(high_var_indices)} high-variance features")
-            else:
-                print(f"   Data collection: No variance candidates left")
         
         return [{"feature_name": self.feature_cols[idx],
                  "question": self.questions_map.get(self.feature_cols[idx], 
