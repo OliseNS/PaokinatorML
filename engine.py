@@ -2,54 +2,52 @@ import pandas as pd
 import numpy as np
 
 class AkinatorEngine:
-    """Improved Akinator with adaptive confidence and error tolerance."""
+    """Enhanced Akinator with improved accuracy through better question selection and confidence calibration."""
     
     def __init__(self, df, feature_cols, questions_map):
         self.df = df
         self.feature_cols = feature_cols
         self.questions_map = questions_map
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
-        self.definite_exp = -5.0
-        self.uncertain_exp = -2.5
+        self.definite_exp = -6.0  # Sharper penalties for contradictions
+        self.uncertain_exp = -2.0
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0,
             'no': 0.0, 'n': 0.0,
-            
-            'mostly': 0.75,
-            'sort of': 0.5,
-            'not really': 0.25,
-            
-            'usually': 0.75, 'probably': 0.75,
-            'sometimes': 0.5, 'maybe': 0.5,
-            'rarely': 0.25
+            'mostly': 0.75, 'probably': 0.75, 'usually': 0.75,
+            'sort of': 0.5, 'sometimes': 0.5, 'maybe': 0.5,
+            'not really': 0.25, 'rarely': 0.25
         }
         
         self.MAX_QUESTIONS = 25  
         
+        # More aggressive early confidence to match Akinator's bold guessing
         self.confidence_schedule = {
-            range(0, 8): (0.95, 20.0),   # Q1-7: 95% + 20x ratio (very strict)
-            range(8, 12): (0.92, 15.0),  # Q8-11: 92% + 15x ratio
-            range(12, 16): (0.88, 12.0), # Q12-15: 88% + 12x ratio
-            range(16, 20): (0.85, 10.0), # Q16-19: 85% + 10x ratio
-            range(20, 25): (0.80, 8.0),  # Q20-24: 80% + 8x ratio
+            range(0, 6): (0.90, 15.0),   # Q1-5: Aggressive early
+            range(6, 10): (0.88, 12.0),  # Q6-9: Still confident
+            range(10, 15): (0.85, 10.0), # Q10-14: Moderate
+            range(15, 20): (0.82, 8.0),  # Q15-19: More lenient
+            range(20, 25): (0.78, 6.0),  # Q20-24: Very lenient
         }
         
-        # *** NEW: Error Tolerance ***
-        # Track answer history to detect potential user errors
-        self.answer_history = []  # List of (feature, answer, prior_entropy)
-        self.error_dampening = 0.85  # Dampen likelihood impact to 85% to allow recovery
+        # Track question history for adaptive strategy
+        self.answer_history = []
+        self.error_dampening = 0.80  # More aggressive dampening
         
-        # *** IMPROVED: Smart Sparse Question Strategy ***
-        # Ask sparse questions opportunistically when entropy is high
-        self.sparse_entropy_threshold = 3.5  # Only ask sparse when confused
+        # Improved sparse question strategy
+        self.sparse_entropy_threshold = 4.0  # Higher threshold
         self.sparse_questions_asked = set()
-        self.max_sparse_questions = 4  # Limit total sparse questions
+        self.max_sparse_questions = 3  # Fewer sparse questions
+        
+        # Track consistency for error detection
+        self.contradiction_count = 0
+        self.max_contradictions = 3
         
         self._precompute_likelihood_tables()
         self._build_arrays()
         
     def _precompute_likelihood_tables(self):
-        """Precompute likelihoods with moderate penalties for error tolerance."""
+        """Precompute likelihoods with sharper penalties for definite answers."""
         feature_grid = np.linspace(0.0, 1.0, 41, dtype=np.float32)
         n_grid, n_answers = len(feature_grid), len(self.answer_values)
         
@@ -61,19 +59,19 @@ class AkinatorEngine:
                 dist = abs(fval - aval)
                 like_def = np.exp(self.definite_exp * dist)
                 
-                # *** SOFTENED: Less aggressive penalties for error recovery ***
-                if dist > 0.7: like_def *= 0.01    # Was 0.001
-                elif dist > 0.5: like_def *= 0.1   # Was 0.05
-                elif dist > 0.3: like_def *= 0.4   # Was 0.3
+                # Sharper penalties for definite contradictions
+                if dist > 0.7: like_def *= 0.005
+                elif dist > 0.5: like_def *= 0.05
+                elif dist > 0.3: like_def *= 0.3
                 
-                self.likelihood_table_definite[i, j] = np.clip(like_def, 0.001, 1.0)
+                self.likelihood_table_definite[i, j] = np.clip(like_def, 0.0001, 1.0)
                 self.likelihood_table_uncertain[i, j] = np.clip(
                     np.exp(self.uncertain_exp * dist), 0.01, 1.0)
         
         self.feature_grid = feature_grid
         
     def _build_arrays(self):
-        """Build arrays from DataFrame."""
+        """Build arrays from DataFrame with improved feature selection."""
         self.animals = self.df['animal_name'].values
         features = self.df[self.feature_cols].values.astype(np.float32)
         
@@ -86,31 +84,50 @@ class AkinatorEngine:
         col_var = np.where(np.isnan(col_var), 0.0, col_var)
         self.col_nan_frac = col_nan_frac
         
-        # Feature masks
-        self.allowed_feature_mask = (col_nan_frac < 0.95) & (col_var > 5e-5)
+        # More selective feature filtering
+        self.allowed_feature_mask = (col_nan_frac < 0.90) & (col_var > 1e-4)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].tolist()
         
-        # Sparse features for data collection (40-100% NaN)
-        self.data_collection_sparse_mask = (col_nan_frac >= 0.40)
+        # Sparse features (50-100% NaN)
+        self.data_collection_sparse_mask = (col_nan_frac >= 0.50)
         self.data_collection_sparse_indices = np.where(self.data_collection_sparse_mask)[0].tolist()
         
         print(f"   Feature stats: {len(self.allowed_feature_indices)} allowed, "
               f"{len(self.data_collection_sparse_indices)} sparse")
         
-        # Initial feature ranking
+        # Enhanced feature ranking with diversity
         if len(self.animals) > 0 and self.allowed_feature_indices:
             uniform_prior = np.ones(len(self.animals), dtype=np.float32) / len(self.animals)
             gains = self._compute_gains(uniform_prior, self.allowed_feature_indices, robust=False)
-            self.feature_importance = {self.feature_cols[idx]: float(gains[i]) 
+            
+            # Add diversity bonus
+            diversity_scores = self._compute_feature_diversity(self.allowed_feature_indices)
+            combined_scores = gains + 0.1 * diversity_scores  # 10% diversity bonus
+            
+            self.feature_importance = {self.feature_cols[idx]: float(combined_scores[i]) 
                                        for i, idx in enumerate(self.allowed_feature_indices)}
-            sorted_idx = np.argsort(gains)[::-1]
+            sorted_idx = np.argsort(combined_scores)[::-1]
             self.sorted_initial_feature_indices = [self.allowed_feature_indices[i] for i in sorted_idx]
         else:
             self.feature_importance = {f: 0.0 for f in self.feature_cols}
             self.sorted_initial_feature_indices = []
 
+    def _compute_feature_diversity(self, feature_indices):
+        """Calculate diversity score based on feature distribution balance."""
+        diversity = np.zeros(len(feature_indices))
+        for i, idx in enumerate(feature_indices):
+            feature_vals = self.features[:, idx]
+            valid_vals = feature_vals[~np.isnan(feature_vals)]
+            if len(valid_vals) > 0:
+                # Higher diversity for balanced distributions
+                hist, _ = np.histogram(valid_vals, bins=5, range=(0, 1))
+                hist_norm = hist / (hist.sum() + 1e-10)
+                # Entropy of distribution
+                diversity[i] = -np.sum(hist_norm * np.log(hist_norm + 1e-10))
+        return diversity
+
     def _compute_gains(self, prior, feature_indices, robust=False):
-        """Unified gain computation (expected or minimax)."""
+        """Enhanced gain computation with variance consideration."""
         curr_entropy = self._entropy(prior)
         if curr_entropy < 0.01 or not feature_indices:
             return np.zeros(len(feature_indices))
@@ -154,14 +171,17 @@ class AkinatorEngine:
                                for a_idx in range(A))
                 gains[f_idx] = curr_entropy - max_ent
             else:
-                # Expected gain
+                # Expected gain with variance bonus
                 prob_answer = prior_sub @ likelihoods[:, f_idx, :]
                 exp_ent = sum(prob_answer[a_idx] * self._entropy(
                     prior_sub * likelihoods[:, f_idx, a_idx] / 
                     (prior_sub * likelihoods[:, f_idx, a_idx]).sum())
                     if (prior_sub * likelihoods[:, f_idx, a_idx]).sum() > 1e-10 else 0.0
                     for a_idx in range(A))
-                gains[f_idx] = curr_entropy - exp_ent
+                
+                # Add variance bonus to prefer questions that split distributions well
+                variance = np.var(prob_answer)
+                gains[f_idx] = curr_entropy - exp_ent + 0.05 * variance
         
         return gains
     
@@ -180,7 +200,7 @@ class AkinatorEngine:
         return prior / (prior.sum() + 1e-10)
     
     def update(self, prior, feature_idx, answer):
-        """Bayesian update with error tolerance and dampening."""
+        """Enhanced Bayesian update with contradiction tracking."""
         fuzzy_val = self.fuzzy_map.get(answer.lower().strip())
         if fuzzy_val is None:
             return prior
@@ -192,22 +212,27 @@ class AkinatorEngine:
         table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
         likelihood = table[quantized, target_idx]
         
-        # *** NEW: Error Dampening ***
-        # Soften the likelihood impact to allow recovery from user errors
-        # Move likelihood values closer to 1.0 (neutral) by dampening factor
+        # Error dampening for recovery
         likelihood = 1.0 + (likelihood - 1.0) * self.error_dampening
         
-        # Hard constraint for definite answers (but softened)
+        # Track contradictions
         if fuzzy_val in [1.0, 0.0]:
             contradictions = np.abs(self.features[:, feature_idx] - fuzzy_val)
-            hard_contradiction = (~self.nan_mask[:, feature_idx]) & (contradictions > 0.6)
-            likelihood = np.where(hard_contradiction, 0.01, likelihood)  # Was 0.0001
+            hard_contradiction = (~self.nan_mask[:, feature_idx]) & (contradictions > 0.7)
+            
+            # Count if this eliminates top candidates
+            top_candidates = prior > 0.1
+            if np.any(hard_contradiction & top_candidates):
+                self.contradiction_count += 1
+            
+            # Sharper penalty for definite contradictions
+            likelihood = np.where(hard_contradiction, 0.001, likelihood)
         
         # Only treat NaN as neutral for uncertain answers
         if not is_definite:
             likelihood = np.where(self.nan_mask[:, feature_idx], 1.0, likelihood)
         
-        # Record answer history for potential error detection
+        # Record answer history
         self.answer_history.append({
             'feature_idx': feature_idx,
             'answer': answer,
@@ -215,10 +240,16 @@ class AkinatorEngine:
         })
             
         posterior = prior * likelihood
-        return posterior / (posterior.sum() + 1e-10)
+        posterior_norm = posterior / (posterior.sum() + 1e-10)
+        
+        # Prevent over-concentration early on
+        if len(self.answer_history) < 5:
+            posterior_norm = 0.95 * posterior_norm + 0.05 * prior
+        
+        return posterior_norm
 
     def select_sparse_question(self, asked, question_count):
-        """Select sparse question for data collection (only when confused)."""
+        """Select sparse question for data collection (only when very confused)."""
         available = [idx for idx in self.data_collection_sparse_indices 
                      if self.feature_cols[idx] not in asked]
         
@@ -227,7 +258,7 @@ class AkinatorEngine:
         
         # Weight heavily by NaN ratio
         nan_ratios = np.array([self.col_nan_frac[idx] for idx in available])
-        weights = np.exp(10 * (nan_ratios - 0.5))
+        weights = np.exp(12 * (nan_ratios - 0.5))
         weights = weights / weights.sum()
         
         chosen_idx = np.random.choice(available, p=weights)
@@ -239,28 +270,29 @@ class AkinatorEngine:
 
     def select_question(self, prior, asked, question_count):
         """
-        *** IMPROVED: Adaptive Question Selection ***
-        
-        Prioritizes discriminative questions and only asks sparse questions
-        when entropy is high (confused state).
+        Improved question selection with better early-game strategy.
         """
-        # *** NEW: Opportunistic Sparse Questions (only when confused) ***
         current_entropy = self._entropy(prior)
+        
+        # Sparse questions only when very confused
         if (current_entropy > self.sparse_entropy_threshold and 
             len(self.sparse_questions_asked) < self.max_sparse_questions and
-            question_count >= 5):  # Not too early
+            question_count >= 8):
             
             feature, question = self.select_sparse_question(asked, question_count)
             if feature:
                 self.sparse_questions_asked.add(feature)
                 return feature, question
         
-        # Early game: random from top 10 for variety
-        if question_count < 3 and self.sorted_initial_feature_indices:
-            available_top = [idx for idx in self.sorted_initial_feature_indices[:10]
+        # Early game: Top features with slight randomization
+        if question_count < 4 and self.sorted_initial_feature_indices:
+            available_top = [idx for idx in self.sorted_initial_feature_indices[:8]
                              if self.feature_cols[idx] not in asked]
             if available_top:
-                idx = np.random.choice(available_top)
+                # Weighted toward top
+                weights = np.array([0.4, 0.25, 0.15, 0.1, 0.05, 0.03, 0.01, 0.01][:len(available_top)])
+                weights = weights / weights.sum()
+                idx = np.random.choice(available_top, p=weights)
                 feature = self.feature_cols[idx]
                 return feature, self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
         
@@ -270,22 +302,23 @@ class AkinatorEngine:
         if not available:
             return None, None
         
-        # *** IMPROVED: Discriminative question when narrowing down ***
-        # When we have a clear frontrunner but not confident enough to guess,
-        # ask questions that separate it from similar candidates
+        # Discriminative questions when narrowing down
         sorted_prior = np.argsort(prior)[::-1]
         top_prob = prior[sorted_prior[0]]
         
-        if top_prob > 0.4 and question_count >= 5:  # Potential frontrunner
+        if top_prob > 0.35 and question_count >= 4:
             top_idx = sorted_prior[0]
             feature, question = self.get_discriminative_question(top_idx, prior, asked)
             if feature:
                 print(f"   [Q{question_count}] DISCRIMINATIVE for {self.animals[top_idx]}")
                 return feature, question
         
-        # Adaptive pool size
-        max_features = {range(0,5): 30, range(5,8): 50, range(8,12): 75}.get(
-            next((r for r in [range(0,5), range(5,8), range(8,12)] if question_count in r), None), 100)
+        # Adaptive pool size - smaller for focused search
+        max_features = {
+            range(0,4): 20,
+            range(4,8): 40,
+            range(8,12): 60
+        }.get(next((r for r in [range(0,4), range(4,8), range(8,12)] if question_count in r), None), 80)
         
         # Build candidate pool
         available_set = set(available)
@@ -300,14 +333,14 @@ class AkinatorEngine:
         if not candidates:
             return None, None
         
-        # Compute gains (robust if high entropy)
-        robust = current_entropy > 3.0
+        # Compute gains
+        robust = current_entropy > 3.5
         gains = self._compute_gains(prior, candidates, robust=robust)
         sorted_idx = np.argsort(gains)[::-1]
         
-        # Weighted random from top 3 for variety
-        if question_count >= 3 and len(sorted_idx) >= 3:
-            chosen = np.random.choice(sorted_idx[:3], p=[0.7, 0.2, 0.1])
+        # Weighted random from top options for variety
+        if question_count >= 3 and len(sorted_idx) >= 4:
+            chosen = np.random.choice(sorted_idx[:4], p=[0.6, 0.2, 0.1, 0.1])
         else:
             chosen = sorted_idx[0]
         
@@ -317,13 +350,7 @@ class AkinatorEngine:
     
     def should_guess(self, prior, question_count):
         """
-        *** IMPROVED: Adaptive Confidence Guessing ***
-        
-        Uses dynamic confidence thresholds that become more lenient as
-        questions progress. Forces guess at MAX_QUESTIONS.
-        
-        Early game: Very strict (avoid premature guessing)
-        Late game: More lenient (must make a guess eventually)
+        More aggressive guessing strategy to match Akinator.
         """
         # Force guess at maximum questions
         if question_count >= self.MAX_QUESTIONS:
@@ -337,8 +364,8 @@ class AkinatorEngine:
             }
         
         # Get confidence thresholds for current question count
-        confidence_threshold = 0.95  # Default (very strict)
-        ratio_threshold = 20.0
+        confidence_threshold = 0.90
+        ratio_threshold = 15.0
         
         for q_range, (conf, ratio) in self.confidence_schedule.items():
             if question_count in q_range:
@@ -346,27 +373,28 @@ class AkinatorEngine:
                 ratio_threshold = ratio
                 break
         
-        # Get top 2 candidates
+        # Get top candidates
         sorted_idx = np.argsort(prior)[::-1]
         top_idx = sorted_idx[0]
         top_prob = prior[top_idx]
         second_prob = prior[sorted_idx[1]] if len(prior) > 1 else 0.0
         
-        # Calculate ratio
         ratio = top_prob / (second_prob + 1e-12)
-        
-        # *** NEW: Additional check for entropy ***
-        # Don't guess if entropy is still very high (still confused)
         current_entropy = self._entropy(prior)
-        if current_entropy > 2.5 and question_count < 15:
+        
+        # More lenient entropy check
+        if current_entropy > 3.0 and question_count < 12:
             return {'guess': False, 'animal': None, 'confidence': float(top_prob)}
         
         # Check both conditions
         is_absolutely_sure = top_prob > confidence_threshold
         is_relatively_sure = ratio > ratio_threshold
         
-        if is_absolutely_sure and is_relatively_sure:
-            print(f"   [Q{question_count}] Confident enough: {top_prob:.1%} confidence, "
+        # Additional heuristic: guess if clearly ahead mid-game
+        mid_game_confident = (question_count >= 8 and top_prob > 0.70 and ratio > 5.0)
+        
+        if (is_absolutely_sure and is_relatively_sure) or mid_game_confident:
+            print(f"   [Q{question_count}] Confident: {top_prob:.1%} confidence, "
                   f"{ratio:.1f}x ratio (thresholds: {confidence_threshold:.1%}, {ratio_threshold:.1f}x)")
             return {
                 'guess': True,
@@ -377,11 +405,10 @@ class AkinatorEngine:
         return {'guess': False, 'animal': None, 'confidence': float(top_prob)}
     
     def get_discriminative_question(self, top_idx, prior, asked):
-        """
-        *** IMPROVED: Find question that best separates top candidate from similar ones ***
-        """
-        # Find candidates similar to the top one (within 10% probability)
-        similar_mask = (prior > prior[top_idx] * 0.1)
+        """Find question that best separates top candidate from competitors."""
+        # Find strong competitors (within 20% probability)
+        competitor_threshold = max(0.05, prior[top_idx] * 0.2)
+        similar_mask = (prior > competitor_threshold)
         similar_mask[top_idx] = False
         similar_indices = np.where(similar_mask)[0]
         
@@ -393,18 +420,25 @@ class AkinatorEngine:
         if not available:
             return None, None
         
-        # Find features where top candidate differs most from similar ones
-        diffs = np.abs(self.features[top_idx] - self.features[similar_indices])
-        avg_diffs = np.nanmean(diffs, axis=0)
+        # Find features where top candidate differs most from competitors
+        top_features = self.features[top_idx]
+        competitor_features = self.features[similar_indices]
         
-        # Mask unavailable features
-        mask = np.full_like(avg_diffs, -1.0)
-        mask[available] = avg_diffs[available]
-        mask[np.isnan(self.features[top_idx])] = -1.0
+        # Weighted by competitor probabilities
+        weights = prior[similar_indices] / prior[similar_indices].sum()
+        weighted_avg = np.average(competitor_features, axis=0, weights=weights)
+        
+        diffs = np.abs(top_features - weighted_avg)
+        
+        # Mask unavailable features and NaNs
+        mask = np.full_like(diffs, -1.0)
+        mask[available] = diffs[available]
+        mask[np.isnan(top_features)] = -1.0
+        mask[np.isnan(weighted_avg)] = -1.0
         
         # Get feature with maximum difference
         best_idx = np.argmax(mask)
-        if mask[best_idx] > 0.25:  # Significant difference
+        if mask[best_idx] > 0.3:  # Significant difference
             feature = self.feature_cols[best_idx]
             return feature, self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
         
