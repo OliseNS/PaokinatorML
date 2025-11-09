@@ -11,15 +11,21 @@ class AkinatorEngine:
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         self.definite_exp = -5.0
         self.uncertain_exp = -2.5
-        self.fuzzy_map = {'yes': 1.0, 'y': 1.0, 'usually': 0.75, 'sometimes': 0.5, 
-                          'maybe': 0.5, 'rarely': 0.25, 'no': 0.0, 'n': 0.0}
+        self.fuzzy_map = {
+            'yes': 1.0, 'y': 1.0,
+            'no': 0.0, 'n': 0.0,
+            
+            'mostly': 0.75,
+            'sort of': 0.5,
+            'not really': 0.25,
+            
+            'usually': 0.75, 'probably': 0.75,
+            'sometimes': 0.5, 'maybe': 0.5,
+            'rarely': 0.25
+        }
         
+        self.MAX_QUESTIONS = 25  
         
-        # *** IMPROVED: Adaptive Guessing Strategy ***
-        self.MAX_QUESTIONS = 25  # Hard cap before final guess
-        
-        # Dynamic confidence requirements based on question count
-        # Early game: very strict, late game: more lenient
         self.confidence_schedule = {
             range(0, 8): (0.95, 20.0),   # Q1-7: 95% + 20x ratio (very strict)
             range(8, 12): (0.92, 15.0),  # Q8-11: 92% + 15x ratio
