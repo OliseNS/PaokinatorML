@@ -21,18 +21,18 @@ class AkinatorEngine:
         
         self.MAX_QUESTIONS = 25  
         
-        # More aggressive early confidence to match Akinator's bold guessing
+        # FIXED: More conservative confidence schedule for better accuracy
         self.confidence_schedule = {
-            range(0, 6): (0.90, 15.0),   # Q1-5: Aggressive early
-            range(6, 10): (0.88, 12.0),  # Q6-9: Still confident
-            range(10, 15): (0.85, 10.0), # Q10-14: Moderate
-            range(15, 20): (0.82, 8.0),  # Q15-19: More lenient
-            range(20, 25): (0.78, 6.0),  # Q20-24: Very lenient
+            range(0, 8): (0.95, 20.0),   # Q1-7: Very conservative early
+            range(8, 12): (0.93, 18.0),  # Q8-11: Still conservative
+            range(12, 16): (0.90, 15.0), # Q12-15: Moderate
+            range(16, 20): (0.87, 12.0), # Q16-19: More willing
+            range(20, 25): (0.83, 9.0),  # Q20-24: Lenient at end
         }
         
         # Track question history for adaptive strategy
         self.answer_history = []
-        self.error_dampening = 0.80  # More aggressive dampening
+        self.error_dampening = 0.92  # FIXED: Less aggressive dampening to preserve signal
         
         # Improved sparse question strategy
         self.sparse_entropy_threshold = 4.0  # Higher threshold
@@ -127,7 +127,7 @@ class AkinatorEngine:
         return diversity
 
     def _compute_gains(self, prior, feature_indices, robust=False):
-        """Enhanced gain computation with variance consideration."""
+        """FIXED: Removed variance bonus that prioritized noisy questions."""
         curr_entropy = self._entropy(prior)
         if curr_entropy < 0.01 or not feature_indices:
             return np.zeros(len(feature_indices))
@@ -160,7 +160,7 @@ class AkinatorEngine:
         
         likelihoods = np.where(nan_mask_batch[:, :, None], 1.0, likelihoods)
         
-        # Compute gains
+        # Compute gains - pure information gain without variance bonus
         gains = np.zeros(k)
         for f_idx in range(k):
             if robust:
@@ -171,7 +171,7 @@ class AkinatorEngine:
                                for a_idx in range(A))
                 gains[f_idx] = curr_entropy - max_ent
             else:
-                # Expected gain with variance bonus
+                # Pure expected information gain
                 prob_answer = prior_sub @ likelihoods[:, f_idx, :]
                 exp_ent = sum(prob_answer[a_idx] * self._entropy(
                     prior_sub * likelihoods[:, f_idx, a_idx] / 
@@ -179,9 +179,7 @@ class AkinatorEngine:
                     if (prior_sub * likelihoods[:, f_idx, a_idx]).sum() > 1e-10 else 0.0
                     for a_idx in range(A))
                 
-                # Add variance bonus to prefer questions that split distributions well
-                variance = np.var(prob_answer)
-                gains[f_idx] = curr_entropy - exp_ent + 0.05 * variance
+                gains[f_idx] = curr_entropy - exp_ent
         
         return gains
     
@@ -212,7 +210,7 @@ class AkinatorEngine:
         table = self.likelihood_table_definite if is_definite else self.likelihood_table_uncertain
         likelihood = table[quantized, target_idx]
         
-        # Error dampening for recovery
+        # FIXED: Less aggressive error dampening to preserve signal
         likelihood = 1.0 + (likelihood - 1.0) * self.error_dampening
         
         # Track contradictions
@@ -242,9 +240,9 @@ class AkinatorEngine:
         posterior = prior * likelihood
         posterior_norm = posterior / (posterior.sum() + 1e-10)
         
-        # Prevent over-concentration early on
-        if len(self.answer_history) < 5:
-            posterior_norm = 0.95 * posterior_norm + 0.05 * prior
+        # FIXED: More conservative early smoothing - only first 3 questions
+        if len(self.answer_history) <= 3:
+            posterior_norm = 0.97 * posterior_norm + 0.03 * prior
         
         return posterior_norm
 
@@ -302,11 +300,11 @@ class AkinatorEngine:
         if not available:
             return None, None
         
-        # Discriminative questions when narrowing down
+        # FIXED: More selective discriminative questions - only when very confident
         sorted_prior = np.argsort(prior)[::-1]
         top_prob = prior[sorted_prior[0]]
         
-        if top_prob > 0.35 and question_count >= 4:
+        if top_prob > 0.50 and question_count >= 6:  # Higher threshold, later in game
             top_idx = sorted_prior[0]
             feature, question = self.get_discriminative_question(top_idx, prior, asked)
             if feature:
@@ -350,7 +348,7 @@ class AkinatorEngine:
     
     def should_guess(self, prior, question_count):
         """
-        More aggressive guessing strategy to match Akinator.
+        FIXED: More conservative guessing strategy for better accuracy.
         """
         # Force guess at maximum questions
         if question_count >= self.MAX_QUESTIONS:
@@ -364,8 +362,8 @@ class AkinatorEngine:
             }
         
         # Get confidence thresholds for current question count
-        confidence_threshold = 0.90
-        ratio_threshold = 15.0
+        confidence_threshold = 0.95
+        ratio_threshold = 20.0
         
         for q_range, (conf, ratio) in self.confidence_schedule.items():
             if question_count in q_range:
@@ -382,18 +380,17 @@ class AkinatorEngine:
         ratio = top_prob / (second_prob + 1e-12)
         current_entropy = self._entropy(prior)
         
-        # More lenient entropy check
-        if current_entropy > 3.0 and question_count < 12:
+        # FIXED: More conservative entropy check - don't guess when confused
+        if current_entropy > 2.5 and question_count < 15:
             return {'guess': False, 'animal': None, 'confidence': float(top_prob)}
         
-        # Check both conditions
+        # Check both conditions with AND (more conservative)
         is_absolutely_sure = top_prob > confidence_threshold
         is_relatively_sure = ratio > ratio_threshold
         
-        # Additional heuristic: guess if clearly ahead mid-game
-        mid_game_confident = (question_count >= 8 and top_prob > 0.70 and ratio > 5.0)
+        # REMOVED: Mid-game heuristic that caused premature guessing
         
-        if (is_absolutely_sure and is_relatively_sure) or mid_game_confident:
+        if is_absolutely_sure and is_relatively_sure:
             print(f"   [Q{question_count}] Confident: {top_prob:.1%} confidence, "
                   f"{ratio:.1f}x ratio (thresholds: {confidence_threshold:.1%}, {ratio_threshold:.1f}x)")
             return {
@@ -406,8 +403,8 @@ class AkinatorEngine:
     
     def get_discriminative_question(self, top_idx, prior, asked):
         """Find question that best separates top candidate from competitors."""
-        # Find strong competitors (within 20% probability)
-        competitor_threshold = max(0.05, prior[top_idx] * 0.2)
+        # FIXED: Tighter competitor threshold for more relevant discrimination
+        competitor_threshold = max(0.08, prior[top_idx] * 0.15)  # Stricter threshold
         similar_mask = (prior > competitor_threshold)
         similar_mask[top_idx] = False
         similar_indices = np.where(similar_mask)[0]
@@ -438,7 +435,7 @@ class AkinatorEngine:
         
         # Get feature with maximum difference
         best_idx = np.argmax(mask)
-        if mask[best_idx] > 0.3:  # Significant difference
+        if mask[best_idx] > 0.4:  # FIXED: Higher threshold for significant difference
             feature = self.feature_cols[best_idx]
             return feature, self.questions_map.get(feature, f"Does it have {feature.replace('_', ' ')}?")
         
