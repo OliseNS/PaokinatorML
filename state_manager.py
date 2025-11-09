@@ -21,7 +21,7 @@ class StateManager:
             'asked_features': [],
             'answered_features': {},
             'question_count': 0,
-            'middle_guess_made': False,
+            # 'middle_guess_made': False, # <-- REMOVED
             'animal_count': n_animals,
             'continue_mode': False,
             'questions_since_last_guess': 0,

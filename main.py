@@ -146,40 +146,22 @@ async def get_question(session_id: str):
         should_guess, guess_animal, guess_type = srv.should_make_guess(game_state)
         game_state['last_guess_type'] = guess_type
 
+        # --- UPDATED: Simplified Guess Logic ---
         if should_guess:
+            # Since sneaky guess is removed, guess_type will only be 'final'
             top_predictions = srv.get_top_predictions(game_state, n=5)
             
-            if guess_type == 'final':
-                game_state['asked_features'].append('final_guess')
-            else:
-                game_state['asked_features'].append('sneaky_guess')
-
-            # --- SMART FIX ---
+            game_state['asked_features'].append('final_guess')
             game_state['state_type'] = 'question'
             db.push_session_state(session_id, game_state)
             
-            if guess_type == 'final':
-                return {
-                    'should_guess': True,
-                    'guess': guess_animal,
-                    'guess_type': guess_type,
-                    'top_predictions': top_predictions
-                }
-            
-            # Sneaky guess
-            q_num = game_state.get('question_count', 0) + 1
-            top_pred = srv.get_top_predictions(game_state, n=1)
-            article = get_article(guess_animal)
-            
             return {
-                'should_guess': False,
-                'question': f"Is it {article} {guess_animal}?",
-                'feature': 'sneaky_guess',
-                'animal_name': guess_animal,
-                'is_sneaky_guess': True,
-                'question_number': q_num,
-                'top_prediction': top_pred[0] if top_pred else None
+                'should_guess': True,
+                'guess': guess_animal,
+                'guess_type': 'final', # Always final
+                'top_predictions': top_predictions
             }
+        # --- END OF UPDATE ---
         
         # Get regular question
         feature, question, game_state = srv.get_next_question(game_state)
@@ -218,7 +200,7 @@ async def get_question(session_id: str):
             'question_number': q_num,
             'top_prediction': top_pred[0] if top_pred else None,
             'should_guess': False,
-            'is_sneaky_guess': False
+            'is_sneaky_guess': False # This is now always False
         }
     except Exception as e:
         print(f"Error in /question: {e}")
@@ -237,25 +219,10 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
     client_answer = payload.answer.lower().strip()
     feature = payload.feature
     
-    if feature == 'sneaky_guess':
-        if client_answer in ['yes', 'y', 'usually']:
-            # --- SMART FIX ---
-            game_state['state_type'] = 'answer'
-            db.push_session_state(session_id, game_state) # Push state before returning
-            return {
-                'status': 'guess_correct',
-                'animal': payload.animal_name,
-                'top_predictions': srv.get_top_predictions(game_state, n=5)
-            }
-
-        game_state = srv.reject_guess(game_state, payload.animal_name)
-        # --- SMART FIX ---
-        game_state['state_type'] = 'answer'
-        db.push_session_state(session_id, game_state)
-        return {
-            'status': 'ok',
-            'top_predictions': srv.get_top_predictions(game_state, n=5)
-        }
+    # --- UPDATED: Removed Sneaky Guess Block ---
+    # The 'if feature == 'sneaky_guess':' block was here.
+    # It is now removed as the service layer no longer generates this feature.
+    # --- END OF UPDATE ---
     
     answer_map = {
             # Standard values

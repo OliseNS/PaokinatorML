@@ -142,7 +142,7 @@ class UndoHandler:
                 last_feature = asked_features[-1]
                 
                 # --- SMART FIX #1 ---
-                # Only 'final_guess' is skipped. 'sneaky_guess' is a valid stop.
+                # Only 'final_guess' is skipped.
                 if last_feature != 'final_guess':
                     print(f"[UNDO] Skip loop stopped on non-final-guess: '{last_feature}'")
                     break
@@ -231,15 +231,14 @@ class UndoHandler:
         # If we have an error (like "can't undo"), we still need to show the current question
         # The error case means we're at S0_Q1 and can't go back further
         
-        # Handle different feature types
-        if last_feature == 'sneaky_guess':
-            return self._build_sneaky_guess_response(state, engine, error)
-        elif last_feature == 'final_guess':
+        # --- UPDATED: Removed Sneaky Guess ---
+        if last_feature == 'final_guess':
             return self._build_final_guess_response(state, error)
         else:
             return self._build_regular_question_response(
                 state, engine, last_feature, error
             )
+        # --- END OF UPDATE ---
     
     def _build_first_question_response(self, state: dict, 
                                        engine, error: Optional[str],
@@ -275,32 +274,9 @@ class UndoHandler:
         
         return response
     
-    def _build_sneaky_guess_response(self, state: dict, 
-                                     engine, error: Optional[str]) -> dict:
-        """Builds response for a sneaky guess."""
-        top_pred = self.service.get_top_predictions(state, n=1)
-        animal_name = top_pred[0]['animal'] if top_pred else "your animal"
-        
-        article = self._get_article(animal_name)
-        
-        # question_count is the number of ANSWERED questions
-        # The current question being shown is question_count + 1
-        response = {
-            'question': f"Is it {article} {animal_name}?",
-            'feature': 'sneaky_guess',
-            'animal_name': animal_name,
-            'is_sneaky_guess': True,
-            'question_number': state.get('question_count', 0) + 1,
-            'top_prediction': top_pred[0] if top_pred else None,
-            'should_guess': False,
-            'undo_status': 'ok'
-        }
-        
-        if error:
-            response['error'] = error
-            response['undo_status'] = 'failed_at_start'
-        
-        return response
+    # --- UPDATED: Removed _build_sneaky_guess_response ---
+    # The _build_sneaky_guess_response method was here and is now removed.
+    # --- END OF UPDATE ---
     
     def _build_final_guess_response(self, state: dict, 
                                     error: Optional[str]) -> dict:
