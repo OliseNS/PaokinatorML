@@ -14,6 +14,7 @@ class AkinatorEngine:
         self.fuzzy_map = {'yes': 1.0, 'y': 1.0, 'usually': 0.75, 'sometimes': 0.5, 
                           'maybe': 0.5, 'rarely': 0.25, 'no': 0.0, 'n': 0.0}
         
+        
         # *** IMPROVED: Adaptive Guessing Strategy ***
         self.MAX_QUESTIONS = 25  # Hard cap before final guess
         

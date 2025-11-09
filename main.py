@@ -258,12 +258,25 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
         }
     
     answer_map = {
-        'yes': 'yes', 'y': 'yes',
-        'no': 'no', 'n': 'no',
-        'usually': 'usually',
-        'sometimes': 'sometimes',
-        'rarely': 'rarely'
-    }
+            # Standard values
+            'yes': 'yes', 
+            'y': 'yes',
+            'no': 'no', 
+            'n': 'no',
+
+            # NEW frontend values -> Engine values
+            'mostly': 'usually',       # Maps "Mostly" to engine's 0.75
+            'probably': 'usually',     # Keep for backward compatibility if needed
+            'usually': 'usually',      # Keep for engine compatibility
+
+            'sort of': 'sometimes',    # Maps "Sort of" to engine's 0.5
+            'sometimes': 'sometimes',  # Keep for engine compatibility
+            'maybe': 'sometimes',      # Keep for robustness
+
+            'not really': 'rarely',    # Maps "Not really" to engine's 0.25
+            'rarely': 'rarely'         # Keep for engine compatibility
+        }
+        
     brain_answer = answer_map.get(client_answer)
 
     status = 'skipped'
