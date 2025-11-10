@@ -18,10 +18,10 @@ class AkinatorEngine:
         
         # Confidence schedule for guessing (prob threshold, ratio threshold)
         self.confidence_schedule = {
-             range(0, 8): (0.96, 25.0),   # Very strict early
-             range(8, 15): (0.92, 18.0),  # Strict mid-game
-             range(15, 20): (0.88, 12.0), # Moderate late-game
-             range(20, 26): (0.80, 8.0),  # looser end-game
+             range(0, 8): (0.96, 25.0),    # Very strict early
+             range(8, 15): (0.92, 18.0),   # Strict mid-game
+             range(15, 20): (0.88, 12.0),  # Moderate late-game
+             range(20, 26): (0.80, 8.0),   # looser end-game
         }
 
         # --- Mappings ---
@@ -206,28 +206,36 @@ class AkinatorEngine:
         
         # 3. Calculate Likelihoods
         # Quantize feature values to indices [0, 40]
+        # ** FIX **: NaNs are filled with 0.5 (neutral)
         f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 40), 0, 40).astype(np.int32)
         
         # Find which answer column in table matches user answer
         a_idx = np.abs(self.answer_values - answer_val).argmin()
         
         # Look up base likelihoods
+        # This now correctly uses the 0.5-filled value for NaNs,
+        # which will be penalized by Yes/No answers.
         likelihoods = self.likelihood_table[f_quant, a_idx]
         
         # 4. Handle NaNs and Contradictions
-        # If feature data is missing (NaN), this question gives us NO info about this animal.
-        # Likelihood stays 1.0 (neutral).
-        likelihoods[nan_mask] = 1.0
+        
+        # ** FIX **: The following line was the bug. It was removed.
+        # By removing it, NaNs (which were treated as 0.5) now keep
+        # their computed likelihood (e.g., ~0.04 for a 'Yes' answer),
+        # correctly penalizing the item.
+        #
+        # likelihoods[nan_mask] = 1.0  <--- REMOVED
 
         # Strong Contradiction Dampening:
-        # If user says DEFINITELY YES (1.0) but we have DEFINITELY NO (0.0ish),
-        # apply an extra penalty.
+        # This logic is still good. It only applies to non-NaN values
+        # (due to ~nan_mask) and adds an extra penalty for
+        # direct contradictions (e.g., User says YES, data is 0.0).
         if answer_val >= 0.9: # User said YES
-             contradictions = (f_col < 0.2) & (~nan_mask)
-             likelihoods[contradictions] *= 0.1
+            contradictions = (f_col < 0.2) & (~nan_mask)
+            likelihoods[contradictions] *= 0.1
         elif answer_val <= 0.1: # User said NO
-             contradictions = (f_col > 0.8) & (~nan_mask)
-             likelihoods[contradictions] *= 0.1
+            contradictions = (f_col > 0.8) & (~nan_mask)
+            likelihoods[contradictions] *= 0.1
 
         # 5. Apply Bayes Rule
         posterior = prior * likelihoods
@@ -235,9 +243,9 @@ class AkinatorEngine:
         # 6. Normalize
         total_p = np.sum(posterior)
         if total_p < 1e-9:
-             # Avoid hard crash if all candidates ruled out; revert to prior slightly dampened
-             return prior * 0.9 + (1.0/len(prior)) * 0.1
-             
+            # Avoid hard crash if all candidates ruled out; revert to prior slightly dampened
+            return prior * 0.9 + (1.0/len(prior)) * 0.1
+            
         return posterior / total_p
 
     def select_question(self, prior, asked_features, question_count):
@@ -248,7 +256,7 @@ class AkinatorEngine:
         asked_set = set(asked_features)
         # Only consider features that aren't asked AND are marked as 'allowed'
         candidates_indices = [idx for idx in self.allowed_feature_indices 
-                              if self.feature_cols[idx] not in asked_set]
+                             if self.feature_cols[idx] not in asked_set]
 
         if not candidates_indices:
             return None, None
@@ -257,20 +265,20 @@ class AkinatorEngine:
         # ones that were historically good (initial ranking) plus a few randoms
         # to ensure we don't get stuck in loops if the initial ranking is bad for this specific animal.
         if len(candidates_indices) > 100:
-             # Take top 80 from pre-calculated good features that are still available
-             top_candidates = [idx for idx in self.sorted_initial_feature_indices 
-                               if idx in candidates_indices][:80]
-             # Add 20 random other available features for diversity
-             other_candidates = [idx for idx in candidates_indices if idx not in top_candidates]
-             if other_candidates:
-                  random_extras = np.random.choice(other_candidates, 
-                                                   size=min(len(other_candidates), 20), 
-                                                   replace=False)
-                  candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
-             else:
-                  candidates_to_eval = np.array(top_candidates, dtype=np.int32)
+            # Take top 80 from pre-calculated good features that are still available
+            top_candidates = [idx for idx in self.sorted_initial_feature_indices 
+                                  if idx in candidates_indices][:80]
+            # Add 20 random other available features for diversity
+            other_candidates = [idx for idx in candidates_indices if idx not in top_candidates]
+            if other_candidates:
+                 random_extras = np.random.choice(other_candidates, 
+                                                 size=min(len(other_candidates), 20), 
+                                                 replace=False)
+                 candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
+            else:
+                 candidates_to_eval = np.array(top_candidates, dtype=np.int32)
         else:
-             candidates_to_eval = np.array(candidates_indices, dtype=np.int32)
+            candidates_to_eval = np.array(candidates_indices, dtype=np.int32)
 
         # 2. Compute Information Gain (Batched!)
         gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=64)
@@ -322,8 +330,8 @@ class AkinatorEngine:
         # Candidates to ask
         asked_set = set(asked_features)
         candidate_indices = [idx for idx in self.allowed_feature_indices 
-                             if self.feature_cols[idx] not in asked_set]
-                             
+                                 if self.feature_cols[idx] not in asked_set]
+                                 
         if not candidate_indices:
              return None, None
 
@@ -389,9 +397,9 @@ class AkinatorEngine:
         for idx in selected_indices[:num_features]:
              fname = self.feature_cols[idx]
              results.append({
-                  "feature_name": fname,
-                  "question": self.questions_map.get(fname, f"Is it {fname}?"),
-                  "nan_percentage": float(self.col_nan_frac[idx])
+                 "feature_name": fname,
+                 "question": self.questions_map.get(fname, f"Is it {fname}?"),
+                 "nan_percentage": float(self.col_nan_frac[idx])
              })
              
         return results
