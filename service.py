@@ -263,7 +263,7 @@ class AkinatorService:
             
         return game_state
 
-    def get_data_collection_features(self, domain_name: str, 
+    def get_features_for_data_collection(self, domain_name: str, 
                                     item_name: str) -> list[dict]:
         """Gets 5 features for data collection."""
         with self.engines_lock:
