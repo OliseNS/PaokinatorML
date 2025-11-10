@@ -447,8 +447,6 @@ async def get_performance():
         ]
     }
 
-
-# --- NEW: Game Report Endpoint (replaces /win and /learn) ---
 @app.get("/report/{session_id}", response_model=GameReport)
 async def get_and_finalize_game_report(
     session_id: str, 
@@ -457,9 +455,7 @@ async def get_and_finalize_game_report(
 ):
     """
     Retrieves a final report AND finalizes the game.
-    This endpoint replaces calls to /win and /learn.
-    It records the suggestion/new item, generates the report,
-    and deletes the session.
+    Replaces calls to /win and /learn.
     """
     srv = get_service()
     game_state = db.get_current_session_state(session_id)
@@ -470,7 +466,14 @@ async def get_and_finalize_game_report(
         user_answers = game_state.get('answered_features', {})
         domain_name = game_state.get('domain_name', 'animals')
         
-        # 1. Generate the report (read-op)
+        # --- FIX START: Check if already finalized to prevent duplicate votes ---
+        if game_state.get('game_finalized', False):
+             return srv.get_game_report(
+                domain_name=domain_name,
+                item_name=item_name,
+                user_answers=user_answers,
+                is_new=is_new
+            )
         report_data = srv.get_game_report(
             domain_name=domain_name,
             item_name=item_name,
@@ -480,14 +483,15 @@ async def get_and_finalize_game_report(
         
         # 2. Finalize the game (write-op)
         if is_new:
-            # This was a "learn" action
             srv.learn_new_animal(item_name, user_answers, domain_name)
         else:
-            # This was a "win" action
             srv.record_suggestion(item_name, user_answers, domain_name)
         
-        # 3. Clean up the session
-        db.delete_session(session_id)
+        # 3. Clean up: Don't delete immediately, just mark as finalized.
+        # Redis TTL will clean it up after 30 minutes.
+        # db.delete_session(session_id)  <-- REMOVED THIS LINE
+        game_state['game_finalized'] = True
+        db.push_session_state(session_id, game_state)
         
         # 4. Return the report
         return report_data
@@ -498,7 +502,6 @@ async def get_and_finalize_game_report(
         print(f"Error in /report: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
-
 
 @app.post("/admin/reload", include_in_schema=False)
 async def trigger_reload(reload_token: str = Header(..., alias="X-Reload-Token")):
