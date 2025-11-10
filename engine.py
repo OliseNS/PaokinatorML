@@ -84,7 +84,9 @@ class AkinatorEngine:
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
 
         # Identify sparse features for data collection phase
-        self.sparse_indices = np.where(self.col_nan_frac >= 0.50)[0].astype(np.int32)
+        # MODIFIED: Define sparse as >= 50% NaN AND allowed
+        sparse_mask = (self.col_nan_frac >= 0.50) & self.allowed_feature_mask
+        self.sparse_indices = np.where(sparse_mask)[0].astype(np.int32)
         
         # --- Initial Feature Ranking ---
         # Pre-calculate the best starting questions assuming uniform prior
@@ -117,7 +119,7 @@ class AkinatorEngine:
         gains = np.zeros(n_features, dtype=np.float32)
         
         current_entropy = self._entropy(prior)
-        if current_entropy < 1e-5:
+        if current_entropy < 1e-5 or n_features == 0:
             return gains
 
         # Identify active animals to speed up calc (skip animals with ~0 probability)
@@ -134,7 +136,12 @@ class AkinatorEngine:
              use_subset = False
              active_prior = prior
              active_mask = slice(None) # Select all
+             n_active = n_animals # ensure n_active is set
 
+        # Handle edge case where all animals are filtered out
+        if n_active == 0:
+            return gains
+            
         # Main batch loop
         for i in range(0, n_features, batch_size):
             end = min(i + batch_size, n_features)
@@ -245,12 +252,66 @@ class AkinatorEngine:
             
         return posterior / total_p
 
+    # --- NEW METHOD ---
+    def get_sparse_question_for_game(self, prior, asked_features_names):
+        """
+        Tries to find the most useful sparse question to ask.
+        'Sparse' is defined by self.sparse_indices.
+        'Useful' is defined by highest information gain.
+        """
+        # 1. Get sparse indices (precomputed)
+        sparse_indices = self.sparse_indices
+        
+        # 2. Filter out already-asked features
+        asked_set = set(asked_features_names)
+        candidates_to_eval = [
+            idx for idx in sparse_indices
+            if self.feature_cols[idx] not in asked_set
+        ]
+
+        if not candidates_to_eval:
+            return None, None
+
+        # 3. Compute gain for these sparse candidates
+        # Use a small batch size as we don't expect many
+        gains = self._compute_gains_batched(prior, np.array(candidates_to_eval), batch_size=32)
+        
+        if np.max(gains) < 1e-5: # All sparse questions have 0 gain
+            return None, None
+
+        # 4. Pick the best one
+        best_local_idx = np.argmax(gains)
+        best_feat_idx = candidates_to_eval[best_local_idx]
+        
+        feature_name = self.feature_cols[best_feat_idx]
+        question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
+        
+        return feature_name, question_text
+        
     def select_question(self, prior, asked_features, question_count):
         """
         Selects the next best question using information gain and smart randomization.
+        Injects a sparse question at a specific point to gather data.
         """
+        
+        # --- NEW: Sparse Question Injection ---
+        # At question 8, try to inject a sparse data collection question
+        if question_count == 8:
+            sparse_feat, sparse_q = self.get_sparse_question_for_game(prior, asked_features)
+            if sparse_feat:
+                # We found a sparse question to ask.
+                # Add to sparse_questions_asked set to avoid asking it again via this logic
+                self.sparse_questions_asked.add(sparse_feat)
+                return sparse_feat, sparse_q
+        # --- End of New Logic ---
+        
         # 1. Filter available features
         asked_set = set(asked_features)
+        
+        # Add sparse questions we've *already* injected to the asked_set
+        # to prevent the regular algorithm from picking them right after.
+        asked_set.update(self.sparse_questions_asked)
+        
         # Only consider features that aren't asked AND are marked as 'allowed'
         candidates_indices = [idx for idx in self.allowed_feature_indices 
                              if self.feature_cols[idx] not in asked_set]
@@ -276,6 +337,9 @@ class AkinatorEngine:
                  candidates_to_eval = np.array(top_candidates, dtype=np.int32)
         else:
             candidates_to_eval = np.array(candidates_indices, dtype=np.int32)
+            
+        if len(candidates_to_eval) == 0:
+            return None, None
 
         # 2. Compute Information Gain (Batched!)
         gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=64)
@@ -471,6 +535,7 @@ class AkinatorEngine:
             
         return False, None, None
 
+    # --- MODIFIED: Robust data collection logic ---
     def get_features_for_data_collection(self, item_name, num_features=5):
         """
         Selects features to ask user about for improving the database.
@@ -479,21 +544,34 @@ class AkinatorEngine:
         2. Features that are globally sparse (need more data overall).
         """
         try:
-            item_idx = np.where(self.animals == item_name)[0][0]
+            # Try exact match first
+            matches = np.where(self.animals == item_name)[0]
+            if len(matches) == 0:
+                 # Try case-insensitive fallback
+                 matches = np.where(np.char.lower(self.animals.astype(str)) == item_name.lower())[0]
+            
+            if len(matches) == 0:
+                print(f"Data collection: Item '{item_name}' not found.")
+                return []
+                
+            item_idx = matches[0]
             item_feats = self.features[item_idx]
-        except IndexError:
+        except Exception as e:
             # Item might be new or not in current engine loaded state
+            print(f"Error finding item '{item_name}' for data collection: {e}")
             return []
 
         # Find features that are NaN for this item AND are in our allowed list
         nan_indices = np.where(np.isnan(item_feats))[0]
-        useful_nan_indices = np.intersect1d(nan_indices, self.allowed_feature_indices)
+        # Ensure we have a writable copy for shuffling
+        useful_nan_indices = np.intersect1d(nan_indices, self.allowed_feature_indices).copy()
         
         # If we need more, look at globally sparse features
         if len(useful_nan_indices) < num_features:
              needed = num_features - len(useful_nan_indices)
-             # Take some globally sparse ones that we haven't already selected
-             extras = np.setdiff1d(self.sparse_indices, useful_nan_indices)
+             # Take some globally sparse ones that we haven'g already selected
+             # Make a writable copy
+             extras = np.setdiff1d(self.sparse_indices, useful_nan_indices).copy()
              # Shuffle extras to get variety across different users
              np.random.shuffle(extras)
              selected_indices = np.concatenate((useful_nan_indices, extras[:needed]))
@@ -503,14 +581,20 @@ class AkinatorEngine:
              np.random.shuffle(useful_nan_indices)
              selected_indices = useful_nan_indices[:num_features]
              
-        # Format for return
+        # Format for return - EXPLICIT TYPE CASTING for JSON safety
         results = []
         for idx in selected_indices[:num_features]:
-             fname = self.feature_cols[idx]
+             # Ensure idx is a standard python int for safe list indexing
+             py_idx = int(idx)
+             # Prevent out-of-bounds just in case
+             if py_idx >= len(self.feature_cols) or py_idx >= len(self.col_nan_frac):
+                 continue
+                 
+             fname = str(self.feature_cols[py_idx])
              results.append({
                  "feature_name": fname,
-                 "question": self.questions_map.get(fname, f"Is it {fname}?"),
-                 "nan_percentage": float(self.col_nan_frac[idx])
+                 "question": str(self.questions_map.get(fname, f"Is it {fname}?")),
+                 "nan_percentage": float(self.col_nan_frac[py_idx])
              })
              
         return results
