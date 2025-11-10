@@ -18,10 +18,10 @@ class AkinatorEngine:
         
         # Confidence schedule for guessing (prob threshold, ratio threshold)
         self.confidence_schedule = {
-             range(0, 8): (0.96, 25.0),    # Very strict early
-             range(8, 15): (0.92, 18.0),   # Strict mid-game
-             range(15, 20): (0.88, 12.0),  # Moderate late-game
-             range(20, 26): (0.80, 8.0),   # looser end-game
+             range(0, 8): (1, 25.0),    # Very strict early
+             range(8, 15): (0.98, 18.0),   # Strict mid-game
+             range(15, 20): (0.96, 12.0),  # Moderate late-game
+             range(20, 26): (0.94, 8.0),   # looser end-game
         }
 
         # --- Mappings ---
