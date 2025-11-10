@@ -348,14 +348,17 @@ class AkinatorEngine:
             top_n_gains = gains[top_n_indices]
             
             # Use softmax with a "temperature" (T)
-            # A higher T makes it more random, lower T makes it more greedy.
             T = 2.0  # Controls "sharpness" of probability distribution
             exp_gains = np.exp(top_n_gains * T)
-            probs = exp_gains / (exp_gains.sum() + 1e-10)
-            
-            # Ensure probs sum to 1 in case of weirdness
-            if not np.isclose(probs.sum(), 1.0):
-                probs = np.array([0.6, 0.2, 0.1, 0.1]) # Fallback
+            exp_sum = exp_gains.sum()
+
+            if exp_sum < 1e-10:
+                # Fallback if gains are all effectively zero
+                probs = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
+            else:
+                probs = exp_gains / exp_sum
+                # CRITICAL FIX: Force the sum to be exactly 1.0 for np.random.choice
+                probs = probs / probs.sum()
             
             chosen_local_idx = np.random.choice(np.arange(4), p=probs)
             chosen = top_n_indices[chosen_local_idx]
