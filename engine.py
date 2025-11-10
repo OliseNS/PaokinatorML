@@ -282,8 +282,10 @@ class AkinatorEngine:
                 self.sparse_questions_asked.add(feature)
                 return feature, question
         
-        # Early game: Top features with slight randomization
-        if question_count < 4 and self.sorted_initial_feature_indices:
+        # *** FIX 1: Make "early game" logic *only* apply to the very first question. ***
+        # For Q2+, we MUST use the updated prior (via _compute_gains) to "divide fast".
+        # Original was `if question_count < 4:`, which ignored user's first answers.
+        if question_count <= 1 and self.sorted_initial_feature_indices:
             available_top = [idx for idx in self.sorted_initial_feature_indices[:8]
                              if self.feature_cols[idx] not in asked]
             if available_top:
@@ -325,7 +327,7 @@ class AkinatorEngine:
         
         if len(candidates) < max_features:
             remaining = list(available_set - set(candidates))
-            np.random.shuffle(remaining)
+            np.random.shuffle(remaining) # This shuffle is good!
             candidates.extend(remaining[:max_features - len(candidates)])
         
         if not candidates:
@@ -336,10 +338,30 @@ class AkinatorEngine:
         gains = self._compute_gains(prior, candidates, robust=robust)
         sorted_idx = np.argsort(gains)[::-1]
         
-        # Weighted random from top options for variety
+        # *** FIX 2: Implement "smarter randomization" using softmax. ***
+        # This dynamically creates probabilities based on *how good* the
+        # questions are. If gains are [1.5, 1.49], they get ~equal chance.
+        # If gains are [1.5, 0.5], the 1.5 gets a *much* higher chance.
+        # Original was `p=[0.6, 0.2, 0.1, 0.1]`
         if question_count >= 3 and len(sorted_idx) >= 4:
-            chosen = np.random.choice(sorted_idx[:4], p=[0.6, 0.2, 0.1, 0.1])
+            top_n_indices = sorted_idx[:4]
+            top_n_gains = gains[top_n_indices]
+            
+            # Use softmax with a "temperature" (T)
+            # A higher T makes it more random, lower T makes it more greedy.
+            T = 2.0  # Controls "sharpness" of probability distribution
+            exp_gains = np.exp(top_n_gains * T)
+            probs = exp_gains / (exp_gains.sum() + 1e-10)
+            
+            # Ensure probs sum to 1 in case of weirdness
+            if not np.isclose(probs.sum(), 1.0):
+                probs = np.array([0.6, 0.2, 0.1, 0.1]) # Fallback
+            
+            chosen_local_idx = np.random.choice(np.arange(4), p=probs)
+            chosen = top_n_indices[chosen_local_idx]
+            
         else:
+            # For early questions, just be greedy
             chosen = sorted_idx[0]
         
         idx = candidates[int(chosen)]
@@ -442,8 +464,13 @@ class AkinatorEngine:
         return None, None
 
     def get_features_for_data_collection(self, item_name: str, num_features: int = 5) -> list[dict]:
-        """Collect data for sparse and missing features."""
+        """
+        *** FIX 3: Collect data with randomized sampling to avoid "always same questions". ***
+        We create a pool of good candidates (e.g., top 15) and randomly 
+        sample from that pool, rather than just taking the deterministic top 5.
+        """
         final_indices = []
+        pool_multiplier = 3 # Create a pool 3x larger than needed
         
         # Find item
         item_idx_list = np.where(self.animals == item_name)[0]
@@ -456,34 +483,60 @@ class AkinatorEngine:
         # Strategy 1: Item-specific NULLs
         if item_idx is not None:
             null_indices = np.where(np.isnan(self.features[item_idx]))[0]
+            # Prioritize nulls that are also globally sparse
             item_nulls_sorted = sorted(null_indices.tolist(), 
                                       key=lambda idx: self.col_nan_frac[idx], 
                                       reverse=True)
-            final_indices = item_nulls_sorted[:num_features]
+            
+            # Create a pool of good candidates
+            pool_size = min(len(item_nulls_sorted), num_features * pool_multiplier)
+            pool = item_nulls_sorted[:pool_size]
+            
+            # Sample from the pool
+            sample_size = min(len(pool), num_features)
+            if sample_size > 0:
+                final_indices = np.random.choice(pool, size=sample_size, replace=False).tolist()
         
         # Strategy 2: Globally sparse features
-        if len(final_indices) < num_features:
-            needed = num_features - len(final_indices)
+        needed = num_features - len(final_indices)
+        if needed > 0:
             sparse_candidates = [idx for idx in self.data_collection_sparse_indices 
                                 if idx not in final_indices]
             sparse_sorted = sorted(sparse_candidates, 
                                   key=lambda idx: self.col_nan_frac[idx], 
                                   reverse=True)
-            final_indices.extend(sparse_sorted[:needed])
+            
+            pool_size = min(len(sparse_sorted), needed * pool_multiplier)
+            pool = sparse_sorted[:pool_size]
+            
+            sample_size = min(len(pool), needed)
+            if sample_size > 0:
+                chosen = np.random.choice(pool, size=sample_size, replace=False).tolist()
+                final_indices.extend(chosen)
         
         # Strategy 3: High-variance features
-        if len(final_indices) < num_features:
-            needed = num_features - len(final_indices)
+        needed = num_features - len(final_indices)
+        if needed > 0:
             variance_candidates = [idx for idx in self.allowed_feature_indices 
                                   if idx not in final_indices]
             if variance_candidates:
                 variances = np.nanvar(self.features[:, variance_candidates], axis=0)
                 sorted_var_idx = np.argsort(variances)[::-1]
-                high_var_indices = [variance_candidates[i] for i in sorted_var_idx[:needed]]
-                final_indices.extend(high_var_indices)
+                high_var_indices = [variance_candidates[i] for i in sorted_var_idx]
+
+                pool_size = min(len(high_var_indices), needed * pool_multiplier)
+                pool = high_var_indices[:pool_size]
+                
+                sample_size = min(len(pool), needed)
+                if sample_size > 0:
+                    chosen = np.random.choice(pool, size=sample_size, replace=False).tolist()
+                    final_indices.extend(chosen)
+        
+        # Ensure we return the correct number, just in case
+        final_indices_unique = list(dict.fromkeys(final_indices)) # Preserve order, remove duplicates
         
         return [{"feature_name": self.feature_cols[idx],
                  "question": self.questions_map.get(self.feature_cols[idx], 
                                      f"Does it have {self.feature_cols[idx].replace('_', ' ')}?"),
                  "nan_percentage": float(self.col_nan_frac[idx])}
-                for idx in final_indices[:num_features]]
+                for idx in final_indices_unique[:num_features]]
