@@ -156,129 +156,19 @@ class AkinatorService:
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
         """
-        *** MASSIVELY STRICTER *** guessing logic.
-        
-        Now requires:
-        - Much higher confidence (0.85-0.99+)
-        - Much higher separation ratios (15x-50x+)
-        - Lower entropy thresholds
-        - Minimum question counts
-        - Active candidate analysis
-        
-        Returns: (should_guess, animal_name, guess_type)
+        *** REFACTORED ***
+        Delegates all guessing logic to the engine itself.
+        This service layer is no longer responsible for guess logic.
         """
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
-            
-        q_count = game_state['question_count']
-        probs = game_state['probabilities'].copy()
-        mask = game_state['rejected_mask']
-        probs[mask] = 0.0 
+        
+        # Delegate directly to the engine
+        return engine.should_make_guess(game_state)
 
-        if probs.sum() < 1e-10:
-            return False, None, None
-        
-        # Normalize
-        probs = probs / probs.sum()
-        
-        top_idx = np.argmax(probs)
-        top_prob = probs[top_idx]
-        top_animal = engine.animals[top_idx]
-        
-        # Calculate separation from second place
-        probs_copy = probs.copy()
-        probs_copy[top_idx] = 0.0
-        second_prob = np.max(probs_copy)
-        confidence_ratio = top_prob / (second_prob + 1e-9)
-        
-        # Calculate entropy
-        entropy = self._calculate_entropy(probs)
-        
-        # Count significant candidates (prob > 0.05)
-        significant_candidates = np.sum(probs > 0.05)
-        
-        # Count viable candidates (prob > 0.01)
-        viable_candidates = np.sum(probs > 0.01)
-        
-        # --- Continue Mode Logic ---
-        QUESTIONS_TO_WAIT = 4  # Increased from 3
-        if game_state.get('continue_mode', False):
-            if game_state.get('questions_since_last_guess', 0) < QUESTIONS_TO_WAIT:
-                return False, None, None
-            else:
-                # Reset and allow final guess with stricter threshold
-                game_state['continue_mode'] = False
-                game_state['questions_since_last_guess'] = 0
-
-        # --- REMOVED MIDDLE GUESSES ---
-        # Middle guesses are disruptive and don't help accuracy
-        # Removed entirely
-        
-        # --- (NEW) STRICTER FINAL GUESS LOGIC ---
-        
-        # Early game (< 10 questions): NEVER guess unless absolutely certain
-        if q_count < 10:
-            if (top_prob > 0.99 and  # TIGHTENED
-                confidence_ratio > 60.0 and  # TIGHTENED
-                entropy < 0.10 and  # TIGHTENED
-                significant_candidates <= 1):
-                print(f"[GUESS] Early game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
-                return True, top_animal, 'final'
-            return False, None, None
-        
-        # Mid game (10-15 questions): Very strict
-        if q_count < 15:
-            if (top_prob > 0.97 and  # TIGHTENED
-                confidence_ratio > 40.0 and  # TIGHTENED
-                entropy < 0.20 and  # TIGHTENED
-                significant_candidates <= 2):
-                print(f"[GUESS] Mid game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
-                return True, top_animal, 'final'
-            return False, None, None
-        
-        # Late mid game (15-20 questions): Strict
-        if q_count < 20:
-            if (top_prob > 0.92 and  # TIGHTENED
-                confidence_ratio > 25.0 and  # TIGHTENED
-                entropy < 0.35 and  # TIGHTENED
-                significant_candidates <= 3):
-                print(f"[GUESS] Late mid confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
-                return True, top_animal, 'final'
-            return False, None, None
-        
-        # Late game (20-25 questions): Moderately strict (USER'S TARGET)
-        if q_count < 25:
-            if (top_prob > 0.88 and  # TIGHTENED
-                confidence_ratio > 20.0 and  # TIGHTENED
-                entropy < 0.5):  # TIGHTENED
-                print(f"[GUESS] Late game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
-                return True, top_animal, 'final'
-            return False, None, None
-        
-        # Very late game (25-30 questions): Still require decent confidence
-        if q_count < 30:
-            if (top_prob > 0.80 and  # TIGHTENED
-                confidence_ratio > 12.0 and  # TIGHTENED
-                entropy < 0.8):  # TIGHTENED
-                print(f"[GUESS] Very late confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
-                return True, top_animal, 'final'
-            return False, None, None
-        
-        # Forced guess after 30 questions (but still with minimum standards)
-        if q_count >= 30:
-            if top_prob > 0.60 and confidence_ratio > 5.0:  # TIGHTENED
-                print(f"[GUESS] Forced (30+): prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
-                return True, top_animal, 'final'
-            # If even forced guess fails, return top candidate anyway
-            print(f"[GUESS] Ultimate forced (30+): prob={top_prob:.3f}")
-            return True, top_animal, 'final'
-            
-        return False, None, None
-
-    def _calculate_entropy(self, probs: np.ndarray) -> float:
-        """Calculate Shannon entropy of probability distribution."""
-        probs_safe = np.clip(probs, 1e-10, 1.0)
-        return -np.sum(probs_safe * np.log(probs_safe))
+    # --- HELPER REMOVED ---
+    # def _calculate_entropy(self, probs: np.ndarray) -> float:
+    # This method has been moved to engine.py
 
     def activate_continue_mode(self, game_state: dict) -> dict:
         """Sets game to continue asking questions after wrong guess."""
@@ -396,3 +286,64 @@ class AkinatorService:
     def start_engine_reload(self):
         """Starts background reload of all engines."""
         threading.Thread(target=self._background_reload, daemon=True).start()
+
+    def get_game_report(self, domain_name: str, item_name: str, 
+                        user_answers: dict, is_new: bool) -> dict:
+        """
+        Generates a report comparing user answers to consensus answers.
+        """
+        with self.engines_lock:
+            engine = self.engines.get(domain_name)
+            if not engine:
+                raise ValueError(f"Domain '{domain_name}' not found.")
+        
+        questions_report = []
+        item_idx = -1
+        
+        # Handle new items
+        if is_new:
+            report_name = f"{item_name} (New Item)"
+        
+        # Handle existing items
+        else:
+            report_name = item_name
+            try:
+                item_idx = np.where(engine.animals == item_name)[0][0]
+            except (IndexError, TypeError):
+                # Fallback: Item not found, treat as new
+                report_name = f"{item_name} (Item not found)"
+                is_new = True
+
+        # Build the question list
+        for feature_name, user_value in user_answers.items():
+            question_text = engine.questions_map.get(
+                feature_name, 
+                f"Is it/does it have {feature_name.replace('_', ' ')}?"
+            )
+            
+            consensus_value = None
+            if not is_new and item_idx != -1:
+                try:
+                    # Find the feature's column index
+                    feature_idx = engine.feature_cols.index(feature_name)
+                    # Get the consensus value from the engine's feature matrix
+                    consensus_raw = engine.features[item_idx, feature_idx]
+                    # Convert np.nan to None
+                    if not np.isnan(consensus_raw):
+                        consensus_value = float(consensus_raw)
+                except (ValueError, IndexError):
+                    # Feature not in engine (e.g., new feature), skip consensus
+                    pass
+            
+            questions_report.append({
+                "question": question_text,
+                "feature": feature_name,
+                "user_answer": float(user_value),
+                "consensus_answer": consensus_value
+            })
+
+        return {
+            "item_name": report_name,
+            "is_new_item": is_new,
+            "questions": questions_report
+        }

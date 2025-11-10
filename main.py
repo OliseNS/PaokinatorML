@@ -26,18 +26,24 @@ class AnswerPayload(BaseModel):
 class RejectPayload(BaseModel):
     animal_name: str
 
-class WinPayload(BaseModel):
-    animal_name: str
-
-class LearnPayload(BaseModel):
-    animal_name: str
-
 class SuggestFeaturePayload(BaseModel):
     domain_name: str
     feature_name: str
     question_text: str
     item_name: str
     fuzzy_value: float
+
+# --- NEW: Report Models ---
+class ReportQuestion(BaseModel):
+    question: str
+    feature: str
+    user_answer: float
+    consensus_answer: Optional[float] = None
+
+class GameReport(BaseModel):
+    item_name: str
+    is_new_item: bool
+    questions: List[ReportQuestion]
 
 
 # --- Global Variables ---
@@ -146,9 +152,7 @@ async def get_question(session_id: str):
         should_guess, guess_animal, guess_type = srv.should_make_guess(game_state)
         game_state['last_guess_type'] = guess_type
 
-        # --- UPDATED: Simplified Guess Logic ---
         if should_guess:
-            # Since sneaky guess is removed, guess_type will only be 'final'
             top_predictions = srv.get_top_predictions(game_state, n=5)
             
             game_state['asked_features'].append('final_guess')
@@ -158,10 +162,9 @@ async def get_question(session_id: str):
             return {
                 'should_guess': True,
                 'guess': guess_animal,
-                'guess_type': 'final', # Always final
+                'guess_type': 'final',
                 'top_predictions': top_predictions
             }
-        # --- END OF UPDATE ---
         
         # Get regular question
         feature, question, game_state = srv.get_next_question(game_state)
@@ -169,7 +172,6 @@ async def get_question(session_id: str):
         if feature and feature not in game_state['asked_features']:
             game_state['asked_features'].append(feature)
 
-        # --- SMART FIX ---
         game_state['state_type'] = 'question'
         db.push_session_state(session_id, game_state)
 
@@ -200,7 +202,7 @@ async def get_question(session_id: str):
             'question_number': q_num,
             'top_prediction': top_pred[0] if top_pred else None,
             'should_guess': False,
-            'is_sneaky_guess': False # This is now always False
+            'is_sneaky_guess': False
         }
     except Exception as e:
         print(f"Error in /question: {e}")
@@ -218,11 +220,6 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
     domain_name = game_state['domain_name']
     client_answer = payload.answer.lower().strip()
     feature = payload.feature
-    
-    # --- UPDATED: Removed Sneaky Guess Block ---
-    # The 'if feature == 'sneaky_guess':' block was here.
-    # It is now removed as the service layer no longer generates this feature.
-    # --- END OF UPDATE ---
     
     answer_map = {
             # Standard values
@@ -263,7 +260,6 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
                     
                 status = 'ok'
 
-    # --- SMART FIX ---
     game_state['state_type'] = 'answer'
     db.push_session_state(session_id, game_state)
     
@@ -332,43 +328,8 @@ async def reject_animal(session_id: str, payload: RejectPayload):
     }
 
 
-@app.post("/win/{session_id}")
-async def confirm_win(session_id: str, payload: WinPayload):
-    srv = get_service()
-    game_state = db.get_current_session_state(session_id)
-    if not game_state:
-        raise HTTPException(status_code=404, detail="Session expired or not found")
-    
-    answered_features = game_state['answered_features']
-    domain_name = game_state['domain_name']
-    
-    srv.record_suggestion(payload.animal_name, answered_features, domain_name)
-    db.delete_session(session_id)
-    
-    return {
-        'status': 'win_confirmed',
-        'animal': payload.animal_name
-    }
-
-
-@app.post("/learn/{session_id}")
-async def learn_animal(session_id: str, payload: LearnPayload):
-    srv = get_service()
-    game_state = db.get_current_session_state(session_id)
-    if not game_state:
-        raise HTTPException(status_code=404, detail="Session expired or not found")
-    
-    answered_features = game_state['answered_features']
-    domain_name = game_state['domain_name']
-    
-    result = srv.learn_new_animal(payload.animal_name, answered_features, domain_name)
-    db.delete_session(session_id)
-    
-    return {
-        'message': f"Thank you! I've learned about {payload.animal_name}.",
-        'features_learned': len(answered_features),
-        'db_status': result
-    }
+# --- REMOVED /win and /learn ENDPOINTS ---
+# The new /report endpoint now handles this functionality.
 
 
 @app.get("/items_for_questions/{domain_name}")
@@ -413,7 +374,7 @@ async def suggest_feature(payload: SuggestFeaturePayload):
 async def get_features_for_data_collection(domain_name: str, item_name: str):
     srv = get_service()
     try:
-        features = srv.get_data_collection_features(domain_name, item_name)
+        features = srv.get_features_for_data_collection(domain_name, item_name)
         return {"features": features, "item_name": item_name, "domain_name": domain_name}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -485,6 +446,58 @@ async def get_performance():
             "Engines are warmed up on startup for optimal performance"
         ]
     }
+
+
+# --- NEW: Game Report Endpoint (replaces /win and /learn) ---
+@app.get("/report/{session_id}", response_model=GameReport)
+async def get_and_finalize_game_report(
+    session_id: str, 
+    item_name: str, 
+    is_new: bool = False
+):
+    """
+    Retrieves a final report AND finalizes the game.
+    This endpoint replaces calls to /win and /learn.
+    It records the suggestion/new item, generates the report,
+    and deletes the session.
+    """
+    srv = get_service()
+    game_state = db.get_current_session_state(session_id)
+    if not game_state:
+        raise HTTPException(status_code=404, detail="Session expired or not found")
+
+    try:
+        user_answers = game_state.get('answered_features', {})
+        domain_name = game_state.get('domain_name', 'animals')
+        
+        # 1. Generate the report (read-op)
+        report_data = srv.get_game_report(
+            domain_name=domain_name,
+            item_name=item_name,
+            user_answers=user_answers,
+            is_new=is_new
+        )
+        
+        # 2. Finalize the game (write-op)
+        if is_new:
+            # This was a "learn" action
+            srv.learn_new_animal(item_name, user_answers, domain_name)
+        else:
+            # This was a "win" action
+            srv.record_suggestion(item_name, user_answers, domain_name)
+        
+        # 3. Clean up the session
+        db.delete_session(session_id)
+        
+        # 4. Return the report
+        return report_data
+        
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        print(f"Error in /report: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 
 @app.post("/admin/reload", include_in_schema=False)

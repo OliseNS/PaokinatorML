@@ -4,6 +4,7 @@ import numpy as np
 class AkinatorEngine:
     """
     Memory-optimized Akinator engine with batched calculations and improved selection logic.
+    All guessing logic is now consolidated in this file.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -16,13 +17,9 @@ class AkinatorEngine:
         # Standardized answer values for the engine's internal logic
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         
-        # Confidence schedule for guessing (prob threshold, ratio threshold)
-        self.confidence_schedule = {
-             range(0, 8): (1, 25.0),    # Very strict early
-             range(8, 15): (0.98, 18.0),   # Strict mid-game
-             range(15, 20): (0.96, 12.0),  # Moderate late-game
-             range(20, 26): (0.94, 8.0),   # looser end-game
-        }
+        # --- CONFUSING SCHEDULE REMOVED ---
+        # The old, unused self.confidence_schedule has been deleted.
+        # All guessing logic is now in the `should_make_guess` method.
 
         # --- Mappings ---
         # Ensures compatibility with: Yes, Mostly, Sort of, Not really, No
@@ -359,6 +356,120 @@ class AkinatorEngine:
              return feature_name, self.questions_map.get(feature_name, f"Does it have {feature_name}?")
              
         return None, None
+
+    # --- NEW HELPER (MOVED FROM SERVICE) ---
+    def _calculate_entropy(self, probs: np.ndarray) -> float:
+        """Calculate Shannon entropy of probability distribution."""
+        probs_safe = np.clip(probs, 1e-10, 1.0)
+        # Use log2 for entropy in bits, consistent with _entropy method
+        return -np.sum(probs_safe * np.log2(probs_safe))
+
+    # --- NEW METHOD (MOVED FROM SERVICE) ---
+    def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
+        """
+        *** (USER REQUEST) EVEN STRICTER *** guessing logic.
+        
+        This is the single source of truth for guessing logic.
+        
+        Returns: (should_guess, animal_name, guess_type)
+        """
+        q_count = game_state['question_count']
+        probs = game_state['probabilities'].copy()
+        mask = game_state['rejected_mask']
+        probs[mask] = 0.0 
+
+        if probs.sum() < 1e-10:
+            return False, None, None
+        
+        # Normalize
+        probs = probs / probs.sum()
+        
+        top_idx = np.argmax(probs)
+        top_prob = probs[top_idx]
+        top_animal = self.animals[top_idx] # Use self.animals
+        
+        # Calculate separation from second place
+        probs_copy = probs.copy()
+        probs_copy[top_idx] = 0.0
+        second_prob = np.max(probs_copy)
+        confidence_ratio = top_prob / (second_prob + 1e-9)
+        
+        # Calculate entropy
+        entropy = self._calculate_entropy(probs) # Use self._calculate_entropy
+        
+        # Count significant candidates (prob > 0.05)
+        significant_candidates = np.sum(probs > 0.05)
+        
+        # --- Continue Mode Logic ---
+        QUESTIONS_TO_WAIT = 4
+        if game_state.get('continue_mode', False):
+            if game_state.get('questions_since_last_guess', 0) < QUESTIONS_TO_WAIT:
+                return False, None, None
+            else:
+                # Reset and allow final guess with stricter threshold
+                game_state['continue_mode'] = False
+                game_state['questions_since_last_guess'] = 0
+
+        # --- (NEW) EVEN STRICTER FINAL GUESS LOGIC ---
+        
+        # Early game (< 10 questions): Almost impossible to guess
+        if q_count < 10:
+            if (top_prob > 0.995 and  # TIGHTENED
+                confidence_ratio > 70.0 and  # TIGHTENED
+                entropy < 0.05 and  # TIGHTENED
+                significant_candidates <= 1):
+                print(f"[GUESS] Early game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Mid game (10-15 questions): Extremely strict
+        if q_count < 15:
+            if (top_prob > 0.98 and  # TIGHTENED
+                confidence_ratio > 50.0 and  # TIGHTENED
+                entropy < 0.15 and  # TIGHTENED
+                significant_candidates <= 1): # <-- TIGHTENED
+                print(f"[GUESS] Mid game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Late mid game (15-20 questions): Very Strict
+        if q_count < 20:
+            if (top_prob > 0.95 and  # TIGHTENED
+                confidence_ratio > 30.0 and  # TIGHTENED
+                entropy < 0.30 and  # TIGHTENED
+                significant_candidates <= 2): # <-- TIGHTENED
+                print(f"[GUESS] Late mid confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Late game (20-25 questions): Strict
+        if q_count < 25:
+            if (top_prob > 0.90 and  # TIGHTENED
+                confidence_ratio > 25.0 and  # TIGHTENED
+                entropy < 0.45):  # TIGHTENED
+                print(f"[GUESS] Late game confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Very late game (25-30 questions): Moderately Strict
+        if q_count < 30:
+            if (top_prob > 0.85 and  # TIGHTENED
+                confidence_ratio > 15.0 and  # TIGHTENED
+                entropy < 0.7):  # TIGHTENED
+                print(f"[GUESS] Very late confidence: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Forced guess after 30 questions
+        if q_count >= 30:
+            if top_prob > 0.70 and confidence_ratio > 8.0:  # TIGHTENED
+                print(f"[GUESS] Forced (30+): prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
+                return True, top_animal, 'final'
+            # If even forced guess fails, return top candidate anyway
+            print(f"[GUESS] Ultimate forced (30+): prob={top_prob:.3f}")
+            return True, top_animal, 'final'
+            
+        return False, None, None
 
     def get_features_for_data_collection(self, item_name, num_features=5):
         """
