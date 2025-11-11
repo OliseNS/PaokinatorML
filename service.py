@@ -192,18 +192,13 @@ class AkinatorService:
         game_state['questions_since_last_guess'] = 0
         game_state['middle_guess_made'] = False
         return game_state
-
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
         """
-        --- UPDATED: Pure Exploration Strategy ---
-        This implements your request to "split the pool" at every step,
-        ensuring all possibilities are explored based on maximum information gain.
+        BALANCED STRATEGY: Explore early, disambiguate when confident
         
-        - The "Exploitation" (discriminative) logic has been REMOVED.
-        - The engine will NOW ALWAYS ask the question that provides the
-          best "split" (highest information gain) across the *entire*
-          remaining pool of candidates. This forces it to explore
-          obscure items and not just home in on the most probable one.
+        - Early game (entropy high): Pure exploration via info gain
+        - Late game (top candidate emerges): Discriminate between similar items
+        - Prevents premature convergence while ensuring precise identification
         """
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
@@ -213,34 +208,62 @@ class AkinatorService:
         
         prior_sum = prior.sum()
         if prior_sum < 1e-10:
-            # Fallback if all probabilities somehow became zero
             prior = np.ones_like(prior)
             prior[game_state['rejected_mask']] = 0.0
             prior_sum = prior.sum()
             if prior_sum < 1e-10:
-                 # This means even the fallback failed (e.g., all items rejected)
-                 return None, None, game_state
-            
+                return None, None, game_state
+                
         prior = prior / (prior_sum + 1e-10)
         
         asked = game_state['asked_features']
         q_count = game_state['question_count']
         
-        # First question optimization (still good to keep)
+        # First question optimization
         if q_count == 0 and hasattr(engine, 'sorted_initial_feature_indices'):
             feature, q = engine.select_question(prior, asked, q_count)
             return feature, q, game_state
         
-        # --- NEW: Pure Exploration Strategy ---
-        # We REMOVED the "if top_prob > 0.30" exploitation block.
-        # Now, we *always* find the best general split (max info gain)
-        # by calling engine.select_question.
-        # This forces the engine to explore all items, including obscure ones,
-        # by always asking the question that narrows the *entire* pool the most.
-        print(f"[Question] PURE EXPLORE: Finding best split for all {np.sum(prior > 0):.0f} items.")
+        # Calculate metrics for strategy decision
+        top_idx = np.argmax(prior)
+        top_prob = prior[top_idx]
+        
+        rival_threshold = top_prob * 0.3  # Items within 30% of top probability
+        num_rivals = np.sum((prior > rival_threshold) & (np.arange(len(prior)) != top_idx))
+        
+        entropy = engine._calculate_entropy(prior)
+        
+        
+        should_disambiguate = (
+            top_prob > 0.20 and 
+            2 <= num_rivals <= 10 and 
+            entropy < 3.0 and 
+            q_count > 8
+        )
+        
+        if should_disambiguate:
+            print(f"[Question] DISAMBIGUATE: top_prob={top_prob:.3f}, rivals={num_rivals}, entropy={entropy:.2f}")
+            
+            # Try to find a discriminative question
+            feature, q = engine.get_discriminative_question(top_idx, prior, asked)
+            
+            if feature and q:
+                print(f"  → Found discriminative question: {q[:60]}...")
+                return feature, q, game_state
+            else:
+                print(f"  → No discriminative question found, falling back to exploration")
+        
+        # --- EXPLORATION STRATEGY (default) ---
+        # Used when:
+        # - Early game (high entropy, no clear leader)
+        # - No suitable rivals to discriminate between
+        # - Discriminative question search failed
+        
+        print(f"[Question] EXPLORE: Finding best split across {np.sum(prior > 0.001):.0f} items (entropy={entropy:.2f})")
         feature, q = engine.select_question(prior, asked, q_count)
+        
         return feature, q, game_state
-
+    
     def process_answer(self, game_state: dict, feature: str, answer: str) -> dict:
         """Updates game state based on an answer."""
         with self.engines_lock:

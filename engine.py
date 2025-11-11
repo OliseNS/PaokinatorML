@@ -178,19 +178,15 @@ class AkinatorEngine:
         
         likelihoods = self.likelihood_table[f_quant, a_idx]
         
-        # FIXED: Much harsher contradiction penalties (0.03 = 97% penalty)
         if answer_val >= 0.9:  # User said YES
             contradictions = (f_col < 0.15) & (~nan_mask)
             likelihoods[contradictions] *= 0.03  # Was 0.08 - now devastating
         elif answer_val <= 0.1:  # User said NO
             contradictions = (f_col > 0.85) & (~nan_mask)
-            likelihoods[contradictions] *= 0.03  # Was 0.08 - now devastating
+            likelihoods[contradictions] *= 0.03  
 
-        # NEW: Update cumulative consistency scores
-        # Calculate how well each animal matches this specific answer
         match_quality = likelihoods.copy()
         
-        # Normalize to 0-1 range where 1 = perfect match, 0 = terrible match
         match_quality = np.log(match_quality + 1e-9)  # Log space
         match_quality = (match_quality - match_quality.min()) / (match_quality.max() - match_quality.min() + 1e-9)
         
@@ -199,9 +195,6 @@ class AkinatorEngine:
 
         posterior = prior * likelihoods
         
-        # NEW: Apply consistency weighting
-        # Animals with higher cumulative scores get a boost
-        # This prevents a single strong match from overriding accumulated evidence
         consistency_weight = 1.0 + (new_cumulative_scores / (answer_history_len + 1)) * 0.3
         posterior = posterior * consistency_weight
         
