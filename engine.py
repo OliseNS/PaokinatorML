@@ -9,6 +9,7 @@ class AkinatorEngine:
     3. Stricter entropy thresholds (< 0.25 for late game)
     4. Harsher contradiction penalties (0.03 = 97% penalty)
     5. Guessing now requires both high prob AND high consistency
+    
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -16,11 +17,9 @@ class AkinatorEngine:
         self.feature_cols = feature_cols
         self.questions_map = questions_map
         
-        # --- Configuration ---
         self.MAX_QUESTIONS = 25
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         
-        # --- Mappings ---
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0,
             'mostly': 0.75, 'usually': 0.75, 'probably': 0.75,
@@ -29,13 +28,8 @@ class AkinatorEngine:
             'no': 0.0, 'n': 0.0,
         }
 
-        # --- Internal State ---
-        # self.answer_history = []  <- REMOVED (Moved to game_state)
         self.sparse_questions_asked = set()
         
-        # self.cumulative_scores = None <- REMOVED (Moved to game_state)
-
-        # --- Initialization ---
         self._precompute_likelihood_tables()
         self._build_arrays()
 
@@ -53,7 +47,6 @@ class AkinatorEngine:
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
                 
-                # FIXED: Very tight sigmas - exact matches matter!
                 if a_val == 1.0 or a_val == 0.0:
                     sigma = 0.10  # Was 0.15 - now much stricter
                 else:
@@ -70,9 +63,6 @@ class AkinatorEngine:
         
         self.features = self.df[self.feature_cols].values.astype(np.float32)
         self.nan_mask = np.isnan(self.features)
-        
-        # Initialize cumulative scores (tracks consistency across all answers)
-        # self.cumulative_scores = np.zeros(len(self.animals), dtype=np.float32) <- REMOVED
         
         # Pre-calculate column stats
         self.col_nan_frac = np.mean(self.nan_mask, axis=0)
@@ -359,8 +349,10 @@ class AkinatorEngine:
         """
         FIXED: Now requires high probability AND high consistency.
         
-        This prevents "lucky" premature guesses by checking the cumulative
-        score of the top animal against its rivals.
+        --- NEW PATIENCE FIX ---
+        Thresholds have been made *significantly* stricter to prevent
+        overconfident, incorrect guesses. The engine will now ask many
+        more questions before it is "allowed" to guess.
         """
         q_count = game_state['question_count']
         probs = game_state['probabilities'].copy()
@@ -387,14 +379,11 @@ class AkinatorEngine:
         entropy = self._calculate_entropy(probs)
         
         # --- NEW CONSISTENCY CHECK (THE FIX) ---
-        # Checks if the top animal has been *consistently* good, not just
-        # lucky on the last question.
         cumulative_scores = game_state.get('cumulative_scores')
         is_consistent = False
         if cumulative_scores is not None and q_count > 0:
             top_animal_score = cumulative_scores[top_idx]
             
-            # Calculate average score of all *plausible* animals
             plausible_mask = (probs > 0.001) & (~mask)
             if np.any(plausible_mask):
                 avg_score = np.mean(cumulative_scores[plausible_mask])
@@ -403,8 +392,6 @@ class AkinatorEngine:
                 avg_score = 0.0
                 score_std = 0.0
             
-            # The top animal's score must be at least 0.25 standard deviations
-            # above the average score of all plausible animals.
             consistency_threshold = avg_score + (score_std * 0.25)
             
             if top_animal_score >= consistency_threshold:
@@ -424,35 +411,35 @@ class AkinatorEngine:
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # FIXED: Thresholds now require 'is_consistent'
+        # --- MUCH STRICTER THRESHOLDS ---
         
-        # Zone 1: Early Game (q < 10). Virtually never guess.
-        if q_count < 10:
-            # Must be >99.5%, 200x more likely, entropy < 0.1, AND consistent
-            if top_prob > 0.995 and confidence_ratio > 200.0 and entropy < 0.1 and is_consistent:
+        # Zone 1: Early Game (q < 15). Almost impossible to guess.
+        # Was: q < 10, prob > 0.995, ratio > 200.0
+        if q_count < 15:
+            if top_prob > 0.999 and confidence_ratio > 500.0 and entropy < 0.05 and is_consistent:
                 print(f"[GUESS] Early Slam Dunk: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
-        # Zone 2: Mid-Game (q < 18). High confidence required.
-        if q_count < 18:
-            # Must be >98.5%, 50x more likely, entropy < 0.20, AND consistent
-            if top_prob > 0.985 and confidence_ratio > 50.0 and entropy < 0.20 and is_consistent:
+        # Zone 2: Mid-Game (q < 25). Extremely high confidence needed.
+        # Was: q < 18, prob > 0.985, ratio > 50.0
+        if q_count < 25:
+            if top_prob > 0.995 and confidence_ratio > 200.0 and entropy < 0.15 and is_consistent:
                 print(f"[GUESS] Mid-Game: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
-        # Zone 3: Late-Game (q < MAX). Still need strong confidence.
-        if q_count < self.MAX_QUESTIONS:
-            # Must be >97%, 20x more likely, entropy < 0.25, AND consistent
-            if top_prob > 0.97 and confidence_ratio > 20.0 and entropy < 0.25 and is_consistent:
+        # Zone 3: Late-Game (q < 35). Very high confidence needed.
+        # Was: q < 25, prob > 0.97, ratio > 20.0
+        if q_count < self.MAX_QUESTIONS: 
+            if top_prob > 0.99 and confidence_ratio > 100.0 and entropy < 0.20 and is_consistent:
                 print(f"[GUESS] Late-Game: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Zone 4: Timeout (MAX_QUESTIONS reached).
         # At timeout, we guess regardless of consistency.
-        print(f"[GUESS] Forced Timeout: prob={top_prob:.4f}, entropy={entropy:.3f}")
+        print(f"[GUESS] Forced Timeout (Q={q_count}): prob={top_prob:.4f}, entropy={entropy:.3f}")
         return True, top_animal, 'final'
 
     def get_features_for_data_collection(self, item_name, num_features=5):
