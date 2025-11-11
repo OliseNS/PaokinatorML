@@ -3,13 +3,11 @@ import numpy as np
 
 class AkinatorEngine:
     """
-    --- UPDATED (Smarter Tuning) ---
-    Akinator engine refactored for a "smart" balance of accuracy and patience.
-    
-    - Stricter likelihood curves to punish "close-but-wrong" answers.
-    - Harsher penalties for direct contradictions.
-    - "Smarter" patient guessing logic that uses ENTROPY to measure
-      total uncertainty, not just the top candidate's probability.
+    FIXED VERSION - Addresses "forgetting" and "too eager" issues:
+    1. Much tighter likelihood curves (0.10, 0.15 sigmas)
+    2. Cumulative consistency tracking to prevent single-answer override
+    3. Stricter entropy thresholds (< 0.25 for late game)
+    4. Harsher contradiction penalties (0.03 = 97% penalty)
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -33,6 +31,9 @@ class AkinatorEngine:
         # --- Internal State ---
         self.answer_history = []
         self.sparse_questions_asked = set()
+        
+        # NEW: Track cumulative match quality per animal
+        self.cumulative_scores = None
 
         # --- Initialization ---
         self._precompute_likelihood_tables()
@@ -40,12 +41,7 @@ class AkinatorEngine:
 
     def _precompute_likelihood_tables(self):
         """
-        --- FIX: Re-tightened likelihood curves. ---
-        The previous curves (0.2, 0.3) were too "soft" and lenient.
-        These "middle-ground" sigmas (0.15, 0.22) are more forgiving
-        than the original (0.12, 0.25) but much STRICTER than the
-        current ones. This will penalize "close" answers more,
-        preventing the wrong animal from running away with a high score.
+        MUCH TIGHTER likelihood curves to prevent single-answer override.
         """
         steps = 41
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
@@ -57,15 +53,15 @@ class AkinatorEngine:
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
                 
-                # --- FIX: "Smarter" middle-ground sigmas ---
+                # FIXED: Very tight sigmas - exact matches matter!
                 if a_val == 1.0 or a_val == 0.0:
-                    sigma = 0.15  # Was 0.2 (too lenient). 
+                    sigma = 0.10  # Was 0.15 - now much stricter
                 else:
-                    sigma = 0.22  # Was 0.3 (far too lenient).
+                    sigma = 0.15  # Was 0.22 - now much stricter
 
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
                 
-                # Floor to prevent true zero probabilities (allows recovery later)
+                # Floor to prevent true zero probabilities
                 self.likelihood_table[i, j] = max(likelihood, 0.0001)
 
     def _build_arrays(self):
@@ -74,6 +70,9 @@ class AkinatorEngine:
         
         self.features = self.df[self.feature_cols].values.astype(np.float32)
         self.nan_mask = np.isnan(self.features)
+        
+        # Initialize cumulative scores (tracks consistency across all answers)
+        self.cumulative_scores = np.zeros(len(self.animals), dtype=np.float32)
         
         # Pre-calculate column stats
         self.col_nan_frac = np.mean(self.nan_mask, axis=0)
@@ -112,10 +111,7 @@ class AkinatorEngine:
         return -np.sum(p * np.log2(p))
 
     def _compute_gains_batched(self, prior, feature_indices, batch_size=64):
-        """
-        Memory-optimized information gain.
-        (Logic unchanged, but will perform better with stabler priors)
-        """
+        """Memory-optimized information gain."""
         n_animals = len(prior)
         n_features = len(feature_indices)
         n_answers = len(self.answer_values)
@@ -178,7 +174,7 @@ class AkinatorEngine:
 
     def update(self, prior, feature_idx, answer_str):
         """
-        --- FIX: Harsher Bayesian update penalties ---
+        FIXED: Now tracks cumulative consistency to prevent single-answer override.
         """
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         
@@ -190,18 +186,32 @@ class AkinatorEngine:
         
         likelihoods = self.likelihood_table[f_quant, a_idx]
         
-        # --- FIX: Harsher contradiction penalties ---
-        # The old penalty (0.05) was strict but fair.
-        # The lenient penalty (0.2) was letting "wrong" answers survive.
-        # 0.08 is a 92% penalty, which is devastating, as it should be.
+        # FIXED: Much harsher contradiction penalties (0.03 = 97% penalty)
         if answer_val >= 0.9:  # User said YES
             contradictions = (f_col < 0.15) & (~nan_mask)
-            likelihoods[contradictions] *= 0.08  # Was 0.2 (too lenient)
+            likelihoods[contradictions] *= 0.03  # Was 0.08 - now devastating
         elif answer_val <= 0.1:  # User said NO
             contradictions = (f_col > 0.85) & (~nan_mask)
-            likelihoods[contradictions] *= 0.08  # Was 0.2 (too lenient)
+            likelihoods[contradictions] *= 0.03  # Was 0.08 - now devastating
+
+        # NEW: Update cumulative consistency scores
+        # Calculate how well each animal matches this specific answer
+        match_quality = likelihoods.copy()
+        
+        # Normalize to 0-1 range where 1 = perfect match, 0 = terrible match
+        match_quality = np.log(match_quality + 1e-9)  # Log space
+        match_quality = (match_quality - match_quality.min()) / (match_quality.max() - match_quality.min() + 1e-9)
+        
+        # Accumulate scores (higher = more consistent across all answers)
+        self.cumulative_scores += match_quality
 
         posterior = prior * likelihoods
+        
+        # NEW: Apply consistency weighting
+        # Animals with higher cumulative scores get a boost
+        # This prevents a single strong match from overriding accumulated evidence
+        consistency_weight = 1.0 + (self.cumulative_scores / (len(self.answer_history) + 1)) * 0.3
+        posterior = posterior * consistency_weight
         
         total_p = np.sum(posterior)
         if total_p < 1e-9:
@@ -211,7 +221,7 @@ class AkinatorEngine:
         return posterior / total_p
 
     def get_sparse_question_for_game(self, prior, asked_features_names):
-        """Find the most useful sparse question. (Unchanged)"""
+        """Find the most useful sparse question."""
         sparse_indices = self.sparse_indices
         
         asked_set = set(asked_features_names)
@@ -237,9 +247,7 @@ class AkinatorEngine:
         return feature_name, question_text
         
     def select_question(self, prior, asked_features, question_count):
-        """
-        Smarter question selection. (Logic unchanged)
-        """
+        """Smarter question selection."""
         
         if question_count == 6:
             sparse_feat, sparse_q = self.get_sparse_question_for_game(prior, asked_features)
@@ -304,7 +312,7 @@ class AkinatorEngine:
         return feature_name, question_text
 
     def get_discriminative_question(self, top_animal_idx, prior, asked_features):
-        """Find a question that separates the top candidate from rivals. (Unchanged)"""
+        """Find a question that separates the top candidate from rivals."""
         top_prob = prior[top_animal_idx]
         
         rival_threshold = top_prob * 0.2
@@ -346,19 +354,15 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
         """
-        --- FIX: "SMART" PATIENT Guessing Logic (with ENTROPY) ---
+        FIXED: Much stricter entropy thresholds to prevent premature guessing.
         
-        This is now much smarter. It doesn't just check the top
-        candidate's probability. It also checks the `entropy` of
-        the *entire* system.
+        Entropy interpretation:
+        - 0.0 = Perfect certainty (100% one option)
+        - 0.3 = Very high certainty (~90% one option, 10% split among others)
+        - 0.5 = High certainty (~85% one option)
+        - 1.0 = Moderate certainty (50/50 between two options)
         
-        Entropy = A measure of uncertainty.
-        - High Entropy = Very confused, many animals are still possible.
-        - Low Entropy = Very certain, only one or two animals are left.
-        
-        We will now REFUSE to guess (even if one animal is high)
-        if the overall entropy is still high, meaning the engine
-        is still "confused" or "uncertain" about the other options.
+        We now require entropy < 0.25 for late game guessing.
         """
         q_count = game_state['question_count']
         probs = game_state['probabilities'].copy()
@@ -381,7 +385,7 @@ class AkinatorEngine:
         # Ratio of top candidate to the runner-up
         confidence_ratio = top_prob / (second_prob + 1e-9)
         
-        # --- NEW: Measure total uncertainty ---
+        # Measure total uncertainty
         entropy = self._calculate_entropy(probs)
         
         # Continue mode logic
@@ -392,45 +396,38 @@ class AkinatorEngine:
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # --- NEW "SMART" THRESHOLDS (with Entropy) ---
+        # FIXED: Much stricter thresholds
         
-        # Zone 1: Early Game (q < 8). Only "slam-dunk" guesses.
-        if q_count < 8:
-            # Must be >99% and 150x more likely than #2.
-            # This should almost never happen, which is the point.
-            if top_prob > 0.99 and confidence_ratio > 150.0:
-                print(f"[GUESS] Slam Dunk: prob={top_prob:.3f}")
+        # Zone 1: Early Game (q < 10). Virtually never guess.
+        if q_count < 10:
+            # Must be >99.5% and 200x more likely, AND entropy < 0.1
+            if top_prob > 0.995 and confidence_ratio > 200.0 and entropy < 0.1:
+                print(f"[GUESS] Early Slam Dunk: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
-            return False, None, None # Force "no"
+            return False, None, None
         
-        # Zone 2: Mid-Game (q < 15). High confidence AND low uncertainty.
-        if q_count < 15:
-            # Must be >98%, 30x more likely, AND entropy < 0.5
-            # An entropy of 0.5 means we are *extremely* certain.
-            if top_prob > 0.98 and confidence_ratio > 30.0 and entropy < 0.5:
-                print(f"[GUESS] Mid-Game High-Conf: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, entropy={entropy:.2f}")
+        # Zone 2: Mid-Game (q < 18). High confidence required.
+        if q_count < 18:
+            # Must be >98.5%, 50x more likely, AND entropy < 0.20
+            if top_prob > 0.985 and confidence_ratio > 50.0 and entropy < 0.20:
+                print(f"[GUESS] Mid-Game: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
-            return False, None, None # Force "no"
+            return False, None, None
         
-        # Zone 3: Late-Game (q < MAX). Standard confidence, low-ish uncertainty.
+        # Zone 3: Late-Game (q < MAX). Still need strong confidence.
         if q_count < self.MAX_QUESTIONS:
-            # Must be >96%, 10x more likely, AND entropy < 1.0
-            # An entropy of 1.0 means we are very, very certain.
-            if top_prob > 0.96 and confidence_ratio > 10.0 and entropy < 1.0:
-                print(f"[GUESS] Late-Game Standard: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, entropy={entropy:.2f}")
+            # Must be >97%, 20x more likely, AND entropy < 0.25
+            if top_prob > 0.97 and confidence_ratio > 20.0 and entropy < 0.25:
+                print(f"[GUESS] Late-Game: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
-            return False, None, None # Force "no"
+            return False, None, None
         
         # Zone 4: Timeout (MAX_QUESTIONS reached).
-        # We've run out of questions. Make the best guess we have.
-        print(f"[GUESS] Forced (Timeout): prob={top_prob:.3f}, entropy={entropy:.2f}")
+        print(f"[GUESS] Forced Timeout: prob={top_prob:.4f}, entropy={entropy:.3f}")
         return True, top_animal, 'final'
 
     def get_features_for_data_collection(self, item_name, num_features=5):
-        """
-        ALWAYS returns features for data collection.
-        (Unchanged)
-        """
+        """ALWAYS returns features for data collection."""
         try:
             matches = np.where(self.animals == item_name)[0]
             if len(matches) == 0:
