@@ -94,6 +94,17 @@ class AkinatorService:
             len(engine.animals),
             engine.animals
         )
+
+        # --- FIX: Ensure consistency state exists in game_state ---
+        # This moves state from the engine to the session
+        if 'cumulative_scores' not in game_state or len(game_state['cumulative_scores']) != len(engine.animals):
+            # If mismatch (e.g., new engine), reset it.
+            game_state['cumulative_scores'] = np.zeros(len(engine.animals), dtype=np.float32)
+        
+        if 'answer_history' not in game_state:
+            game_state['answer_history'] = []
+        # --- END FIX ---
+
         return engine, game_state
 
     # --- Public API Methods ---
@@ -110,10 +121,20 @@ class AkinatorService:
             if not engine:
                 raise ValueError(f"Domain '{domain_name}' not found.")
             
-            return self.state_manager.create_initial_state(
+            # Get base state from manager
+            initial_state = self.state_manager.create_initial_state(
                 domain_name, 
                 len(engine.animals)
             )
+
+            # --- FIX: Add consistency state to the new game_state ---
+            if 'cumulative_scores' not in initial_state:
+                initial_state['cumulative_scores'] = np.zeros(len(engine.animals), dtype=np.float32)
+            if 'answer_history' not in initial_state:
+                 initial_state['answer_history'] = []
+            # --- END FIX ---
+            
+            return initial_state
 
     def get_top_predictions(self, game_state: dict, n: int = 5) -> list[dict]:
         """Gets top N predictions with caching."""
@@ -248,8 +269,24 @@ class AkinatorService:
              
         prior = prior / (prior_sum + 1e-10)
         
-        posterior = engine.update(prior, feature_idx, answer)
+        # --- FIX: Pass state to update() and get new state back ---
+        current_scores = game_state['cumulative_scores']
+        q_count = game_state['question_count'] # This is the length of answer history
+
+        posterior, new_scores = engine.update(
+            prior,
+            feature_idx,
+            answer,
+            current_scores,
+            q_count
+        )
+        
         game_state['probabilities'] = posterior
+        game_state['cumulative_scores'] = new_scores
+        # --- END FIX ---
+        
+        # Also add to answer_history for the report
+        game_state['answer_history'].append({'feature': feature, 'answer': answer})
         
         return game_state
 

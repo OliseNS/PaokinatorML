@@ -5,9 +5,10 @@ class AkinatorEngine:
     """
     FIXED VERSION - Addresses "forgetting" and "too eager" issues:
     1. Much tighter likelihood curves (0.10, 0.15 sigmas)
-    2. Cumulative consistency tracking to prevent single-answer override
+    2. Cumulative consistency tracking (NOW MOVED TO GAME STATE)
     3. Stricter entropy thresholds (< 0.25 for late game)
     4. Harsher contradiction penalties (0.03 = 97% penalty)
+    5. Guessing now requires both high prob AND high consistency
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -29,11 +30,10 @@ class AkinatorEngine:
         }
 
         # --- Internal State ---
-        self.answer_history = []
+        # self.answer_history = []  <- REMOVED (Moved to game_state)
         self.sparse_questions_asked = set()
         
-        # NEW: Track cumulative match quality per animal
-        self.cumulative_scores = None
+        # self.cumulative_scores = None <- REMOVED (Moved to game_state)
 
         # --- Initialization ---
         self._precompute_likelihood_tables()
@@ -72,7 +72,7 @@ class AkinatorEngine:
         self.nan_mask = np.isnan(self.features)
         
         # Initialize cumulative scores (tracks consistency across all answers)
-        self.cumulative_scores = np.zeros(len(self.animals), dtype=np.float32)
+        # self.cumulative_scores = np.zeros(len(self.animals), dtype=np.float32) <- REMOVED
         
         # Pre-calculate column stats
         self.col_nan_frac = np.mean(self.nan_mask, axis=0)
@@ -146,7 +146,7 @@ class AkinatorEngine:
             f_batch_filled = np.nan_to_num(f_batch, nan=0.5)
             f_batch_quant = np.clip(np.rint(f_batch_filled * 40), 0, 40).astype(np.int8)
 
-            likelihoods = self.likelihood_table[f_batch_quant] 
+            likelihoods = self.likelihood_table[f_batch_quant]  
 
             nan_batch_mask = np.isnan(f_batch)
             nan_expand = np.repeat(nan_batch_mask[:, :, np.newaxis], n_answers, axis=2)
@@ -172,9 +172,11 @@ class AkinatorEngine:
             
         return gains
 
-    def update(self, prior, feature_idx, answer_str):
+    def update(self, prior: np.ndarray, feature_idx: int, answer_str: str, 
+               cumulative_scores: np.ndarray, 
+               answer_history_len: int) -> tuple[np.ndarray, np.ndarray]:
         """
-        FIXED: Now tracks cumulative consistency to prevent single-answer override.
+        FIXED: Now stateless. Accepts and returns cumulative_scores from game_state.
         """
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         
@@ -203,22 +205,23 @@ class AkinatorEngine:
         match_quality = (match_quality - match_quality.min()) / (match_quality.max() - match_quality.min() + 1e-9)
         
         # Accumulate scores (higher = more consistent across all answers)
-        self.cumulative_scores += match_quality
+        new_cumulative_scores = cumulative_scores + match_quality
 
         posterior = prior * likelihoods
         
         # NEW: Apply consistency weighting
         # Animals with higher cumulative scores get a boost
         # This prevents a single strong match from overriding accumulated evidence
-        consistency_weight = 1.0 + (self.cumulative_scores / (len(self.answer_history) + 1)) * 0.3
+        consistency_weight = 1.0 + (new_cumulative_scores / (answer_history_len + 1)) * 0.3
         posterior = posterior * consistency_weight
         
         total_p = np.sum(posterior)
         if total_p < 1e-9:
             # Fallback: dampen the prior to show some update, but don't collapse
-            return prior * 0.8 + (1.0/len(prior)) * 0.2
+            fallback_prior = prior * 0.8 + (1.0/len(prior)) * 0.2
+            return fallback_prior, new_cumulative_scores # Return updated scores even on fallback
             
-        return posterior / total_p
+        return posterior / total_p, new_cumulative_scores
 
     def get_sparse_question_for_game(self, prior, asked_features_names):
         """Find the most useful sparse question."""
@@ -258,8 +261,8 @@ class AkinatorEngine:
         asked_set = set(asked_features)
         asked_set.update(self.sparse_questions_asked)
         
-        candidates_indices = [idx for idx in self.allowed_feature_indices 
-                             if self.feature_cols[idx] not in asked_set]
+        candidates_indices = [idx for idx in self.allowed_feature_indices  
+                              if self.feature_cols[idx] not in asked_set]
 
         if not candidates_indices:
             return None, None
@@ -278,9 +281,9 @@ class AkinatorEngine:
             
             other_candidates = [idx for idx in candidates_indices if idx not in top_candidates]
             if other_candidates:
-                random_extras = np.random.choice(other_candidates, 
-                                                size=min(len(other_candidates), 20), 
-                                                replace=False)
+                random_extras = np.random.choice(other_candidates,  
+                                                 size=min(len(other_candidates), 20),  
+                                                 replace=False)
                 candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
             else:
                 candidates_to_eval = np.array(top_candidates, dtype=np.int32)
@@ -325,7 +328,7 @@ class AkinatorEngine:
         asked_set = set(asked_features)
         candidate_indices = [idx for idx in self.allowed_feature_indices 
                                  if self.feature_cols[idx] not in asked_set]
-                                 
+                                
         if not candidate_indices:
             return None, None
 
@@ -344,7 +347,7 @@ class AkinatorEngine:
             best_feat_idx = candidate_indices[best_local_idx]
             feature_name = self.feature_cols[best_feat_idx]
             return feature_name, self.questions_map.get(feature_name, f"Does it have {feature_name}?")
-             
+                    
         return None, None
 
     def _calculate_entropy(self, probs: np.ndarray) -> float:
@@ -354,20 +357,15 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
         """
-        FIXED: Much stricter entropy thresholds to prevent premature guessing.
+        FIXED: Now requires high probability AND high consistency.
         
-        Entropy interpretation:
-        - 0.0 = Perfect certainty (100% one option)
-        - 0.3 = Very high certainty (~90% one option, 10% split among others)
-        - 0.5 = High certainty (~85% one option)
-        - 1.0 = Moderate certainty (50/50 between two options)
-        
-        We now require entropy < 0.25 for late game guessing.
+        This prevents "lucky" premature guesses by checking the cumulative
+        score of the top animal against its rivals.
         """
         q_count = game_state['question_count']
         probs = game_state['probabilities'].copy()
         mask = game_state['rejected_mask']
-        probs[mask] = 0.0 
+        probs[mask] = 0.0  
 
         if probs.sum() < 1e-10:
             return False, None, None
@@ -388,6 +386,36 @@ class AkinatorEngine:
         # Measure total uncertainty
         entropy = self._calculate_entropy(probs)
         
+        # --- NEW CONSISTENCY CHECK (THE FIX) ---
+        # Checks if the top animal has been *consistently* good, not just
+        # lucky on the last question.
+        cumulative_scores = game_state.get('cumulative_scores')
+        is_consistent = False
+        if cumulative_scores is not None and q_count > 0:
+            top_animal_score = cumulative_scores[top_idx]
+            
+            # Calculate average score of all *plausible* animals
+            plausible_mask = (probs > 0.001) & (~mask)
+            if np.any(plausible_mask):
+                avg_score = np.mean(cumulative_scores[plausible_mask])
+                score_std = np.std(cumulative_scores[plausible_mask])
+            else:
+                avg_score = 0.0
+                score_std = 0.0
+            
+            # The top animal's score must be at least 0.25 standard deviations
+            # above the average score of all plausible animals.
+            consistency_threshold = avg_score + (score_std * 0.25)
+            
+            if top_animal_score >= consistency_threshold:
+                is_consistent = True
+            else:
+                print(f"[GUESS] REJECTED: {top_animal} has high prob ({top_prob:.2f}) but low consistency ({top_animal_score:.2f} < {consistency_threshold:.2f})")
+        
+        elif q_count == 0:
+            is_consistent = True # No data to check, allow
+        # --- END CONSISTENCY CHECK ---
+
         # Continue mode logic
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 3:
@@ -396,33 +424,34 @@ class AkinatorEngine:
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # FIXED: Much stricter thresholds
+        # FIXED: Thresholds now require 'is_consistent'
         
         # Zone 1: Early Game (q < 10). Virtually never guess.
         if q_count < 10:
-            # Must be >99.5% and 200x more likely, AND entropy < 0.1
-            if top_prob > 0.995 and confidence_ratio > 200.0 and entropy < 0.1:
+            # Must be >99.5%, 200x more likely, entropy < 0.1, AND consistent
+            if top_prob > 0.995 and confidence_ratio > 200.0 and entropy < 0.1 and is_consistent:
                 print(f"[GUESS] Early Slam Dunk: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Zone 2: Mid-Game (q < 18). High confidence required.
         if q_count < 18:
-            # Must be >98.5%, 50x more likely, AND entropy < 0.20
-            if top_prob > 0.985 and confidence_ratio > 50.0 and entropy < 0.20:
+            # Must be >98.5%, 50x more likely, entropy < 0.20, AND consistent
+            if top_prob > 0.985 and confidence_ratio > 50.0 and entropy < 0.20 and is_consistent:
                 print(f"[GUESS] Mid-Game: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Zone 3: Late-Game (q < MAX). Still need strong confidence.
         if q_count < self.MAX_QUESTIONS:
-            # Must be >97%, 20x more likely, AND entropy < 0.25
-            if top_prob > 0.97 and confidence_ratio > 20.0 and entropy < 0.25:
+            # Must be >97%, 20x more likely, entropy < 0.25, AND consistent
+            if top_prob > 0.97 and confidence_ratio > 20.0 and entropy < 0.25 and is_consistent:
                 print(f"[GUESS] Late-Game: prob={top_prob:.4f}, ratio={confidence_ratio:.1f}, entropy={entropy:.3f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Zone 4: Timeout (MAX_QUESTIONS reached).
+        # At timeout, we guess regardless of consistency.
         print(f"[GUESS] Forced Timeout: prob={top_prob:.4f}, entropy={entropy:.3f}")
         return True, top_animal, 'final'
 
@@ -474,7 +503,7 @@ class AkinatorEngine:
             np.random.shuffle(remaining)
             needed = num_features - len(selected_indices)
             selected_indices = np.concatenate((selected_indices, remaining[:needed]))
-             
+            
         return self._format_features(selected_indices[:num_features])
     
     def _get_random_allowed_features(self, num_features):
@@ -493,12 +522,12 @@ class AkinatorEngine:
             py_idx = int(idx)
             if py_idx >= len(self.feature_cols) or py_idx >= len(self.col_nan_frac):
                 continue
-                 
+                    
             fname = str(self.feature_cols[py_idx])
             results.append({
                 "feature_name": fname,
                 "question": str(self.questions_map.get(fname, f"Is it {fname}?")),
                 "nan_percentage": float(self.col_nan_frac[py_idx])
             })
-             
+            
         return results
