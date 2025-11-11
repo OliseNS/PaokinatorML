@@ -385,26 +385,20 @@ class AkinatorEngine:
 
         # --- NEW PATIENT THRESHOLDS ---
         
-        # Zone 1: Too Early (0-7 questions).
-        # We will NOT guess unless it's a 99% slam-dunk.
         if q_count < 8:
-            if top_prob > 0.99 and confidence_ratio > 100.0:
+            if top_prob > 1 and confidence_ratio > 120.0:
                 print(f"[GUESS] Slam Dunk: prob={top_prob:.3f}")
                 return True, top_animal, 'final'
             return False, None, None # Force "no"
         
-        # Zone 2: Mid-Game (8-14 questions).
-        # Must be very confident.
         if q_count < 15:
-            if top_prob > 0.90 and confidence_ratio > 25.0:
+            if top_prob > 0.98 and confidence_ratio > 30.0:
                 print(f"[GUESS] Mid-Game High-Conf: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
                 return True, top_animal, 'final'
             return False, None, None # Force "no"
         
-        # Zone 3: Late-Game (15-24 questions).
-        # Standard Akinator confidence. This is where most correct guesses should happen.
         if q_count < self.MAX_QUESTIONS:
-            if top_prob > 0.80 and confidence_ratio > 4.0:
+            if top_prob > 0.96 and confidence_ratio > 10.0:
                 print(f"[GUESS] Late-Game Standard: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
                 return True, top_animal, 'final'
             return False, None, None # Force "no"
