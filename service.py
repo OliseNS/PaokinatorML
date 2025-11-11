@@ -195,17 +195,15 @@ class AkinatorService:
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
         """
-        --- UPDATED: Hybrid Question Strategy ---
-        This now implements the "smart sounding questions" logic.
+        --- UPDATED: Pure Exploration Strategy ---
+        This implements your request to "split the pool" at every step,
+        ensuring all possibilities are explored based on maximum information gain.
         
-        - "Exploitation" (we have a hunch): If the top animal has > 30%
-          probability, we ask a "discriminative" question to confirm or
-          deny that specific animal. This feels smart to the user.
-          
-        - "Exploration" (we are lost): If no animal is a clear leader,
-          we ask a general "information gain" question to split the
-          field and narrow down the possibilities. This feels like
-          it's searching.
+        - The "Exploitation" (discriminative) logic has been REMOVED.
+        - The engine will NOW ALWAYS ask the question that provides the
+          best "split" (highest information gain) across the *entire*
+          remaining pool of candidates. This forces it to explore
+          obscure items and not just home in on the most probable one.
         """
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
@@ -215,10 +213,12 @@ class AkinatorService:
         
         prior_sum = prior.sum()
         if prior_sum < 1e-10:
+            # Fallback if all probabilities somehow became zero
             prior = np.ones_like(prior)
             prior[game_state['rejected_mask']] = 0.0
             prior_sum = prior.sum()
             if prior_sum < 1e-10:
+                 # This means even the fallback failed (e.g., all items rejected)
                  return None, None, game_state
             
         prior = prior / (prior_sum + 1e-10)
@@ -226,26 +226,18 @@ class AkinatorService:
         asked = game_state['asked_features']
         q_count = game_state['question_count']
         
-        # First question optimization
+        # First question optimization (still good to keep)
         if q_count == 0 and hasattr(engine, 'sorted_initial_feature_indices'):
             feature, q = engine.select_question(prior, asked, q_count)
             return feature, q, game_state
         
-        # --- FIX: Hybrid Strategy ---
-        top_idx = np.argmax(prior)
-        top_prob = prior[top_idx]
-        
-        # "Exploitation Mode": We have a solid lead. Ask a confirming question.
-        # We use 30% as the threshold for a "solid lead". (Was 20%)
-        # This will now trigger more reliably due to the stabler (softer) updates.
-        if top_prob > 0.30:
-            feature, q = engine.get_discriminative_question(top_idx, prior, asked)
-            if feature:
-                print(f"[Question] EXPLOIT: Confirming {engine.animals[top_idx]} with {feature}")
-                return feature, q, game_state
-
-        # "Exploration Mode": No clear leader. Ask a general info-gain question.
-        print(f"[Question] EXPLORE: Top prob {top_prob:.2f} too low. Finding best split.")
+        # --- NEW: Pure Exploration Strategy ---
+        # We REMOVED the "if top_prob > 0.30" exploitation block.
+        # Now, we *always* find the best general split (max info gain)
+        # by calling engine.select_question.
+        # This forces the engine to explore all items, including obscure ones,
+        # by always asking the question that narrows the *entire* pool the most.
+        print(f"[Question] PURE EXPLORE: Finding best split for all {np.sum(prior > 0):.0f} items.")
         feature, q = engine.select_question(prior, asked, q_count)
         return feature, q, game_state
 
