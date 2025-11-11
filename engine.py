@@ -3,12 +3,11 @@ import numpy as np
 
 class AkinatorEngine:
     """
-    Highly optimized Akinator engine with aggressive narrowing and smart guessing.
-    Key improvements:
-    - Much more aggressive probability updates (sharper likelihood curves)
-    - Earlier and more confident guessing
-    - Always returns data collection features
-    - Smarter feature selection prioritizing high-variance questions
+    --- UPDATED ---
+    Akinator engine refactored for patience and accuracy.
+    - Softer likelihood curves to tolerate fuzzy answers.
+    - Patient guessing logic to prevent "rushing".
+    - More forgiving update logic.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -17,7 +16,8 @@ class AkinatorEngine:
         self.questions_map = questions_map
         
         # --- Configuration ---
-        self.MAX_QUESTIONS = 20  # Reduced from 25
+        # --- FIX: Increased max questions to allow for more patient guessing ---
+        self.MAX_QUESTIONS = 25
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         
         # --- Mappings ---
@@ -39,8 +39,12 @@ class AkinatorEngine:
 
     def _precompute_likelihood_tables(self):
         """
-        MUCH sharper likelihood curves for aggressive narrowing.
-        Definite answers (Yes/No) now heavily penalize mismatches.
+        --- FIX: Softer likelihood curves. ---
+        This is the most important change. The old curves were too "sharp" (sigma=0.12).
+        If a user said "Mostly" (0.75) but the DB had "Yes" (1.0), the
+        correct animal's probability was almost zeroed out.
+        These wider curves (sigma=0.2, sigma=0.3) are more tolerant
+        of small differences between user answers and database values.
         """
         steps = 41
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
@@ -52,15 +56,15 @@ class AkinatorEngine:
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
                 
-                # MUCH sharper curves for faster elimination
+                # --- FIX: Widened sigmas for more tolerance ---
                 if a_val == 1.0 or a_val == 0.0:
-                    sigma = 0.12  # Was 0.2, now very sharp for Yes/No
+                    sigma = 0.2  # Was 0.12 (too aggressive).
                 else:
-                    sigma = 0.25  # Was 0.35, tighter for fuzzy answers
+                    sigma = 0.3  # Was 0.25. Softer for intermediate answers.
 
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
                 
-                # Higher minimum to avoid complete elimination (preserve recovery)
+                # Floor to prevent true zero probabilities (allows recovery later)
                 self.likelihood_table[i, j] = max(likelihood, 0.0001)
 
     def _build_arrays(self):
@@ -87,13 +91,12 @@ class AkinatorEngine:
         self.col_var = col_var
         self.col_mean = col_mean
         
-        # Initial feature ranking with bias toward high-variance questions
+        # Initial feature ranking
         if len(self.animals) > 0:
             n = len(self.animals)
             uniform_prior = np.ones(n, dtype=np.float32) / n
             initial_gains = self._compute_gains_batched(uniform_prior, self.allowed_feature_indices, batch_size=256)
             
-            # Boost high-variance features (they discriminate better)
             variance_boost = col_var[self.allowed_feature_indices] / (np.max(col_var) + 1e-5)
             boosted_gains = initial_gains * (1.0 + variance_boost * 0.5)
             
@@ -109,7 +112,8 @@ class AkinatorEngine:
 
     def _compute_gains_batched(self, prior, feature_indices, batch_size=64):
         """
-        Memory-optimized information gain with aggressive pruning.
+        Memory-optimized information gain.
+        (Logic unchanged, but will perform better with stabler priors)
         """
         n_animals = len(prior)
         n_features = len(feature_indices)
@@ -120,8 +124,7 @@ class AkinatorEngine:
         if current_entropy < 1e-5 or n_features == 0:
             return gains
 
-        # Only consider animals with meaningful probability
-        active_mask = prior > 1e-6  # Slightly stricter threshold
+        active_mask = prior > 1e-6
         n_active = np.sum(active_mask)
         
         if n_active < n_animals * 0.1 and n_active > 0:
@@ -174,37 +177,39 @@ class AkinatorEngine:
 
     def update(self, prior, feature_idx, answer_str):
         """
-        AGGRESSIVE Bayesian update - definite answers heavily penalize mismatches.
+        --- FIX: Softer Bayesian update penalties ---
         """
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         
         f_col = self.features[:, feature_idx]
         nan_mask = self.nan_mask[:, feature_idx]
         
-        # Quantize features
         f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 40), 0, 40).astype(np.int32)
         a_idx = np.abs(self.answer_values - answer_val).argmin()
         
         likelihoods = self.likelihood_table[f_quant, a_idx]
         
-        # AGGRESSIVE contradiction penalties
+        # --- FIX: Softer contradiction penalties ---
+        # The old penalty (0.05) was too harsh and killed candidates too early.
+        # 0.2 is much more forgiving.
         if answer_val >= 0.9:  # User said YES
-            contradictions = (f_col < 0.15) & (~nan_mask)  # Stricter threshold
-            likelihoods[contradictions] *= 0.05  # Harsher penalty (was 0.1)
+            contradictions = (f_col < 0.15) & (~nan_mask)
+            likelihoods[contradictions] *= 0.2  # Was 0.05
         elif answer_val <= 0.1:  # User said NO
-            contradictions = (f_col > 0.85) & (~nan_mask)  # Stricter threshold
-            likelihoods[contradictions] *= 0.05  # Harsher penalty
+            contradictions = (f_col > 0.85) & (~nan_mask)
+            likelihoods[contradictions] *= 0.2  # Was 0.05
 
         posterior = prior * likelihoods
         
         total_p = np.sum(posterior)
         if total_p < 1e-9:
-            return prior * 0.8 + (1.0/len(prior)) * 0.2  # Stronger dampening
+            # Fallback: dampen the prior to show some update, but don't collapse
+            return prior * 0.8 + (1.0/len(prior)) * 0.2
             
         return posterior / total_p
 
     def get_sparse_question_for_game(self, prior, asked_features_names):
-        """Find the most useful sparse question."""
+        """Find the most useful sparse question. (Unchanged)"""
         sparse_indices = self.sparse_indices
         
         asked_set = set(asked_features_names)
@@ -231,11 +236,10 @@ class AkinatorEngine:
         
     def select_question(self, prior, asked_features, question_count):
         """
-        Smarter question selection with bias toward high-discriminating features.
-        Injects sparse questions earlier (question 6 instead of 8).
+        Smarter question selection. (Logic unchanged, but will be called
+        more appropriately by the updated service layer).
         """
         
-        # Inject sparse question earlier for better data collection
         if question_count == 6:
             sparse_feat, sparse_q = self.get_sparse_question_for_game(prior, asked_features)
             if sparse_feat:
@@ -251,9 +255,8 @@ class AkinatorEngine:
         if not candidates_indices:
             return None, None
 
-        # Smarter pre-filtering: prioritize high-variance features
+        # Smarter pre-filtering
         if len(candidates_indices) > 100:
-            # Score candidates by initial ranking + variance
             scored_candidates = []
             for idx in candidates_indices:
                 initial_rank = np.where(self.sorted_initial_feature_indices == idx)[0]
@@ -280,15 +283,13 @@ class AkinatorEngine:
 
         gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=64)
         
-        # More aggressive selection (less randomness, more greedy)
         sorted_gain_indices = np.argsort(gains)[::-1]
-        top_n = min(3, len(sorted_gain_indices))  # Reduced from 5
+        top_n = min(3, len(sorted_gain_indices))
         
         top_local_indices = sorted_gain_indices[:top_n]
         top_gains = gains[top_local_indices]
         
-        # Lower temperature = more greedy selection
-        temperature = max(0.3, 1.5 - (question_count * 0.1))  # Much lower than before
+        temperature = max(0.3, 1.5 - (question_count * 0.1))
         
         exp_gains = np.exp((top_gains - np.max(top_gains)) / temperature)
         probs = exp_gains / np.sum(exp_gains)
@@ -302,10 +303,10 @@ class AkinatorEngine:
         return feature_name, question_text
 
     def get_discriminative_question(self, top_animal_idx, prior, asked_features):
-        """Find a question that separates the top candidate from rivals."""
+        """Find a question that separates the top candidate from rivals. (Unchanged)"""
         top_prob = prior[top_animal_idx]
         
-        rival_threshold = top_prob * 0.2  # Slightly higher threshold
+        rival_threshold = top_prob * 0.2
         rival_mask = (prior > rival_threshold) & (np.arange(len(prior)) != top_animal_idx)
         rival_indices = np.where(rival_mask)[0]
         
@@ -330,7 +331,7 @@ class AkinatorEngine:
         
         best_local_idx = np.argmax(diffs)
         
-        if diffs[best_local_idx] > 0.35:  # Slightly lower threshold
+        if diffs[best_local_idx] > 0.35:
             best_feat_idx = candidate_indices[best_local_idx]
             feature_name = self.feature_cols[best_feat_idx]
             return feature_name, self.questions_map.get(feature_name, f"Does it have {feature_name}?")
@@ -344,8 +345,11 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
         """
-        MUCH MORE AGGRESSIVE guessing logic for faster games.
-        Guesses earlier with lower confidence thresholds.
+        --- FIX: PATIENT Guessing Logic ---
+        This is the second most important change. It stops the engine from
+        "rushing". We will not guess early unless we are absolutely certain.
+        It's better to ask 15 smart questions and be right than 8
+        rushed questions and be wrong.
         """
         q_count = game_state['question_count']
         probs = game_state['probabilities'].copy()
@@ -364,82 +368,56 @@ class AkinatorEngine:
         probs_copy = probs.copy()
         probs_copy[top_idx] = 0.0
         second_prob = np.max(probs_copy)
+        
+        # Ratio of top candidate to the runner-up
         confidence_ratio = top_prob / (second_prob + 1e-9)
         
-        entropy = self._calculate_entropy(probs)
-        significant_candidates = np.sum(probs > 0.05)
+        # entropy = self._calculate_entropy(probs)
+        # significant_candidates = np.sum(probs > 0.05)
         
         # Continue mode logic
-        QUESTIONS_TO_WAIT = 3  # Reduced from 4
         if game_state.get('continue_mode', False):
-            if game_state.get('questions_since_last_guess', 0) < QUESTIONS_TO_WAIT:
+            if game_state.get('questions_since_last_guess', 0) < 3: # Was 3, this is fine
                 return False, None, None
             else:
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # MUCH MORE AGGRESSIVE THRESHOLDS
+        # --- NEW PATIENT THRESHOLDS ---
         
-        # Early game (< 6 questions): Very confident guesses only
-        if q_count < 6:
-            if (top_prob > 0.92 and 
-                confidence_ratio > 35.0 and 
-                entropy < 0.2 and 
-                significant_candidates <= 1):
-                print(f"[GUESS] Early: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+        # Zone 1: Too Early (0-7 questions).
+        # We will NOT guess unless it's a 99% slam-dunk.
+        if q_count < 8:
+            if top_prob > 0.99 and confidence_ratio > 100.0:
+                print(f"[GUESS] Slam Dunk: prob={top_prob:.3f}")
                 return True, top_animal, 'final'
-            return False, None, None
+            return False, None, None # Force "no"
         
-        # Mid-early game (6-10 questions): Confident guesses
-        if q_count < 10:
-            if (top_prob > 0.85 and 
-                confidence_ratio > 20.0 and 
-                entropy < 0.35 and 
-                significant_candidates <= 2):
-                print(f"[GUESS] Mid-early: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
-                return True, top_animal, 'final'
-            return False, None, None
-        
-        # Mid game (10-15 questions): Moderate confidence
+        # Zone 2: Mid-Game (8-14 questions).
+        # Must be very confident.
         if q_count < 15:
-            if (top_prob > 0.75 and 
-                confidence_ratio > 12.0 and 
-                entropy < 0.55):
-                print(f"[GUESS] Mid: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+            if top_prob > 0.90 and confidence_ratio > 25.0:
+                print(f"[GUESS] Mid-Game High-Conf: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
                 return True, top_animal, 'final'
-            return False, None, None
+            return False, None, None # Force "no"
         
-        # Late game (15-20 questions): Lower confidence OK
-        if q_count < 20:
-            if (top_prob > 0.65 and 
-                confidence_ratio > 8.0 and 
-                entropy < 0.8):
-                print(f"[GUESS] Late: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}, ent={entropy:.3f}")
+        # Zone 3: Late-Game (15-24 questions).
+        # Standard Akinator confidence. This is where most correct guesses should happen.
+        if q_count < self.MAX_QUESTIONS:
+            if top_prob > 0.80 and confidence_ratio > 4.0:
+                print(f"[GUESS] Late-Game Standard: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
                 return True, top_animal, 'final'
-            return False, None, None
+            return False, None, None # Force "no"
         
-        # Very late (20-25 questions): Make a guess
-        if q_count < 25:
-            if (top_prob > 0.55 and 
-                confidence_ratio > 5.0):
-                print(f"[GUESS] Very late: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
-                return True, top_animal, 'final'
-            return False, None, None
-        
-        # Forced guess after 25 questions
-        if top_prob > 0.45 and confidence_ratio > 3.0:
-            print(f"[GUESS] Forced: prob={top_prob:.3f}, ratio={confidence_ratio:.1f}")
-            return True, top_animal, 'final'
-        
-        # Ultimate fallback
-        print(f"[GUESS] Ultimate: prob={top_prob:.3f}")
+        # Zone 4: Timeout (MAX_QUESTIONS reached).
+        # We've run out of questions. Make the best guess we have.
+        print(f"[GUESS] Forced (Timeout): prob={top_prob:.3f}")
         return True, top_animal, 'final'
 
     def get_features_for_data_collection(self, item_name, num_features=5):
         """
         ALWAYS returns features for data collection.
-        Prioritizes missing features for this item, then globally sparse features,
-        then falls back to random allowed features.
+        (Unchanged)
         """
         try:
             matches = np.where(self.animals == item_name)[0]
@@ -448,7 +426,6 @@ class AkinatorEngine:
             
             if len(matches) == 0:
                 print(f"Data collection: Item '{item_name}' not found, using random features.")
-                # Fallback: return random allowed features
                 return self._get_random_allowed_features(num_features)
                 
             item_idx = matches[0]

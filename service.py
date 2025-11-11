@@ -9,6 +9,7 @@ from state_manager import StateManager
 class AkinatorService:
     """
     Manages multiple AkinatorEngine instances (one per domain) and game logic.
+    (Updated get_next_question for smarter strategy)
     """
     
     def __init__(self):
@@ -156,19 +157,13 @@ class AkinatorService:
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
         """
-        *** REFACTORED ***
-        Delegates all guessing logic to the engine itself.
-        This service layer is no longer responsible for guess logic.
+        Delegates all guessing logic to the (now much more patient) engine.
         """
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
         
         # Delegate directly to the engine
         return engine.should_make_guess(game_state)
-
-    # --- HELPER REMOVED ---
-    # def _calculate_entropy(self, probs: np.ndarray) -> float:
-    # This method has been moved to engine.py
 
     def activate_continue_mode(self, game_state: dict) -> dict:
         """Sets game to continue asking questions after wrong guess."""
@@ -178,7 +173,19 @@ class AkinatorService:
         return game_state
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
-        """Gets the next question. Returns (feature, question, modified_state)."""
+        """
+        --- UPDATED: Hybrid Question Strategy ---
+        This now implements the "smart sounding questions" logic.
+        
+        - "Exploitation" (we have a hunch): If the top animal has > 30%
+          probability, we ask a "discriminative" question to confirm or
+          deny that specific animal. This feels smart to the user.
+          
+        - "Exploration" (we are lost): If no animal is a clear leader,
+          we ask a general "information gain" question to split the
+          field and narrow down the possibilities. This feels like
+          it's searching.
+        """
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
 
@@ -203,15 +210,21 @@ class AkinatorService:
             feature, q = engine.select_question(prior, asked, q_count)
             return feature, q, game_state
         
-        # Try discriminative question
+        # --- FIX: Hybrid Strategy ---
         top_idx = np.argmax(prior)
         top_prob = prior[top_idx]
-        if top_prob > 0.2:
+        
+        # "Exploitation Mode": We have a solid lead. Ask a confirming question.
+        # We use 30% as the threshold for a "solid lead". (Was 20%)
+        # This will now trigger more reliably due to the stabler (softer) updates.
+        if top_prob > 0.30:
             feature, q = engine.get_discriminative_question(top_idx, prior, asked)
             if feature:
+                print(f"[Question] EXPLOIT: Confirming {engine.animals[top_idx]} with {feature}")
                 return feature, q, game_state
 
-        # Default question selection
+        # "Exploration Mode": No clear leader. Ask a general info-gain question.
+        print(f"[Question] EXPLORE: Top prob {top_prob:.2f} too low. Finding best split.")
         feature, q = engine.select_question(prior, asked, q_count)
         return feature, q, game_state
 
