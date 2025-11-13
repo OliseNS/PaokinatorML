@@ -8,8 +8,16 @@ from state_manager import StateManager
 
 class AkinatorService:
     """
-    Manages multiple AkinatorEngine instances (one per domain) and game logic.
-    (Updated get_next_question for smarter strategy)
+    REFACTORED: Manages game logic and state.
+    
+    Core changes to support the new Fuzzy Logic Engine:
+    1.  All game state logic is built around 'cumulative_scores' (from state_manager).
+    2.  'probabilities' are no longer stored in the game state. They are
+        calculated on-the-fly from 'cumulative_scores' using softmax
+        in the `_get_probs_and_state` helper.
+    3.  `process_answer` is now much simpler. It just calls the engine's
+        stateless `update` function and stores the new 'cumulative_scores'.
+    4.  `reject_guess` now only has to update the 'rejected_mask'.
     """
     
     def __init__(self):
@@ -88,24 +96,48 @@ class AkinatorService:
             domain_name, engine = next(iter(self.engines.items()))
             game_state['domain_name'] = domain_name
             
-        # Migrate state if needed
+        # Migrate state if needed (e.g., new animals added)
         game_state = self.state_manager.migrate_state(
             game_state, 
             len(engine.animals),
             engine.animals
         )
 
-        # --- FIX: Ensure consistency state exists in game_state ---
-        # This moves state from the engine to the session
+        # Ensure core state arrays exist (from state_manager)
         if 'cumulative_scores' not in game_state or len(game_state['cumulative_scores']) != len(engine.animals):
-            # If mismatch (e.g., new engine), reset it.
             game_state['cumulative_scores'] = np.zeros(len(engine.animals), dtype=np.float32)
         
         if 'answer_history' not in game_state:
             game_state['answer_history'] = []
-        # --- END FIX ---
 
         return engine, game_state
+
+    # --- NEW HELPER ---
+    def _get_probs_and_state(self, game_state: dict) -> tuple[np.ndarray, dict, AkinatorEngine]:
+        """
+        Calculates probabilities on-the-fly from cumulative_scores using softmax.
+        This is the core of the new fuzzy logic system.
+        """
+        with self.engines_lock:
+            engine, game_state = self._get_engine_and_migrate_state(game_state)
+            
+        scores = game_state['cumulative_scores'].copy()
+        mask = game_state['rejected_mask']
+        
+        # Apply mask: rejected animals have no chance
+        scores[mask] = -np.inf
+        
+        # Softmax calculation (stable version)
+        if len(scores) > 0:
+            e_x = np.exp(scores - np.max(scores))
+            probs = e_x / (e_x.sum() + 1e-10)
+        else:
+            probs = np.array([], dtype=np.float32)
+
+        probs[mask] = 0.0  # Ensure rejected are 0
+        
+        return probs, game_state, engine
+    # --- END NEW HELPER ---
 
     # --- Public API Methods ---
 
@@ -121,36 +153,28 @@ class AkinatorService:
             if not engine:
                 raise ValueError(f"Domain '{domain_name}' not found.")
             
-            # Get base state from manager
+            # Get base state from manager (now includes 'cumulative_scores')
             initial_state = self.state_manager.create_initial_state(
                 domain_name, 
                 len(engine.animals)
             )
-
-            # --- FIX: Add consistency state to the new game_state ---
-            if 'cumulative_scores' not in initial_state:
-                initial_state['cumulative_scores'] = np.zeros(len(engine.animals), dtype=np.float32)
-            if 'answer_history' not in initial_state:
-                 initial_state['answer_history'] = []
-            # --- END FIX ---
             
             return initial_state
 
     def get_top_predictions(self, game_state: dict, n: int = 5) -> list[dict]:
         """Gets top N predictions with caching."""
+        # Cache key is now based on 'cumulative_scores' (see state_manager)
         state_key = self.state_manager.get_state_cache_key(game_state, n)
         
         with self._cache_lock:
             if state_key in self._prediction_cache:
                 return self._prediction_cache[state_key]
         
-        with self.engines_lock:
-            engine, game_state = self._get_engine_and_migrate_state(game_state)
+        # --- REFACTORED ---
+        # Get on-the-fly probabilities
+        probs, game_state, engine = self._get_probs_and_state(game_state)
+        # --- END REFACTOR ---
             
-        probs = game_state['probabilities'].copy()
-        mask = game_state['rejected_mask']
-        probs[mask] = 0.0
-        
         sorted_indices = np.argsort(probs)[::-1]
         
         top_n = min(n, len(sorted_indices))
@@ -178,49 +202,39 @@ class AkinatorService:
 
     def should_make_guess(self, game_state: dict) -> tuple[bool, str | None, str | None]:
         """
-        Delegates all guessing logic to the (now much more patient) engine.
+        Delegates guessing logic to the engine, passing in the
+        on-the-fly probabilities.
         """
-        with self.engines_lock:
-            engine, game_state = self._get_engine_and_migrate_state(game_state)
+        # --- REFACTORED ---
+        probs, game_state, engine = self._get_probs_and_state(game_state)
         
-        # Delegate directly to the engine
-        return engine.should_make_guess(game_state)
+        # Pass both game_state (for scores) and probs (for confidence)
+        return engine.should_make_guess(game_state, probs)
+        # --- END REFACTOR ---
 
     def activate_continue_mode(self, game_state: dict) -> dict:
         """Sets game to continue asking questions after wrong guess."""
         game_state['continue_mode'] = True
         game_state['questions_since_last_guess'] = 0
-        game_state['middle_guess_made'] = False
+        game_state['middle_guess_made'] = False # This can likely be removed if not used
         return game_state
+
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
         """
-        BALANCED STRATEGY: Explore early, disambiguate when confident
-        
-        - Early game (entropy high): Pure exploration via info gain
-        - Late game (top candidate emerges): Discriminate between similar items
-        - Prevents premature convergence while ensuring precise identification
+        Gets the next question using Information Gain, driven by
+        on-the-fly probabilities.
         """
-        with self.engines_lock:
-            engine, game_state = self._get_engine_and_migrate_state(game_state)
+        # --- REFACTORED ---
+        # Get on-the-fly probs to use as the 'prior' for info gain
+        prior, game_state, engine = self._get_probs_and_state(game_state)
+        # --- END REFACTOR ---
 
-        prior = game_state['probabilities'].copy()
-        prior[game_state['rejected_mask']] = 0.0
-        
-        prior_sum = prior.sum()
-        if prior_sum < 1e-10:
-            prior = np.ones_like(prior)
-            prior[game_state['rejected_mask']] = 0.0
-            prior_sum = prior.sum()
-            if prior_sum < 1e-10:
-                return None, None, game_state
-                
-        prior = prior / (prior_sum + 1e-10)
-        
         asked = game_state['asked_features']
         q_count = game_state['question_count']
         
         # First question optimization
         if q_count == 0 and hasattr(engine, 'sorted_initial_feature_indices'):
+            # Pass uniform prior (which 'prior' is at q_count=0)
             feature, q = engine.select_question(prior, asked, q_count)
             return feature, q, game_state
         
@@ -232,7 +246,6 @@ class AkinatorService:
         num_rivals = np.sum((prior > rival_threshold) & (np.arange(len(prior)) != top_idx))
         
         entropy = engine._calculate_entropy(prior)
-        
         
         should_disambiguate = (
             top_prob > 0.20 and 
@@ -254,18 +267,15 @@ class AkinatorService:
                 print(f"  → No discriminative question found, falling back to exploration")
         
         # --- EXPLORATION STRATEGY (default) ---
-        # Used when:
-        # - Early game (high entropy, no clear leader)
-        # - No suitable rivals to discriminate between
-        # - Discriminative question search failed
-        
         print(f"[Question] EXPLORE: Finding best split across {np.sum(prior > 0.001):.0f} items (entropy={entropy:.2f})")
         feature, q = engine.select_question(prior, asked, q_count)
         
         return feature, q, game_state
     
     def process_answer(self, game_state: dict, feature: str, answer: str) -> dict:
-        """Updates game state based on an answer."""
+        """
+        Updates game state based on an answer using the new engine.
+        """
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
             
@@ -273,34 +283,32 @@ class AkinatorService:
             print(f"Warning: Feature '{feature}' not in engine. Skipping.")
             return game_state
             
-        feature_idx = engine.feature_cols.index(feature)
-        
-        prior = game_state['probabilities'].copy()
-        prior[game_state['rejected_mask']] = 0.0
-        
-        prior_sum = prior.sum()
-        if prior_sum < 1e-10:
+        # Find the index for the feature name
+        feature_idx = np.where(engine.feature_cols == feature)[0]
+        if len(feature_idx) == 0:
+             print(f"Warning: Feature '{feature}' not in engine column list. Skipping.")
              return game_state
-             
-        prior = prior / (prior_sum + 1e-10)
-        
-        # --- FIX: Pass state to update() and get new state back ---
-        current_scores = game_state['cumulative_scores']
-        q_count = game_state['question_count'] # This is the length of answer history
+        feature_idx = int(feature_idx[0])
 
-        posterior, new_scores = engine.update(
-            prior,
+        # --- REFACTORED ---
+        # Get current scores from state
+        current_scores = game_state['cumulative_scores']
+
+        # Call the new stateless update function
+        new_scores = engine.update(
             feature_idx,
             answer,
-            current_scores,
-            q_count
+            current_scores
         )
         
-        game_state['probabilities'] = posterior
+        # Store the new scores back into the game state
         game_state['cumulative_scores'] = new_scores
-        # --- END FIX ---
+        # 'probabilities' are no longer stored or updated here.
+        # --- END REFACTOR ---
         
         # Also add to answer_history for the report
+        if 'answer_history' not in game_state:
+             game_state['answer_history'] = []
         game_state['answer_history'].append({'feature': feature, 'answer': answer})
         
         return game_state
@@ -314,12 +322,14 @@ class AkinatorService:
             idx_list = np.where(engine.animals == animal_name)[0]
             if len(idx_list) > 0:
                 idx = idx_list[0]
-                game_state['rejected_mask'][idx] = True
-                game_state['probabilities'][idx] = 0.0 
                 
-                total = game_state['probabilities'].sum()
-                if total > 1e-10:
-                    game_state['probabilities'] = game_state['probabilities'] / total
+                # --- REFACTORED ---
+                # The only action needed is to update the mask.
+                # The softmax helper (`_get_probs_and_state`) will see this
+                # mask and assign -inf score, resulting in 0 probability.
+                game_state['rejected_mask'][idx] = True
+                # All 'probabilities' manipulation is removed.
+                # --- END REFACTOR ---
             else:
                  print(f"Warning: Cannot reject '{animal_name}', not found.")
                 
@@ -330,7 +340,7 @@ class AkinatorService:
 
     def get_features_for_data_collection(self, domain_name: str, 
                                     item_name: str) -> list[dict]:
-        """Gets 5 features for data collection."""
+        """Gets 5 features for data collection (unchanged)."""
         with self.engines_lock:
             engine = self.engines.get(domain_name)
             if not engine:
@@ -340,22 +350,22 @@ class AkinatorService:
 
     def record_suggestion(self, animal_name: str, 
                          answered_features: dict, domain_name: str) -> str:
-        """Persists a suggestion for an existing animal."""
+        """Persists a suggestion for an existing animal (unchanged)."""
         return db.persist_suggestion(animal_name, answered_features, domain_name)
 
     def learn_new_animal(self, animal_name: str, 
                         answered_features: dict, domain_name: str) -> str:
-        """Persists a new animal to the database."""
+        """Persists a new animal to the database (unchanged)."""
         return db.persist_new_animal(animal_name, answered_features, domain_name)
 
     def start_engine_reload(self):
-        """Starts background reload of all engines."""
+        """Starts background reload of all engines (unchanged)."""
         threading.Thread(target=self._background_reload, daemon=True).start()
 
     def get_game_report(self, domain_name: str, item_name: str, 
                         user_answers: dict, is_new: bool) -> dict:
         """
-        Generates a report comparing user answers to consensus answers.
+        Generates a report comparing user answers to consensus answers (unchanged).
         """
         with self.engines_lock:
             engine = self.engines.get(domain_name)
@@ -390,12 +400,14 @@ class AkinatorService:
             if not is_new and item_idx != -1:
                 try:
                     # Find the feature's column index
-                    feature_idx = engine.feature_cols.index(feature_name)
-                    # Get the consensus value from the engine's feature matrix
-                    consensus_raw = engine.features[item_idx, feature_idx]
-                    # Convert np.nan to None
-                    if not np.isnan(consensus_raw):
-                        consensus_value = float(consensus_raw)
+                    feature_idx_list = np.where(engine.feature_cols == feature_name)[0]
+                    if len(feature_idx_list) > 0:
+                        feature_idx = int(feature_idx_list[0])
+                        # Get the consensus value from the engine's feature matrix
+                        consensus_raw = engine.features[item_idx, feature_idx]
+                        # Convert np.nan to None
+                        if not np.isnan(consensus_raw):
+                            consensus_value = float(consensus_raw)
                 except (ValueError, IndexError):
                     # Feature not in engine (e.g., new feature), skip consensus
                     pass

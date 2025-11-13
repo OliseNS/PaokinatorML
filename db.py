@@ -34,37 +34,66 @@ except Exception as e:
 
 # --- Session Management ---
 def _convert_to_serializable(state: dict) -> dict:
-    """Convert numpy arrays to serializable format."""
+    """
+    Convert numpy arrays to serializable format for msgpack.
+    REFACTORED: Now serializes 'cumulative_scores'.
+    """
     state_copy = state.copy()
-    for key in ['probabilities', 'rejected_mask']:
+    # --- REFACTORED ---
+    for key in ['cumulative_scores', 'rejected_mask']:
+    # --- END REFACTOR ---
         if key in state_copy and isinstance(state_copy[key], np.ndarray):
             # msgpack_numpy will handle numpy arrays automatically
             pass
+    
+    # Clean old keys if they exist
+    if 'probabilities' in state_copy:
+        del state_copy['probabilities']
+        
     return state_copy
 
 
 def _convert_from_serializable(state: dict) -> dict:
-    """Convert serializable format back to numpy arrays."""
+    """
+    Convert serializable format back to numpy arrays.
+    REFACTORED: Now deserializes 'cumulative_scores'.
+    """
     # msgpack_numpy handles this automatically, but ensure correct types
-    for key in ['probabilities', 'rejected_mask']:
+    # --- REFACTORED ---
+    for key in ['cumulative_scores', 'rejected_mask']:
+    # --- END REFACTOR ---
         if key in state and isinstance(state[key], np.ndarray):
-            if key == 'probabilities':
+            # --- REFACTORED ---
+            if key == 'cumulative_scores':
                 state[key] = state[key].astype(np.float32)
+            # --- END REFACTOR ---
             elif key == 'rejected_mask':
                 state[key] = state[key].astype(bool)
+                
+    # Clean old keys if they exist
+    if 'probabilities' in state:
+        del state['probabilities']
+
     return state
 
-# --- NEW FUNCTION ---
 def convert_state_to_json_safe(state: dict) -> dict:
-    """Converts state with numpy arrays to be JSON serializable."""
+    """
+    Converts state with numpy arrays to be JSON serializable.
+    REFACTORED: Now converts 'cumulative_scores'.
+    """
     if not state:
         return None
     state_copy = state.copy()
-    for key in ['probabilities', 'rejected_mask']:
+    # --- REFACTORED ---
+    for key in ['cumulative_scores', 'rejected_mask']:
+    # --- END REFACTOR ---
         if key in state_copy and isinstance(state_copy[key], np.ndarray):
             state_copy[key] = state_copy[key].tolist()
+            
+    if 'probabilities' in state_copy:
+        del state_copy['probabilities']
+        
     return state_copy
-# --- END NEW FUNCTION ---
 
 
 def push_session_state(session_id: str, state: dict):
@@ -78,15 +107,10 @@ def push_session_state(session_id: str, state: dict):
         key = f"session:{session_id}"
         packed = msgpack.packb(_convert_to_serializable(state), use_bin_type=True)
         
-        # --- MODIFICATION ---
-        # Push to the head of the list
         redis_client.lpush(key, packed)
         
-        # --- SMART FIX: INCREASED LIMIT ---
-        # Keep only the last 60 states (1 initial + ~29 Q/A pairs)
-        # This fixes the error after ~7 undos.
+        # Keep only the last 60 states
         redis_client.ltrim(key, 0, 59) 
-        # --- END MODIFICATION ---
         
         # Set/refresh the expiration for the *entire list*
         redis_client.expire(key, config.SESSION_TTL_SECONDS)
@@ -103,10 +127,8 @@ def get_current_session_state(session_id: str) -> dict | None:
     try:
         key = f"session:{session_id}"
         
-        # --- MODIFICATION ---
         # Get the head of the list (index 0)
         packed = redis_client.lindex(key, 0)
-        # --- END MODIFICATION ---
         
         if not packed:
             return None
@@ -119,8 +141,6 @@ def get_current_session_state(session_id: str) -> dict | None:
         print(f"✗ Error getting current session {session_id}: {e}")
         return None
 
-
-# --- NEW FUNCTION ---
 def pop_session_state(session_id: str) -> dict | None:
     """Removes the *current* (most recent) state and returns it."""
     if not redis_client:
@@ -128,7 +148,6 @@ def pop_session_state(session_id: str) -> dict | None:
         
     try:
         key = f"session:{session_id}"
-        # --- NEW LOGIC ---
         # Pop the head of the list
         packed = redis_client.lpop(key)
         
@@ -139,12 +158,10 @@ def pop_session_state(session_id: str) -> dict | None:
         redis_client.expire(key, config.SESSION_TTL_SECONDS)
         state = msgpack.unpackb(packed, raw=False)
         return _convert_from_serializable(state)
-        # --- END NEW LOGIC ---
     except Exception as e:
         print(f"✗ Error popping session {session_id}: {e}")
         return None
 
-# --- NEW FUNCTION ---
 def get_session_history_length(session_id: str) -> int:
     """Returns the number of states stored for a session."""
     if not redis_client:
@@ -176,7 +193,6 @@ def get_active_session_count() -> int:
         print(f"✗ Error counting sessions: {e}")
         return 0
 
-# --- NEW FUNCTION ---
 def get_all_domains() -> list[str]:
     """Retrieves all domain names from the domains table."""
     if not supabase:
@@ -196,9 +212,7 @@ def get_all_domains() -> list[str]:
 def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame, list, dict]:
     """
     Load and pivot domain data from Supabase.
-    
-    *** MODIFIED ***
-    Now ONLY loads features AND items with status = 'active'.
+    (No changes needed in this function)
     """
     if not supabase:
         raise Exception("Supabase client not initialized")
@@ -214,7 +228,7 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
         domain_id = domain.data[0]['id']
         print(f"✓ Domain ID: {domain_id}")
         
-        # --- MODIFIED: Load only 'active' features ---
+        # Load only 'active' features
         domain_features_response = supabase.table("domain_features") \
             .select("features(id, feature_name, question_text)") \
             .eq("domain_id", domain_id) \
@@ -240,9 +254,7 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
         questions_map = {f['feature_name']: f['question_text'] for f in active_features_data if f.get('feature_name') and f.get('question_text')}
         print(f"✓ Question texts: {len(questions_map)}")
         
-        # --- *** MODIFICATION & FIX *** ---
         # Get all *ACTIVE* items only
-        # Fixed indentation on all chained methods.
         items = supabase.table("items") \
             .select("id,item_name") \
             .eq("domain_id", domain_id) \
@@ -252,7 +264,7 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
         
         if not items.data:
             print(f"⚠ No 'active' items found for domain '{domain_name}'. Engine will be empty.")
-            return pd.DataFrame(columns=['animal_name']), feature_id_to_name.values(), questions_map
+            return pd.DataFrame(columns=['animal_name']), list(feature_id_to_name.values()), questions_map
         
         item_id_to_name = {i['id']: i['item_name'] for i in items.data}
         item_ids = list(item_id_to_name.keys())
@@ -331,7 +343,6 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
                 })
                 items_with_features.add(row['item_id'])
         
-        # Add all items, even those without features, to the dataframe
         all_item_names = set(item_id_to_name.values())
         items_in_long_data = set(d['animal_name'] for d in long_data)
         missing_items = all_item_names - items_in_long_data
@@ -341,23 +352,25 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
             for item_name in missing_items:
                 long_data.append({
                     'animal_name': item_name,
-                    'feature_name': None, # This will create NaNs
+                    'feature_name': None, 
                     'value': None
                 })
         
+        feature_cols = [f for f in feature_id_to_name.values()]
+
         if not long_data:
             print("⚠ No data found, returning empty dataframe")
-            return pd.DataFrame(columns=['animal_name'] + feature_cols), feature_cols, questions_map
+            df_wide = pd.DataFrame({'animal_name': list(all_item_names)})
+            for col in feature_cols:
+                df_wide[col] = pd.NA
+            return df_wide, feature_cols, questions_map
         
         print("   Pivoting data...")
         df_long = pd.DataFrame(long_data)
-        
-        feature_cols = [f for f in feature_id_to_name.values()]
 
         if df_long.empty or 'feature_name' not in df_long.columns or df_long['feature_name'].isnull().all():
              print("   No feature data to pivot. Returning items list.")
              df_wide = pd.DataFrame({'animal_name': list(all_item_names)})
-             # Add empty feature columns
              for col in feature_cols:
                  df_wide[col] = pd.NA
              return df_wide, feature_cols, questions_map
@@ -380,11 +393,9 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
                 values='value'
             )
         
-        # Ensure all items are in the index
         df_wide = df_wide.reindex(all_item_names)
         df_wide = df_wide.reset_index().rename(columns={'index': 'animal_name'})
         
-        # Ensure all feature columns exist
         for col in feature_cols:
             if col not in df_wide.columns:
                 df_wide[col] = pd.NA
@@ -422,19 +433,17 @@ def _get_or_create_feature_id(feature_name: str, question_text: str = None) -> s
     """Helper to get or create a feature ID."""
     if not supabase: return None
     
-    # Try to find existing
     result = supabase.table("features").select("id").eq("feature_name", feature_name).limit(1).execute()
     if result.data:
         return result.data[0]['id']
     
-    # Not found, create it
     if not question_text:
         question_text = f"Does it have/is it {feature_name.replace('_', ' ')}?"
         
     insert_data = {
         "feature_name": feature_name,
         "question_text": question_text,
-        "status": "suggested" # Features are already suggested by default
+        "status": "suggested" 
     }
     result = supabase.table("features").insert(insert_data).execute()
     return result.data[0]['id'] if result.data else None
@@ -448,7 +457,6 @@ def _link_feature_to_domain(domain_id: str, feature_id: str):
             "feature_id": feature_id
         }).execute()
     except Exception as e:
-        # Ignore duplicate key errors, which are expected
         if "duplicate key value" not in str(e):
             print(f"Error linking feature to domain: {e}")
 
@@ -462,10 +470,7 @@ def _get_feature_map() -> dict:
 def persist_new_animal(animal_name: str, answered_features: dict, domain_name: str = "animals") -> str:
     """
     Insert new animal with its features.
-    
-    *** MODIFIED ***
-    New animals are now inserted with status = 'suggested'
-    and will NOT appear in the game until manually approved.
+    (No changes needed in this function)
     """
     if not supabase:
         return "error"
@@ -479,12 +484,10 @@ def persist_new_animal(animal_name: str, answered_features: dict, domain_name: s
             print(f"'{animal_name}' exists, saving as suggestion")
             return persist_suggestion(animal_name, answered_features, domain_name)
         
-        # --- *** MODIFICATION *** ---
-        # When inserting, set the status to 'suggested'
         item_res = supabase.table("items").insert({
             "item_name": animal_name,
             "domain_id": domain_id,
-            "status": "suggested"  # <-- ADD THIS LINE
+            "status": "suggested"
         }).execute()
         item_id = item_res.data[0]['id']
         
@@ -506,7 +509,7 @@ def persist_new_animal(animal_name: str, answered_features: dict, domain_name: s
             supabase.table("item_features").insert(rows).execute()
         
         print(f"✓ Inserted '{animal_name}' as 'suggested' with {len(rows)} features")
-        return "inserted_as_suggestion" # Changed return value
+        return "inserted_as_suggestion"
     
     except Exception as e:
         print(f"✗ Error persisting '{animal_name}': {e}")
@@ -514,7 +517,10 @@ def persist_new_animal(animal_name: str, answered_features: dict, domain_name: s
 
 
 def persist_suggestion(animal_name: str, answered_features: dict, domain_name: str = "animals") -> str:
-    """Update existing animal features with new votes."""
+    """
+    Update existing animal features with new votes.
+    (No changes needed in this function)
+    """
     if not supabase:
         return "error"
     
@@ -525,8 +531,6 @@ def persist_suggestion(animal_name: str, answered_features: dict, domain_name: s
         
         item_id = _get_item_id(domain_id, animal_name)
         if not item_id:
-            # This could happen if user is playing with a 'suggested' animal
-            # that got deleted, or a race condition.
             print(f"Warning: Voted for '{animal_name}' but it was not found. Ignoring vote.")
             return "error_item_not_found"
         
@@ -540,7 +544,6 @@ def persist_suggestion(animal_name: str, answered_features: dict, domain_name: s
             feature_id = feature_map[fname]
             
             try:
-                # Use upsert to handle both insert and update in one go
                 supabase.rpc('upsert_item_feature_vote', {
                     'p_item_id': item_id,
                     'p_feature_id': feature_id,
@@ -568,35 +571,30 @@ def persist_suggestion(animal_name: str, answered_features: dict, domain_name: s
         print(f"✗ Error persisting suggestion for '{animal_name}': {e}")
         return "error"
 
-# --- NEW FUNCTION ---
 def suggest_new_feature(domain_name: str, feature_name: str, question_text: str, item_name: str, fuzzy_value: float) -> dict:
     """
     Suggests a new feature, links it to a domain, and adds
     the first vote for a given item.
+    (No changes needed in this function)
     """
     if not supabase:
         return {"status": "error", "message": "Database not connected"}
     
     try:
-        # 1. Get Domain ID
         domain_id = _get_domain_id(domain_name)
         if not domain_id:
             return {"status": "error", "message": f"Domain '{domain_name}' not found"}
         
-        # 2. Get Item ID
         item_id = _get_item_id(domain_id, item_name)
         if not item_id:
             return {"status": "error", "message": f"Item '{item_name}' not found in domain '{domain_name}'"}
             
-        # 3. Get or Create Feature ID
         feature_id = _get_or_create_feature_id(feature_name, question_text)
         if not feature_id:
             return {"status": "error", "message": "Could not create or find feature"}
         
-        # 4. Link Feature to Domain (idempotent)
         _link_feature_to_domain(domain_id, feature_id)
         
-        # 5. Add the vote
         try:
             supabase.rpc('upsert_item_feature_vote', {
                 'p_item_id': item_id,
@@ -605,7 +603,6 @@ def suggest_new_feature(domain_name: str, feature_name: str, question_text: str,
                 'p_vote_count': 1
             }).execute()
         except Exception:
-            # Fallback if RPC doesn't exist (copy-paste from persist_suggestion)
             existing = supabase.table("item_features").select("value_sum,vote_count").eq("item_id", item_id).eq("feature_id", feature_id).execute()
             if existing.data:
                 new_sum = existing.data[0]['value_sum'] + float(fuzzy_value)
