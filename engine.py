@@ -3,21 +3,23 @@ import numpy as np
 
 class AkinatorEngine:
     """
-    IMPROVED V2.1: Stricter, more patient, and faster-converging engine.
+    IMPROVED V2.2: Stricter, no-force-guess, and faster-converging engine.
     
     Key changes based on user feedback:
-    1.  More Patient: 
-        - No guesses allowed before question 10 (was 8).
-        - Forced guess moved to question 30 (was 25).
+    1.  More Patient / No Forced Guess: 
+        - Removed all logic for FORCED_GUESS_AT. The engine will
+          ask questions until it is confident, however long it takes.
     2.  More Strict (Not Guessing): 
         - All guessing thresholds (probability, confidence ratio, entropy)
-          in 'should_make_guess' have been significantly increased.
-        - Contradiction penalties in 'update' are now 99.9% (0.001).
-    3.  Faster Convergence: 
-        - 'select_question' temperature is lowered to aggressively favor
-          the question with the highest information gain, reducing randomness.
-    4.  Fuzzy Map:
-        - Removed 'idk' and 'maybe' from the 0.5 ('sometimes') mapping.
+          in 'should_make_guess' have been increased *again* for
+          very high confidence.
+    3.  Faster Convergence / Lower Randomness: 
+        - 'select_question' temperature decays much faster, becoming
+          almost fully deterministic (picking the #1 best question)
+          by question 7.
+        - Only considers the Top 2 best questions for its choice.
+    4.  Faster Performance:
+        - Increased batch_size in select_question's gain calculation.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -26,11 +28,10 @@ class AkinatorEngine:
         self.questions_map = questions_map
         
         self.MAX_QUESTIONS = None
-        self.FORCED_GUESS_AT = 25  
+        # self.FORCED_GUESS_AT = 25 # <-- REMOVED
         
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         
-        ### MODIFIED ###
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0,
             'mostly': 0.75, 'usually': 0.75, 'probably': 0.75,
@@ -246,7 +247,7 @@ class AkinatorEngine:
         
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
-        IMPROVED: Lowered temperature to heavily favor the best question.
+        IMPROVED: Lower temp, faster decay, faster batching, fewer choices.
         """
         
         asked_set = set(asked_features)
@@ -284,15 +285,20 @@ class AkinatorEngine:
         if len(candidates_to_eval) == 0:
             return None, None
 
-        gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=64)
+        ### MODIFIED: Faster batch_size
+        gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=128)
         
         sorted_gain_indices = np.argsort(gains)[::-1]
-        top_n = min(3, len(sorted_gain_indices))
+        
+        ### MODIFIED: Less randomness (Top 2)
+        top_n = min(2, len(sorted_gain_indices))
+        
         top_local_indices = sorted_gain_indices[:top_n]
         top_gains = gains[top_local_indices]
         
-        # Lower temperature = less randomness, more likely to pick #1
-        temperature = max(0.1, 0.7 - (question_count * 0.05))
+        ### MODIFIED: Lower temp, faster decay
+        # Q0=0.5, Q3=0.26, Q5=0.1, Q7=0.01 (min)
+        temperature = max(0.01, 0.5 - (question_count * 0.08))
         
         exp_gains = np.exp((top_gains - np.max(top_gains)) / temperature)
         probs = exp_gains / np.sum(exp_gains)
@@ -350,7 +356,7 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        IMPROVED: Increased all thresholds, raised "no guess" floor to 10.
+        IMPROVED: Even higher thresholds, no forced guess.
         """
         q_count = game_state['question_count']
         
@@ -383,8 +389,8 @@ class AkinatorEngine:
                 avg_score = np.mean(cumulative_scores[plausible_mask])
                 score_std = np.std(cumulative_scores[plausible_mask])
                 
-                # Top animal score must be > (avg + 0.75 * std)
-                consistency_threshold = avg_score + (score_std * 0.75) # Was 0.5
+                ### MODIFIED: Stricter 1.0 std dev
+                consistency_threshold = avg_score + (score_std * 1.0) # Was 0.75
             else:
                 consistency_threshold = -np.inf
             
@@ -405,55 +411,32 @@ class AkinatorEngine:
                 game_state['questions_since_last_guess'] = 0
 
         
+        ### MODIFIED: Stricter thresholds
         # Q10-Q15: Very Strong
         if q_count < 15:
-            if top_prob > 0.98 and confidence_ratio > 300.0 and entropy < 0.2 and is_consistent:
+            if top_prob > 0.99 and confidence_ratio > 500.0 and entropy < 0.1 and is_consistent:
                 print(f"[Q{q_count}] VERY_STRONG: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
             
         # Q15-Q22: Confident
         elif q_count < 22:
-            if top_prob > 0.95 and confidence_ratio > 200.0 and entropy < 0.4 and is_consistent:
+            if top_prob > 0.98 and confidence_ratio > 350.0 and entropy < 0.4 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
         
-        # Q22-Q30: Regular confidence
-        elif q_count < self.FORCED_GUESS_AT:
-            if top_prob > 0.90 and confidence_ratio > 100.0 and entropy < 0.6 and is_consistent:
+        # Q22+ (Replaces "Regular" and "Late Game")
+        elif q_count >= 22:
+            if top_prob > 0.95 and confidence_ratio > 150.0 and entropy < 0.5 and is_consistent:
                 print(f"[Q{q_count}] LIKELY: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
 
-        # --- FORCED GUESS AT Q30 (was Q25) ---
-        if q_count == self.FORCED_GUESS_AT and not game_state.get('has_made_initial_guess', False):
-            if is_consistent:
-                print(f"[Q{q_count}] FORCED GUESS (Consistent): {top_animal} (prob={top_prob:.3f})")
-                game_state['has_made_initial_guess'] = True
-                return True, top_animal, 'initial' 
-            else:
-                # Fallback to best *score* instead of best *prob*
-                plausible_mask = (probs > 0.001) & (~game_state['rejected_mask'])
-                if np.any(plausible_mask) and cumulative_scores is not None:
-                    plausible_scores = cumulative_scores[plausible_mask]
-                    plausible_animals = self.animals[plausible_mask]
-                    best_idx = np.argmax(plausible_scores)
-                    best_animal = plausible_animals[best_idx]
-                    print(f"[Q{q_count}] FORCED GUESS (Fallback to best score): {best_animal}")
-                    game_state['has_made_initial_guess'] = True
-                    return True, best_animal, 'initial'
-                else:
-                    # Absolute fallback
-                    print(f"[Q{q_count}] FORCED GUESS (Absolute Fallback): {top_animal}")
-                    game_state['has_made_initial_guess'] = True
-                    return True, top_animal, 'initial'
-        
-        # --- LATE GAME (Q30+) ---
-        elif q_count > self.FORCED_GUESS_AT:
-            if top_prob > 0.80 and confidence_ratio > 25.0 and entropy < 0.8 and is_consistent:
-                print(f"[Q{q_count}] LATE-GAME GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
-                return True, top_animal, 'final'
+        # --- REMOVED ---
+        # FORCED GUESS logic block was here and is now gone.
+        # LATE GAME (Q30+) block was here and is now merged above.
+        # --- END REMOVED ---
     
         return False, None, None
     
@@ -504,7 +487,7 @@ class AkinatorEngine:
         
         if len(selected_indices) < num_features and len(self.allowed_feature_indices) >= num_features:
             remaining = np.setdiff1d(self.allowed_feature_indices, selected_indices).copy()
-            np.random.shuffle(remaining)
+            np.random_shuffle(remaining)
             needed = num_features - len(selected_indices)
             selected_indices = np.concatenate((selected_indices, remaining[:needed]))
             
