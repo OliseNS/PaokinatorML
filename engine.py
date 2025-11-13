@@ -326,9 +326,8 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        ### MODIFIED ###
-        REWRITTEN: Increased thresholds for more "patience" to prevent
-        rushing to an incorrect guess.
+        FIXED: Now checks if there are still highly informative questions before guessing.
+        This prevents premature guessing when defining questions haven't been asked yet.
         """
         q_count = game_state['question_count']
         
@@ -350,6 +349,7 @@ class AkinatorEngine:
         confidence_ratio = top_prob / (second_prob + 1e-9)
         entropy = self._calculate_entropy(probs)
         
+        # --- CONSISTENCY CHECK (unchanged) ---
         cumulative_scores = game_state.get('cumulative_scores')
         is_consistent = False
         if cumulative_scores is not None and q_count > 0:
@@ -359,13 +359,6 @@ class AkinatorEngine:
             if np.sum(plausible_mask) > 1:
                 avg_score = np.mean(cumulative_scores[plausible_mask])
                 score_std = np.std(cumulative_scores[plausible_mask])
-                
-                ### MODIFIED ###
-                # Relaxed from 1.5 to 0.5.
-                # This prevents rejecting a "logically correct" guess that
-                # isn't yet dominating the scores. It makes the engine
-                # trust its top pick more, if that pick is at least
-                # reasonably above average.
                 consistency_threshold = avg_score + (score_std * 0.5) 
             else:
                 consistency_threshold = -np.inf
@@ -374,9 +367,9 @@ class AkinatorEngine:
                 is_consistent = True
             else:
                 print(f"[GUESS] REJECTED: {top_animal} prob={top_prob:.2f}, "
-                      f"score={top_animal_score:.2f} below threshold={consistency_threshold:.2f}")
+                    f"score={top_animal_score:.2f} below threshold={consistency_threshold:.2f}")
         elif q_count > 0:
-             is_consistent = True
+            is_consistent = True
         
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 3:
@@ -385,11 +378,43 @@ class AkinatorEngine:
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # --- ### MODIFIED ###: Progressive Thresholds (Made MORE PATIENT) ---
+        # --- NEW: QUESTION QUALITY CHECK ---
+        # Before guessing, check if there are still highly informative questions
+        if q_count >= 8 and q_count < 20:  # Only do this check in mid-game
+            asked_features = set(game_state.get('asked_features', []))
+            candidates_indices = [idx for idx in self.allowed_feature_indices  
+                                if self.feature_cols[idx] not in asked_features]
+            
+            if len(candidates_indices) > 0:
+                # Sample up to 50 candidates to check
+                check_size = min(50, len(candidates_indices))
+                if len(candidates_indices) > 50:
+                    check_candidates = np.random.choice(
+                        candidates_indices, 
+                        size=check_size, 
+                        replace=False
+                    )
+                else:
+                    check_candidates = np.array(candidates_indices)
+                
+                # Calculate information gain for these candidates
+                gains = self._compute_gains_batched(probs, check_candidates, batch_size=32)
+                max_gain = np.max(gains) if len(gains) > 0 else 0.0
+                
+                # If there's a question with very high information gain, don't guess yet
+                # Scale threshold with entropy: more uncertainty = higher threshold
+                gain_threshold = 0.3 + (entropy * 0.2)  # Range: 0.3 to 0.5+
+                
+                if max_gain > gain_threshold:
+                    print(f"[GUESS] DEFERRED: High-value question available "
+                        f"(gain={max_gain:.3f} > threshold={gain_threshold:.3f})")
+                    return False, None, None
+        # --- END QUESTION QUALITY CHECK ---
+
+        # --- Progressive Thresholds (unchanged) ---
         
         # Q8-Q12: Very High confidence needed
         if q_count < 12:
-            # Was: 0.95 prob, 100.0 ratio, 0.25 entropy
             if top_prob > 0.99 and confidence_ratio > 300.0 and entropy < 0.1 and is_consistent:
                 print(f"[Q{q_count}] STRONG: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
@@ -397,7 +422,6 @@ class AkinatorEngine:
             
         # Q12-Q20: High confidence
         elif q_count < 20:
-            # Was: 0.90 prob, 50.0 ratio, 0.5 entropy
             if top_prob > 0.98 and confidence_ratio > 150.0 and entropy < 0.25 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
@@ -405,13 +429,12 @@ class AkinatorEngine:
         
         # Q20-Q25: Regular confidence
         elif q_count < self.FORCED_GUESS_AT:
-            # Was: 0.85 prob, 25.0 ratio, 0.75 entropy
             if top_prob > 0.95 and confidence_ratio > 75.0 and entropy < 0.5 and is_consistent:
                 print(f"[Q{q_count}] LIKELY: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
 
-        # --- FORCED GUESS AT Q25 (Unchanged) ---
+        # --- FORCED GUESS AT Q25 (unchanged) ---
         if q_count == self.FORCED_GUESS_AT and not game_state.get('has_made_initial_guess', False):
             if is_consistent:
                 print(f"[Q{q_count}] FORCED GUESS (Consistent): {top_animal} (prob={top_prob:.3f})")
@@ -432,14 +455,13 @@ class AkinatorEngine:
                     game_state['has_made_initial_guess'] = True
                     return True, top_animal, 'initial'
         
-        # --- LATE GAME (Q25+) (Unchanged) ---
+        # --- LATE GAME (Q25+) (unchanged) ---
         elif q_count > self.FORCED_GUESS_AT:
             if top_prob > 0.75 and confidence_ratio > 15.0 and entropy < 1.0 and is_consistent:
                 print(f"[Q{q_count}] LATE-GAME GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
-        
+    
         return False, None, None
-
     def get_features_for_data_collection(self, item_name, num_features=5):
         """
         Gets features for data collection.
