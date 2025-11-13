@@ -277,7 +277,7 @@ class AkinatorEngine:
         top_gains = gains[top_local_indices]
         
         # Q0=1.5, Q1=1.2, Q2=0.9, Q3=0.6, Q4=0.3, Q5=0.01 (min)
-        temperature = max(0.01, 1.5 - (question_count * 0.3))
+        temperature = max(0.01, 15 - (question_count * 5))
         
         exp_gains = np.exp((top_gains - np.max(top_gains)) / (temperature + 1e-5))
         probs = exp_gains / np.sum(exp_gains)
@@ -357,7 +357,6 @@ class AkinatorEngine:
         confidence_ratio = top_prob / (second_prob + 1e-9)
         entropy = self._calculate_entropy(probs)
         
-        # --- CONSISTENCY CHECK (Strict) ---
         cumulative_scores = game_state.get('cumulative_scores')
         is_consistent = False
         if cumulative_scores is not None and q_count > 0:
@@ -391,27 +390,21 @@ class AkinatorEngine:
         
         # Stricter thresholds
         # Q12-Q15: "Perfect"
-        if q_count < 15:
-            if top_prob > 0.995 and confidence_ratio > 750.0 and entropy < 0.05 and is_consistent:
+        if q_count < 25:
+            if top_prob > 0.995 and confidence_ratio > 900.0 and entropy < 0.005 and is_consistent:
                 print(f"[Q{q_count}] PERFECT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
             
-        # Q15-Q22: "Very Strong"
-        elif q_count < 22:
-            if top_prob > 0.99 and confidence_ratio > 500.0 and entropy < 0.2 and is_consistent:
-                print(f"[Q{q_count}] VERY_STRONG: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
-                game_state['has_made_initial_guess'] = True
-                return True, top_animal, 'final'
         
         # Q22+ "Confident"
         elif q_count >= 22:
-            if top_prob > 0.98 and confidence_ratio > 300.0 and entropy < 0.3 and is_consistent:
+            if top_prob > 0.99 and confidence_ratio > 900.0 and entropy < 0.003 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
 
-        # No forced guess, engine will continue asking.
+        # No forced guess, engine will continue until it gets it or until the user gets tired.
         
         return False, None, None
     
