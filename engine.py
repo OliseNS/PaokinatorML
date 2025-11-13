@@ -391,7 +391,7 @@ class AkinatorEngine:
         # Stricter thresholds
         # Q12-Q15: "Perfect"
         if q_count < 25:
-            if top_prob > 0.995 and confidence_ratio > 900.0 and entropy < 0.005 and is_consistent:
+            if top_prob > 0.995 and confidence_ratio > 600.0 and entropy < 0.05 and is_consistent:
                 print(f"[Q{q_count}] PERFECT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
@@ -399,7 +399,7 @@ class AkinatorEngine:
         
         # Q22+ "Confident"
         elif q_count >= 22:
-            if top_prob > 0.99 and confidence_ratio > 900.0 and entropy < 0.003 and is_consistent:
+            if top_prob > 0.99 and confidence_ratio > 400.0 and entropy < 0.03 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
