@@ -370,21 +370,21 @@ class AkinatorEngine:
         
         # Q0-Q10: Almost impossible (only slam dunks)
         if q_count < 10:
-            if top_prob > 0.98 and confidence_ratio > 400.0 and entropy < 0.08 and is_consistent:
+            if top_prob > 1 and confidence_ratio > 500.0 and entropy < 0.20 and is_consistent:
                 print(f"[Q{q_count}] SLAM DUNK: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Q10-Q15: Very high confidence needed
         if q_count < 15:
-            if top_prob > 0.92 and confidence_ratio > 120.0 and entropy < 0.25 and is_consistent:
+            if top_prob > 0.98 and confidence_ratio > 300.0 and entropy < 0.15 and is_consistent:
                 print(f"[Q{q_count}] STRONG: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Q15-Q20: Moderate confidence
         if q_count < self.FORCED_GUESS_AT:
-            if top_prob > 0.85 and confidence_ratio > 50.0 and entropy < 0.5 and is_consistent:
+            if top_prob > 0.96 and confidence_ratio > 100.0 and entropy < 0.10 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
             return False, None, None
