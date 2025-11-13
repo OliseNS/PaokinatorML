@@ -316,7 +316,7 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        COMPLETELY REWRITTEN: Progressive thresholds + forced guess at Q20.
+        COMPLETELY REWRITTEN: Progressive thresholds + NO forced guess. More patient.
         """
         q_count = game_state['question_count']
         
@@ -366,52 +366,34 @@ class AkinatorEngine:
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # === NEW PROGRESSIVE THRESHOLDS ===
-        
-        # Q0-Q10: Almost impossible (only slam dunks)
+        # Q0-Q10: "Slam Dunk" - requires near-perfect confidence
         if q_count < 10:
-            if top_prob > 1 and confidence_ratio > 500.0 and entropy < 0.20 and is_consistent:
+            if top_prob > 0.999 and confidence_ratio > 500.0 and entropy < 0.20 and is_consistent:
                 print(f"[Q{q_count}] SLAM DUNK: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
             return False, None, None
         
         # Q10-Q15: Very high confidence needed
         if q_count < 15:
-            if top_prob > 0.98 and confidence_ratio > 300.0 and entropy < 0.15 and is_consistent:
+            if top_prob > 0.99 and confidence_ratio > 400.0 and entropy < 0.10 and is_consistent:
                 print(f"[Q{q_count}] STRONG: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
             return False, None, None
         
-        # Q15-Q20: Moderate confidence
-        if q_count < self.FORCED_GUESS_AT:
-            if top_prob > 0.96 and confidence_ratio > 100.0 and entropy < 0.10 and is_consistent:
+        # Q15-Q25: High confidence, but more patient than before
+        if q_count < 25:
+            if top_prob > 0.98 and confidence_ratio > 150.0 and entropy < 0.10 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
             return False, None, None
         
-        # Q20: FORCED GUESS (user can continue if wrong)
-        if q_count == self.FORCED_GUESS_AT:
-            if is_consistent:
-                print(f"[Q20] FORCED GUESS: {top_animal} (prob={top_prob:.3f})")
-                return True, top_animal, 'final'
-            else:
-                # Find most consistent item if top isn't consistent
-                plausible_mask = (probs > 0.001) & (~game_state['rejected_mask'])
-                if np.any(plausible_mask):
-                    plausible_scores = cumulative_scores[plausible_mask]
-                    plausible_animals = self.animals[plausible_mask]
-                    best_idx = np.argmax(plausible_scores)
-                    best_animal = plausible_animals[best_idx]
-                    print(f"[Q20] FORCED GUESS (fallback): {best_animal}")
-                    return True, best_animal, 'final'
-                else:
-                    print(f"[Q20] FORCED GUESS (no fallback): {top_animal}")
-                    return True, top_animal, 'final'
+        # --- REMOVED: FORCED GUESS AT Q20 ---
+        # The block that forced a guess at self.FORCED_GUESS_AT is deleted.
         
-        # Q21-Q35: After continue, lower threshold
+        # Q25-Q35: After continue, or after many questions
         if q_count < self.MAX_QUESTIONS:
-            if top_prob > 0.75 and confidence_ratio > 20.0 and entropy < 0.8 and is_consistent:
-                print(f"[Q{q_count}] POST-CONTINUE: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+            if top_prob > 0.80 and confidence_ratio > 25.0 and entropy < 0.8 and is_consistent:
+                print(f"[Q{q_count}] POST-CONTINUE/LATE-GAME: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
             return False, None, None
         

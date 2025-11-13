@@ -238,35 +238,12 @@ class AkinatorService:
             feature, q = engine.select_question(prior, asked, q_count)
             return feature, q, game_state
         
-        # Calculate metrics for strategy decision
-        top_idx = np.argmax(prior)
-        top_prob = prior[top_idx]
-        
-        rival_threshold = top_prob * 0.3  # Items within 30% of top probability
-        num_rivals = np.sum((prior > rival_threshold) & (np.arange(len(prior)) != top_idx))
-        
-        entropy = engine._calculate_entropy(prior)
-        
-        should_disambiguate = (
-            top_prob > 0.20 and 
-            2 <= num_rivals <= 10 and 
-            entropy < 3.0 and 
-            q_count > 8
-        )
-        
-        if should_disambiguate:
-            print(f"[Question] DISAMBIGUATE: top_prob={top_prob:.3f}, rivals={num_rivals}, entropy={entropy:.2f}")
-            
-            # Try to find a discriminative question
-            feature, q = engine.get_discriminative_question(top_idx, prior, asked)
-            
-            if feature and q:
-                print(f"  → Found discriminative question: {q[:60]}...")
-                return feature, q, game_state
-            else:
-                print(f"  → No discriminative question found, falling back to exploration")
+        # --- MODIFIED: REMOVED DISAMBIGUATION PHASE ---
+        # The logic for `should_disambiguate` has been removed.
+        # We now *always* use the exploration strategy, as requested.
         
         # --- EXPLORATION STRATEGY (default) ---
+        entropy = engine._calculate_entropy(prior)
         print(f"[Question] EXPLORE: Finding best split across {np.sum(prior > 0.001):.0f} items (entropy={entropy:.2f})")
         feature, q = engine.select_question(prior, asked, q_count)
         
