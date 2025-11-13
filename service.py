@@ -221,8 +221,10 @@ class AkinatorService:
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
         """
-        Gets the next question using Information Gain, driven by
-        on-the-fly probabilities.
+        ### MODIFIED (Based on your insight) ###
+        Gets the next question. If confidence is high, it switches
+        to a "confirmation" strategy to ask a discriminative question.
+        Otherwise, it uses the "exploration" (information gain) strategy.
         """
         # --- REFACTORED ---
         # Get on-the-fly probs to use as the 'prior' for info gain
@@ -238,12 +240,22 @@ class AkinatorService:
             feature, q = engine.select_question(prior, asked, q_count)
             return feature, q, game_state
         
-        # --- MODIFIED: REMOVED DISAMBIGUATION PHASE ---
-        # The logic for `should_disambiguate` has been removed.
-        # We now *always* use the exploration strategy, as requested.
+        # --- NEW: "CONFIRMATION" STRATEGY (Your "Akinator Knows" insight) ---
+        top_prob = np.max(prior)
+        entropy = engine._calculate_entropy(prior)
+        
+        # If confidence is high (e.g., >70% prob, low entropy),
+        # try to find a "confirmation" question.
+        if top_prob > 0.70 and entropy < 1.2 and q_count > 5:
+            top_idx = np.argmax(prior)
+            feature, q = engine.get_discriminative_question(top_idx, prior, asked)
+            
+            if feature:
+                print(f"[Question] CONFIRM: Asking discriminative question for {engine.animals[top_idx]} (prob={top_prob:.2f})")
+                return feature, q, game_state
+            # If no good confirmation question found, fall through to exploration
         
         # --- EXPLORATION STRATEGY (default) ---
-        entropy = engine._calculate_entropy(prior)
         print(f"[Question] EXPLORE: Finding best split across {np.sum(prior > 0.001):.0f} items (entropy={entropy:.2f})")
         feature, q = engine.select_question(prior, asked, q_count)
         

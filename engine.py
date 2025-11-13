@@ -100,7 +100,11 @@ class AkinatorEngine:
         return -np.sum(p * np.log2(p))
 
     def _compute_gains_batched(self, prior: np.ndarray, feature_indices: np.ndarray, batch_size: int = 64) -> np.ndarray:
-        """Memory-optimized Information Gain calculation."""
+        """
+        ### OPTIMIZED ###
+        Memory-optimized Information Gain calculation.
+        Vectorized entropy calculation for speed.
+        """
         n_features = len(feature_indices)
         n_answers = len(self.answer_values)
         gains = np.zeros(n_features, dtype=np.float32)
@@ -112,12 +116,14 @@ class AkinatorEngine:
         active_mask = prior > 1e-6
         n_active = np.sum(active_mask)
         
-        if n_active < len(prior) * 0.1 and n_active > 0:
+        # --- OPTIMIZATION ---
+        # Use the 'active' slice if we've eliminated at least 20% of items
+        if n_active < len(prior) * 0.8 and n_active > 0:
             active_prior = prior[active_mask]
             active_prior = active_prior / active_prior.sum()
         else:
             active_prior = prior
-            active_mask = slice(None)
+            active_mask = slice(None) # Use all items
             n_active = len(prior)
 
         if n_active == 0:
@@ -132,26 +138,42 @@ class AkinatorEngine:
             f_batch_filled = np.nan_to_num(f_batch, nan=0.5)
             f_batch_quant = np.clip(np.rint(f_batch_filled * 40), 0, 40).astype(np.int8)
 
+            # (n_active, batch_size, n_answers)
             likelihoods = self.likelihood_table[f_batch_quant]
 
             nan_batch_mask = np.isnan(f_batch)
             nan_expand = np.repeat(nan_batch_mask[:, :, np.newaxis], n_answers, axis=2)
-            likelihoods[nan_expand] = 1.0
+            likelihoods[nan_expand] = 1.0 # (n_active, batch_size, n_answers)
 
             batch_gains = np.zeros(len(batch_indices), dtype=np.float32)
             
             for f_local_idx in range(len(batch_indices)):
-                L_f = likelihoods[:, f_local_idx, :]
+                L_f = likelihoods[:, f_local_idx, :] # (n_active, n_answers)
                 
+                # Probability of each answer given the feature
+                # (n_active,) @ (n_active, n_answers) -> (n_answers,)
                 p_answers = active_prior @ L_f
                 
-                expected_entropy = 0.0
-                for a_idx in range(n_answers):
-                    p_a = p_answers[a_idx]
-                    if p_a > 1e-7:
-                        post = active_prior * L_f[:, a_idx]
-                        post /= p_a
-                        expected_entropy += p_a * self._calculate_entropy(post)
+                # --- OPTIMIZATION: Vectorized Entropy Calculation ---
+                # (n_active, 1) * (n_active, n_answers) -> (n_active, n_answers)
+                posteriors = active_prior[:, np.newaxis] * L_f
+                # (n_active, n_answers) / (n_answers,) -> (n_active, n_answers)
+                posteriors /= (p_answers + 1e-10)
+                
+                # Clip for log
+                posteriors = np.clip(posteriors, 1e-10, 1.0)
+                
+                # (n_active, n_answers)
+                p_logs = np.log2(posteriors)
+                
+                # Sum over animals (axis 0) to get entropy for each answer
+                # -sum(p*log(p))
+                # (n_answers,)
+                entropies_per_answer = -np.sum(posteriors * p_logs, axis=0)
+                
+                # (n_answers,) @ (n_answers,) -> scalar
+                expected_entropy = p_answers @ entropies_per_answer
+                # --- END OPTIMIZATION ---
                 
                 batch_gains[f_local_idx] = current_entropy - expected_entropy
 
@@ -297,7 +319,12 @@ class AkinatorEngine:
         rival_indices = np.where(rival_mask)[0]
         
         if len(rival_indices) == 0:
-            return None, None
+            # No significant rivals, but let's just find a question
+            # that the top animal is very "sure" about.
+            rival_indices = np.where(prior > 0.001)[0]
+            rival_indices = rival_indices[rival_indices != top_animal_idx]
+            if len(rival_indices) == 0:
+                 return None, None # Only one animal left
             
         asked_set = set(asked_features)
         candidate_indices = [idx for idx in self.allowed_feature_indices 
@@ -315,9 +342,13 @@ class AkinatorEngine:
         
         diffs = np.abs(np.nan_to_num(top_feats, nan=0.5) - np.nan_to_num(avg_rival_feats, nan=0.5))
         
-        best_local_idx = np.argmax(diffs)
+        # Prioritize questions where the top animal has a strong opinion (not 0.5)
+        opinion_strength = 1.0 + np.abs(np.nan_to_num(top_feats, nan=0.5) - 0.5) # Range 1.0 to 1.5
+        weighted_diffs = diffs * opinion_strength
         
-        if diffs[best_local_idx] > 0.35:
+        best_local_idx = np.argmax(weighted_diffs)
+        
+        if weighted_diffs[best_local_idx] > 0.35: # 0.35 is the original diffs threshold
             best_feat_idx = candidate_indices[best_local_idx]
             feature_name = self.feature_cols[best_feat_idx]
             return feature_name, self.questions_map.get(feature_name, f"Does it have {feature_name}?")
@@ -326,8 +357,10 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        FIXED: Now checks if there are still highly informative questions before guessing.
-        This prevents premature guessing when defining questions haven't been asked yet.
+        ### MODIFIED ###
+        - Relaxed consistency check to prevent rejecting good answers.
+        - Lowered thresholds to be more reasonable.
+        - Removed [GUESS] DEFERRED block (now handled by service.py)
         """
         q_count = game_state['question_count']
         
@@ -349,7 +382,7 @@ class AkinatorEngine:
         confidence_ratio = top_prob / (second_prob + 1e-9)
         entropy = self._calculate_entropy(probs)
         
-        # --- CONSISTENCY CHECK (unchanged) ---
+        # --- CONSISTENCY CHECK (Relaxed) ---
         cumulative_scores = game_state.get('cumulative_scores')
         is_consistent = False
         if cumulative_scores is not None and q_count > 0:
@@ -359,7 +392,11 @@ class AkinatorEngine:
             if np.sum(plausible_mask) > 1:
                 avg_score = np.mean(cumulative_scores[plausible_mask])
                 score_std = np.std(cumulative_scores[plausible_mask])
-                consistency_threshold = avg_score + (score_std * 0.5) 
+                
+                # --- MODIFIED ---
+                # OLD: avg_score + (score_std * 0.5) (Very strict)
+                # NEW: Don't reject unless it's *worse* than average
+                consistency_threshold = avg_score - (score_std * 0.25)
             else:
                 consistency_threshold = -np.inf
             
@@ -367,7 +404,7 @@ class AkinatorEngine:
                 is_consistent = True
             else:
                 print(f"[GUESS] REJECTED: {top_animal} prob={top_prob:.2f}, "
-                    f"score={top_animal_score:.2f} below threshold={consistency_threshold:.2f}")
+                    f"score={top_animal_score:.2f} below relaxed_threshold={consistency_threshold:.2f}")
         elif q_count > 0:
             is_consistent = True
         
@@ -378,58 +415,33 @@ class AkinatorEngine:
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # --- NEW: QUESTION QUALITY CHECK ---
-        # Before guessing, check if there are still highly informative questions
-        if q_count >= 8 and q_count < 20:  # Only do this check in mid-game
-            asked_features = set(game_state.get('asked_features', []))
-            candidates_indices = [idx for idx in self.allowed_feature_indices  
-                                if self.feature_cols[idx] not in asked_features]
-            
-            if len(candidates_indices) > 0:
-                # Sample up to 50 candidates to check
-                check_size = min(50, len(candidates_indices))
-                if len(candidates_indices) > 50:
-                    check_candidates = np.random.choice(
-                        candidates_indices, 
-                        size=check_size, 
-                        replace=False
-                    )
-                else:
-                    check_candidates = np.array(candidates_indices)
-                
-                # Calculate information gain for these candidates
-                gains = self._compute_gains_batched(probs, check_candidates, batch_size=32)
-                max_gain = np.max(gains) if len(gains) > 0 else 0.0
-                
-                # If there's a question with very high information gain, don't guess yet
-                # Scale threshold with entropy: more uncertainty = higher threshold
-                gain_threshold = 0.3 + (entropy * 0.2)  # Range: 0.3 to 0.5+
-                
-                if max_gain > gain_threshold:
-                    print(f"[GUESS] DEFERRED: High-value question available "
-                        f"(gain={max_gain:.3f} > threshold={gain_threshold:.3f})")
-                    return False, None, None
-        # --- END QUESTION QUALITY CHECK ---
+        # --- REMOVED: QUESTION QUALITY CHECK ---
+        # This is now handled proactively by get_next_question in service.py
+        # which will ask high-gain questions *before* we get here.
+        # --- END REMOVED BLOCK ---
 
-        # --- Progressive Thresholds (unchanged) ---
+        # --- Progressive Thresholds (Lowered) ---
         
-        # Q8-Q12: Very High confidence needed
+        # Q8-Q12: High confidence needed
         if q_count < 12:
-            if top_prob > 0.99 and confidence_ratio > 300.0 and entropy < 0.1 and is_consistent:
+            # OLD: 0.99 / 300.0 / 0.1
+            if top_prob > 0.95 and confidence_ratio > 150.0 and entropy < 0.5 and is_consistent:
                 print(f"[Q{q_count}] STRONG: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
             
-        # Q12-Q20: High confidence
+        # Q12-Q20: Confident
         elif q_count < 20:
-            if top_prob > 0.98 and confidence_ratio > 150.0 and entropy < 0.25 and is_consistent:
+            # OLD: 0.98 / 150.0 / 0.25
+            if top_prob > 0.90 and confidence_ratio > 100.0 and entropy < 0.75 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
         
         # Q20-Q25: Regular confidence
         elif q_count < self.FORCED_GUESS_AT:
-            if top_prob > 0.95 and confidence_ratio > 75.0 and entropy < 0.5 and is_consistent:
+            # OLD: 0.95 / 75.0 / 0.5
+            if top_prob > 0.85 and confidence_ratio > 50.0 and entropy < 1.0 and is_consistent:
                 print(f"[Q{q_count}] LIKELY: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
