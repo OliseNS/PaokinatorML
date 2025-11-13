@@ -3,13 +3,16 @@ import numpy as np
 
 class AkinatorEngine:
     """
-    IMPROVED: Fuzzy Logic Expert System Engine with faster convergence.
+    IMPROVED: Fuzzy Logic Expert System Engine with better patience and logic.
     
-    Key changes based on user request:
-    1. Faster convergence: Guessing thresholds are lowered to be less patient.
-    2. No guess before Q8: Hard-coded rule prevents guesses from Q0-Q7.
-    3. Forced guess at Q25: Re-implemented forced guess if no guess made by Q25.
-    4. No max questions: Removed the Q35 timeout for infinite play.
+    Key changes based on user feedback:
+    1.  More Patient: Guessing thresholds are significantly increased to prevent "rushing".
+    2.  More Logical Guesses: Consistency check is relaxed slightly to prevent
+        rejection of a correct, but not-yet-dominant, answer.
+    3.  Smarter Question Selection: Removed fixed-interval sparse questions (Q8, Q15).
+        All questions, including new/sparse ones, now compete based on
+        information gain, which should help new questions get asked.
+    4.  Kept Randomness: The initial question selection sampling (for UX) is preserved.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -17,8 +20,7 @@ class AkinatorEngine:
         self.feature_cols = np.array(feature_cols)
         self.questions_map = questions_map
         
-        # Set per user request
-        self.MAX_QUESTIONS = None  # No upper limit
+        self.MAX_QUESTIONS = None
         self.FORCED_GUESS_AT = 25  
         
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
@@ -31,7 +33,8 @@ class AkinatorEngine:
             'no': 0.0, 'n': 0.0,
         }
 
-        self.sparse_questions_asked = set()
+        ### MODIFIED ###
+        # self.sparse_questions_asked = set()  # <-- This is no longer needed
         
         self._precompute_likelihood_tables()
         self._build_arrays()
@@ -187,7 +190,12 @@ class AkinatorEngine:
         return new_cumulative_scores
 
     def get_sparse_question_for_game(self, prior: np.ndarray, asked_features_names: set) -> tuple[str, str]:
-        """Find the most useful sparse question to ask right now."""
+        """
+        Find the most useful sparse question to ask right now.
+        NOTE: This function is no longer called by select_question()
+        but is kept in case it's used by other parts of the system
+        (or for future data collection logic).
+        """
         
         candidates_to_eval = [
             idx for idx in self.sparse_indices
@@ -212,18 +220,21 @@ class AkinatorEngine:
         
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
-        IMPROVED: Sparse questions at Q8 and Q15 (not Q6/Q12).
+        ### MODIFIED ###
+        IMPROVED: Removed fixed-interval sparse questions.
+        All questions (including new/sparse) are now evaluated on information gain.
+        This allows new questions to be asked as soon as their gain is high enough.
         """
         
-        if question_count == 8 or question_count == 15:
-            asked_set_for_sparse = set(asked_features) | self.sparse_questions_asked
-            sparse_feat, sparse_q = self.get_sparse_question_for_game(prior, asked_set_for_sparse)
-            if sparse_feat:
-                self.sparse_questions_asked.add(sparse_feat)
-                print(f"[Question] Asking sparse Q{question_count}: {sparse_feat}")
-                return sparse_feat, sparse_q
+        ### MODIFIED ###
+        # The block that forced sparse questions at Q8 and Q15 has been removed.
         
         asked_set = set(asked_features)
+        
+        ### MODIFIED ###
+        # This list now *naturally* includes all allowed features:
+        # normal features, sparse features, and new features.
+        # They will all be evaluated by information gain.
         candidates_indices = [idx for idx in self.allowed_feature_indices  
                               if self.feature_cols[idx] not in asked_set]
 
@@ -231,6 +242,7 @@ class AkinatorEngine:
             print("[Question] No more features to ask.")
             return None, None
 
+        # This sampling logic is preserved as requested for UX.
         if len(candidates_indices) > 100:
             scored_candidates = []
             for idx in candidates_indices:
@@ -314,7 +326,9 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        REWRITTEN: Faster convergence, no guess before Q8, forced guess at Q25, no max.
+        ### MODIFIED ###
+        REWRITTEN: Increased thresholds for more "patience" to prevent
+        rushing to an incorrect guess.
         """
         q_count = game_state['question_count']
         
@@ -336,7 +350,6 @@ class AkinatorEngine:
         confidence_ratio = top_prob / (second_prob + 1e-9)
         entropy = self._calculate_entropy(probs)
         
-        # STRICTER CONSISTENCY CHECK (from user code)
         cumulative_scores = game_state.get('cumulative_scores')
         is_consistent = False
         if cumulative_scores is not None and q_count > 0:
@@ -346,8 +359,14 @@ class AkinatorEngine:
             if np.sum(plausible_mask) > 1:
                 avg_score = np.mean(cumulative_scores[plausible_mask])
                 score_std = np.std(cumulative_scores[plausible_mask])
-                # MUCH STRICTER: 1.5 std dev above average (was 0.5)
-                consistency_threshold = avg_score + (score_std * 1.5) 
+                
+                ### MODIFIED ###
+                # Relaxed from 1.5 to 0.5.
+                # This prevents rejecting a "logically correct" guess that
+                # isn't yet dominating the scores. It makes the engine
+                # trust its top pick more, if that pick is at least
+                # reasonably above average.
+                consistency_threshold = avg_score + (score_std * 0.5) 
             else:
                 consistency_threshold = -np.inf
             
@@ -356,52 +375,49 @@ class AkinatorEngine:
             else:
                 print(f"[GUESS] REJECTED: {top_animal} prob={top_prob:.2f}, "
                       f"score={top_animal_score:.2f} below threshold={consistency_threshold:.2f}")
-        elif q_count > 0: # If scores aren't present yet but we've asked questions
+        elif q_count > 0:
              is_consistent = True
         
-        # Continue mode logic (from user code)
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 3:
                 return False, None, None
             else:
-                # Ready to guess again after continuing
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # --- Progressive Thresholds (Made FASTER) ---
+        # --- ### MODIFIED ###: Progressive Thresholds (Made MORE PATIENT) ---
         
-        # Q8-Q10: High confidence needed
-        if q_count < 10:
-            # Was: 0.999 prob, 500.0 ratio
-            if top_prob > 0.95 and confidence_ratio > 100.0 and entropy < 0.25 and is_consistent:
+        # Q8-Q12: Very High confidence needed
+        if q_count < 12:
+            # Was: 0.95 prob, 100.0 ratio, 0.25 entropy
+            if top_prob > 0.99 and confidence_ratio > 300.0 and entropy < 0.1 and is_consistent:
                 print(f"[Q{q_count}] STRONG: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
             
-        # Q10-Q15: Medium-High confidence
-        elif q_count < 15:
-            # Was: 0.99 prob, 400.0 ratio
-            if top_prob > 0.90 and confidence_ratio > 50.0 and entropy < 0.5 and is_consistent:
+        # Q12-Q20: High confidence
+        elif q_count < 20:
+            # Was: 0.90 prob, 50.0 ratio, 0.5 entropy
+            if top_prob > 0.98 and confidence_ratio > 150.0 and entropy < 0.25 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
         
-        # Q15-Q25: Regular confidence
+        # Q20-Q25: Regular confidence
         elif q_count < self.FORCED_GUESS_AT:
-            # Was: 0.98 prob, 150.0 ratio
-            if top_prob > 0.85 and confidence_ratio > 25.0 and entropy < 0.75 and is_consistent:
+            # Was: 0.85 prob, 25.0 ratio, 0.75 entropy
+            if top_prob > 0.95 and confidence_ratio > 75.0 and entropy < 0.5 and is_consistent:
                 print(f"[Q{q_count}] LIKELY: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
 
-        # --- FORCED GUESS AT Q25 ---
+        # --- FORCED GUESS AT Q25 (Unchanged) ---
         if q_count == self.FORCED_GUESS_AT and not game_state.get('has_made_initial_guess', False):
             if is_consistent:
                 print(f"[Q{q_count}] FORCED GUESS (Consistent): {top_animal} (prob={top_prob:.3f})")
                 game_state['has_made_initial_guess'] = True
-                return True, top_animal, 'initial' # Use 'initial' to signal it's a forced guess
+                return True, top_animal, 'initial' 
             else:
-                # Fallback to most consistent if top is inconsistent
                 plausible_mask = (probs > 0.001) & (~game_state['rejected_mask'])
                 if np.any(plausible_mask) and cumulative_scores is not None:
                     plausible_scores = cumulative_scores[plausible_mask]
@@ -412,26 +428,25 @@ class AkinatorEngine:
                     game_state['has_made_initial_guess'] = True
                     return True, best_animal, 'initial'
                 else:
-                    # Absolute fallback
                     print(f"[Q{q_count}] FORCED GUESS (Absolute Fallback): {top_animal}")
                     game_state['has_made_initial_guess'] = True
                     return True, top_animal, 'initial'
         
-        # --- LATE GAME (Q25+) ---
-        # Handles all cases after Q25, forever.
+        # --- LATE GAME (Q25+) (Unchanged) ---
         elif q_count > self.FORCED_GUESS_AT:
-            # Make it easier to re-guess after continuing
             if top_prob > 0.75 and confidence_ratio > 15.0 and entropy < 1.0 and is_consistent:
                 print(f"[Q{q_count}] LATE-GAME GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
         
-        # --- REMOVED: Q35 TIMEOUT ---
-        # No timeout block, so game can continue.
-
         return False, None, None
 
     def get_features_for_data_collection(self, item_name, num_features=5):
-        """Gets features for data collection."""
+        """
+        Gets features for data collection.
+        This logic correctly prioritizes unknown (NaN) features for the
+        specific item, then falls back to globally sparse features.
+        (This logic was already good and remains unchanged).
+        """
         try:
             matches = np.where(self.animals == item_name)[0]
             if len(matches) == 0:
@@ -452,6 +467,9 @@ class AkinatorEngine:
         
         if len(useful_nan_indices) < num_features:
             needed = num_features - len(useful_nan_indices)
+            
+            ### MODIFIED ###
+            # Use self.sparse_indices as the fallback, which is what you wanted
             extras = np.setdiff1d(self.sparse_indices, useful_nan_indices).copy()
             
             if len(extras) > 0:
