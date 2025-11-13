@@ -18,8 +18,8 @@ class AkinatorEngine:
         self.feature_cols = np.array(feature_cols)
         self.questions_map = questions_map
         
-        self.MAX_QUESTIONS = 35
-        self.FORCED_GUESS_AT = 20  # Force a guess here
+        self.MAX_QUESTIONS = None
+        self.FORCED_GUESS_AT = 25  
         
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         
@@ -69,8 +69,8 @@ class AkinatorEngine:
         
         self.col_nan_frac = np.mean(self.nan_mask, axis=0)
         col_var = np.nanvar(self.features, axis=0)
-        
-        self.allowed_feature_mask = (self.col_nan_frac < 0.98) & (col_var > 1e-6)
+
+        self.allowed_feature_mask = (self.col_nan_frac < 1.0)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
 
         sparse_mask = (self.col_nan_frac >= 0.50) & self.allowed_feature_mask
