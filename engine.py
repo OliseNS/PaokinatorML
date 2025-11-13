@@ -3,14 +3,13 @@ import numpy as np
 
 class AkinatorEngine:
     """
-    IMPROVED: Fuzzy Logic Expert System Engine with better convergence.
+    IMPROVED: Fuzzy Logic Expert System Engine with faster convergence.
     
-    Key improvements:
-    1. Stronger contradiction penalties (0.01 instead of 0.03)
-    2. Stricter consistency checks (1.5 std dev instead of 0.5)
-    3. Progressive guess thresholds that scale with question count
-    4. FORCED guess at Q20 with option to continue
-    5. Better sparse question timing (Q8, Q15 instead of Q6, Q12)
+    Key changes based on user request:
+    1. Faster convergence: Guessing thresholds are lowered to be less patient.
+    2. No guess before Q8: Hard-coded rule prevents guesses from Q0-Q7.
+    3. Forced guess at Q25: Re-implemented forced guess if no guess made by Q25.
+    4. No max questions: Removed the Q35 timeout for infinite play.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -18,7 +17,8 @@ class AkinatorEngine:
         self.feature_cols = np.array(feature_cols)
         self.questions_map = questions_map
         
-        self.MAX_QUESTIONS = None
+        # Set per user request
+        self.MAX_QUESTIONS = None  # No upper limit
         self.FORCED_GUESS_AT = 25  
         
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
@@ -51,11 +51,10 @@ class AkinatorEngine:
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
                 
-                # Even tighter curves for better discrimination
                 if a_val == 1.0 or a_val == 0.0:
-                    sigma = 0.10  # Stricter (was 0.12)
+                    sigma = 0.10
                 else:
-                    sigma = 0.16  # Stricter (was 0.18)
+                    sigma = 0.16
 
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
                 self.likelihood_table[i, j] = max(likelihood, 0.0001)
@@ -216,7 +215,6 @@ class AkinatorEngine:
         IMPROVED: Sparse questions at Q8 and Q15 (not Q6/Q12).
         """
         
-        # Ask sparse questions LATER when we have more context
         if question_count == 8 or question_count == 15:
             asked_set_for_sparse = set(asked_features) | self.sparse_questions_asked
             sparse_feat, sparse_q = self.get_sparse_question_for_game(prior, asked_set_for_sparse)
@@ -316,10 +314,14 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        COMPLETELY REWRITTEN: Progressive thresholds + NO forced guess. More patient.
+        REWRITTEN: Faster convergence, no guess before Q8, forced guess at Q25, no max.
         """
         q_count = game_state['question_count']
         
+        # RULE: No guesses before question 8
+        if q_count < 8:
+            return False, None, None
+            
         if probs.sum() < 1e-10:
             return False, None, None
         
@@ -334,12 +336,11 @@ class AkinatorEngine:
         confidence_ratio = top_prob / (second_prob + 1e-9)
         entropy = self._calculate_entropy(probs)
         
-        # STRICTER CONSISTENCY CHECK (1.5 std dev instead of 0.5)
+        # STRICTER CONSISTENCY CHECK (from user code)
         cumulative_scores = game_state.get('cumulative_scores')
         is_consistent = False
         if cumulative_scores is not None and q_count > 0:
             top_animal_score = cumulative_scores[top_idx]
-            
             plausible_mask = (probs > 0.001) & (~game_state['rejected_mask'])
             
             if np.sum(plausible_mask) > 1:
@@ -355,64 +356,79 @@ class AkinatorEngine:
             else:
                 print(f"[GUESS] REJECTED: {top_animal} prob={top_prob:.2f}, "
                       f"score={top_animal_score:.2f} below threshold={consistency_threshold:.2f}")
-        elif q_count == 0:
-            is_consistent = True
+        elif q_count > 0: # If scores aren't present yet but we've asked questions
+             is_consistent = True
         
-        # Continue mode logic
+        # Continue mode logic (from user code)
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 3:
                 return False, None, None
             else:
+                # Ready to guess again after continuing
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        # Q0-Q10: "Slam Dunk" - requires near-perfect confidence
+        # --- Progressive Thresholds (Made FASTER) ---
+        
+        # Q8-Q10: High confidence needed
         if q_count < 10:
-            if top_prob > 0.999 and confidence_ratio > 500.0 and entropy < 0.20 and is_consistent:
-                print(f"[Q{q_count}] SLAM DUNK: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
-                return True, top_animal, 'final'
-            return False, None, None
-        
-        # Q10-Q15: Very high confidence needed
-        if q_count < 15:
-            if top_prob > 0.99 and confidence_ratio > 400.0 and entropy < 0.10 and is_consistent:
+            # Was: 0.999 prob, 500.0 ratio
+            if top_prob > 0.95 and confidence_ratio > 100.0 and entropy < 0.25 and is_consistent:
                 print(f"[Q{q_count}] STRONG: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+                game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
-            return False, None, None
-        
-        # Q15-Q25: High confidence, but more patient than before
-        if q_count < 25:
-            if top_prob > 0.98 and confidence_ratio > 150.0 and entropy < 0.10 and is_consistent:
+            
+        # Q10-Q15: Medium-High confidence
+        elif q_count < 15:
+            # Was: 0.99 prob, 400.0 ratio
+            if top_prob > 0.90 and confidence_ratio > 50.0 and entropy < 0.5 and is_consistent:
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+                game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
-            return False, None, None
         
-        # --- REMOVED: FORCED GUESS AT Q20 ---
-        # The block that forced a guess at self.FORCED_GUESS_AT is deleted.
-        
-        # Q25-Q35: After continue, or after many questions
-        if q_count < self.MAX_QUESTIONS:
-            if top_prob > 0.80 and confidence_ratio > 25.0 and entropy < 0.8 and is_consistent:
-                print(f"[Q{q_count}] POST-CONTINUE/LATE-GAME: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+        # Q15-Q25: Regular confidence
+        elif q_count < self.FORCED_GUESS_AT:
+            # Was: 0.98 prob, 150.0 ratio
+            if top_prob > 0.85 and confidence_ratio > 25.0 and entropy < 0.75 and is_consistent:
+                print(f"[Q{q_count}] LIKELY: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+                game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
-            return False, None, None
-        
-        # Q35: Absolute timeout
-        if is_consistent:
-            print(f"[Q35] TIMEOUT: {top_animal} (prob={top_prob:.3f})")
-            return True, top_animal, 'final'
-        else:
-            plausible_mask = (probs > 0.001) & (~game_state['rejected_mask'])
-            if np.any(plausible_mask):
-                plausible_scores = cumulative_scores[plausible_mask]
-                plausible_animals = self.animals[plausible_mask]
-                best_idx = np.argmax(plausible_scores)
-                best_animal = plausible_animals[best_idx]
-                print(f"[Q35] TIMEOUT (fallback): {best_animal}")
-                return True, best_animal, 'final'
+
+        # --- FORCED GUESS AT Q25 ---
+        if q_count == self.FORCED_GUESS_AT and not game_state.get('has_made_initial_guess', False):
+            if is_consistent:
+                print(f"[Q{q_count}] FORCED GUESS (Consistent): {top_animal} (prob={top_prob:.3f})")
+                game_state['has_made_initial_guess'] = True
+                return True, top_animal, 'initial' # Use 'initial' to signal it's a forced guess
             else:
-                print(f"[Q35] TIMEOUT (no options): {top_animal}")
+                # Fallback to most consistent if top is inconsistent
+                plausible_mask = (probs > 0.001) & (~game_state['rejected_mask'])
+                if np.any(plausible_mask) and cumulative_scores is not None:
+                    plausible_scores = cumulative_scores[plausible_mask]
+                    plausible_animals = self.animals[plausible_mask]
+                    best_idx = np.argmax(plausible_scores)
+                    best_animal = plausible_animals[best_idx]
+                    print(f"[Q{q_count}] FORCED GUESS (Fallback): {best_animal}")
+                    game_state['has_made_initial_guess'] = True
+                    return True, best_animal, 'initial'
+                else:
+                    # Absolute fallback
+                    print(f"[Q{q_count}] FORCED GUESS (Absolute Fallback): {top_animal}")
+                    game_state['has_made_initial_guess'] = True
+                    return True, top_animal, 'initial'
+        
+        # --- LATE GAME (Q25+) ---
+        # Handles all cases after Q25, forever.
+        elif q_count > self.FORCED_GUESS_AT:
+            # Make it easier to re-guess after continuing
+            if top_prob > 0.75 and confidence_ratio > 15.0 and entropy < 1.0 and is_consistent:
+                print(f"[Q{q_count}] LATE-GAME GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 return True, top_animal, 'final'
+        
+        # --- REMOVED: Q35 TIMEOUT ---
+        # No timeout block, so game can continue.
+
+        return False, None, None
 
     def get_features_for_data_collection(self, item_name, num_features=5):
         """Gets features for data collection."""
