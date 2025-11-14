@@ -343,82 +343,57 @@ class AkinatorEngine:
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
         Determines if the engine is confident enough to make a guess.
-        --- PATIENCE FIX 1: INCREASED PATIENCE ---
-        - Increased min questions from 12 to 15.
-        - Increased ratio thresholds to force more confirmation questions.
-        - Cleaned up if/else logic for tiered thresholds.
+        This logic is now flexible, removing the hard requirement for a minimum
+        number of questions and instead relying on tiered confidence thresholds.
         """
         q_count = game_state['question_count']
-        
-        # --- PATIENCE FIX 1 ---
-        if q_count < 20: # Was 12
-        # --- END PATIENCE FIX 1 ---
-            return False, None, None
-            
+
         if probs.sum() < 1e-10:
             return False, None, None
-        
+
         top_idx = np.argmax(probs)
         top_prob = probs[top_idx]
         top_animal = self.animals[top_idx]
-        
+
         probs_copy = probs.copy()
         probs_copy[top_idx] = 0.0
         second_prob = np.max(probs_copy)
-        
+
         confidence_ratio = top_prob / (second_prob + 1e-9)
         entropy = self._calculate_entropy(probs)
-        
-        cumulative_scores = game_state.get('cumulative_scores')
-        is_consistent = False
-        if cumulative_scores is not None and q_count > 0:
-            top_animal_score = cumulative_scores[top_idx]
-            plausible_mask = (probs > 0.001) & (~game_state['rejected_mask'])
-            
-            if np.sum(plausible_mask) > 1:
-                avg_score = np.mean(cumulative_scores[plausible_mask])
-                score_std = np.std(cumulative_scores[plausible_mask])
-                
-                # Stays at 1.0 std dev
-                consistency_threshold = avg_score + (score_std * 1.0) 
-            else:
-                consistency_threshold = -np.inf
-            
-            if top_animal_score >= consistency_threshold:
-                is_consistent = True
-            else:
-                print(f"[GUESS] REJECTED: {top_animal} prob={top_prob:.2f}, "
-                      f"score={top_animal_score:.2f} below strict_threshold={consistency_threshold:.2f}")
-        elif q_count > 0:
-            is_consistent = True
-        
+
+        # Prevent guessing again too soon after a rejection
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 3:
                 return False, None, None
             else:
+                # Reset for the next potential guess
                 game_state['continue_mode'] = False
                 game_state['questions_since_last_guess'] = 0
 
-        
-        # --- PATIENCE FIX 1: Stricter thresholds & cleaner logic ---
-        # Q15-Q21: "Perfect"
-        if q_count < 22: # Was < 25
-            if top_prob > 0.995 and confidence_ratio > 1000.0 and entropy < 0.05 and is_consistent: # Was 600.0
-                print(f"[Q{q_count}] PERFECT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
-                game_state['has_made_initial_guess'] = True
-                return True, top_animal, 'final'
-            
-        # Q22+ "Confident"
-        if q_count >= 22: # Was elif q_count >= 22
-            # (Note: Relaxed entropy slightly but kept ratio high)
-            if top_prob > 0.99 and confidence_ratio > 800.0 and entropy < 0.05 and is_consistent: # Was 400.0 / 0.03
-                print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
-                game_state['has_made_initial_guess'] = True
-                return True, top_animal, 'final'
-        # --- END PATIENCE FIX 1 ---
+        # Tier 1: High-Confidence Guess (can happen early)
+        # Requires near-certainty. Allows the engine to feel "smart" for obvious characters.
+        if top_prob > 0.95 and confidence_ratio > 1500 and entropy < 0.1:
+            print(f"[Q{q_count}] HIGH-CONFIDENCE GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+            game_state['has_made_initial_guess'] = True
+            return True, top_animal, 'final'
 
-        # No forced guess, engine will continue until it gets it or until the user gets tired.
-        
+        # Tier 2: Standard-Confidence Guess (requires more questions)
+        # A balanced threshold for making a guess after a reasonable number of questions.
+        if q_count > 8 and top_prob > 0.85 and confidence_ratio > 800 and entropy < 0.5:
+            print(f"[Q{q_count}] STANDARD-CONFIDENCE GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+            game_state['has_made_initial_guess'] = True
+            return True, top_animal, 'final'
+
+        # Tier 3: Final Attempt (for long games)
+        # If the game has gone on for a long time, the engine can make a guess
+        # with slightly lower confidence to avoid getting stuck.
+        if q_count > 20 and top_prob > 0.75 and confidence_ratio > 500:
+            print(f"[Q{q_count}] EXTENDED-GAME GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+            game_state['has_made_initial_guess'] = True
+            return True, top_animal, 'final'
+
+        # If no thresholds are met, continue asking questions.
         return False, None, None
     
     def get_features_for_data_collection(self, item_name, num_features=5):
