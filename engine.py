@@ -485,3 +485,181 @@ class AkinatorEngine:
             })
             
         return results
+    
+    """
+    New group of functions that help me figure out uneeded features that add no gain to the system
+    """
+    def _format_features(self, indices):
+        """Format feature indices into the expected output format."""
+        results = []
+        for idx in indices:
+            py_idx = int(idx)
+            if py_idx >= len(self.feature_cols) or py_idx >= len(self.col_nan_frac):
+                continue
+                    
+            fname = str(self.feature_cols[py_idx])
+            results.append({
+                "feature_name": fname,
+                "question": str(self.questions_map.get(fname, f"Is it {fname}?")),
+                "nan_percentage": float(self.col_nan_frac[py_idx])
+            })
+            
+        return results
+    
+    def to_delete(self, similarity_threshold=0.85, min_variance=0.01, output_file='questions_to_delete.csv'):
+        """
+        Identifies and logs redundant, similar, or low-quality questions that should be deleted.
+        
+        Criteria for deletion:
+        1. Highly correlated features (similarity > threshold)
+        2. Low variance features (variance < min_variance)
+        3. Features with >95% missing data
+        4. Features that provide minimal information gain
+        
+        Args:
+            similarity_threshold: Correlation threshold above which features are considered redundant
+            min_variance: Minimum variance threshold for useful features
+            output_file: CSV file to save the deletion candidates
+            
+        Returns:
+            DataFrame with features to delete and their reasons
+        """
+        from datetime import datetime
+        import os
+        
+        start_time = datetime.now()
+        print(f"\n{'='*60}")
+        print(f"Started redundancy analysis at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}\n")
+        
+        deletion_candidates = []
+        
+        # 1. Find features with excessive missing data (>95%)
+        print("Checking for features with excessive missing data...")
+        high_nan_mask = self.col_nan_frac > 0.95
+        high_nan_indices = np.where(high_nan_mask)[0]
+        
+        for idx in high_nan_indices:
+            fname = self.feature_cols[idx]
+            question = self.questions_map.get(fname, f"Does it have {fname}?")
+            deletion_candidates.append({
+                'feature_name': fname,
+                'question_text': question,
+                'reason': 'excessive_missing_data',
+                'nan_percentage': float(self.col_nan_frac[idx]),
+                'variance': float(self.col_var[idx]) if not np.isnan(self.col_var[idx]) else 0.0,
+                'correlation_with': None
+            })
+        
+        print(f"  Found {len(high_nan_indices)} features with >95% missing data")
+        
+        # 2. Find low variance features
+        print("\nChecking for low variance features...")
+        valid_var_mask = ~np.isnan(self.col_var) & (self.col_var < min_variance)
+        low_var_indices = np.where(valid_var_mask)[0]
+        
+        for idx in low_var_indices:
+            if idx in high_nan_indices:
+                continue  # Already flagged
+                
+            fname = self.feature_cols[idx]
+            question = self.questions_map.get(fname, f"Does it have {fname}?")
+            deletion_candidates.append({
+                'feature_name': fname,
+                'question_text': question,
+                'reason': 'low_variance',
+                'nan_percentage': float(self.col_nan_frac[idx]),
+                'variance': float(self.col_var[idx]),
+                'correlation_with': None
+            })
+        
+        print(f"  Found {len(low_var_indices)} features with variance < {min_variance}")
+        
+        # 3. Find highly correlated (redundant) features
+        print("\nChecking for highly correlated features...")
+        print("  (This may take a moment for large datasets...)")
+        
+        allowed_indices = self.allowed_feature_indices
+        redundant_pairs = []
+        
+        # Sample correlation check for performance
+        sample_size = min(len(allowed_indices), 200)
+        if len(allowed_indices) > sample_size:
+            indices_to_check = np.random.choice(allowed_indices, sample_size, replace=False)
+        else:
+            indices_to_check = allowed_indices
+        
+        for i, idx1 in enumerate(indices_to_check):
+            for idx2 in indices_to_check[i+1:]:
+                col1 = self.features[:, idx1]
+                col2 = self.features[:, idx2]
+                
+                # Only compare where both have data
+                valid_mask = ~np.isnan(col1) & ~np.isnan(col2)
+                if np.sum(valid_mask) < 10:
+                    continue
+                
+                corr = np.corrcoef(col1[valid_mask], col2[valid_mask])[0, 1]
+                
+                if not np.isnan(corr) and abs(corr) > similarity_threshold:
+                    # Keep the feature with less missing data
+                    if self.col_nan_frac[idx1] > self.col_nan_frac[idx2]:
+                        redundant_idx = idx1
+                        keeper_idx = idx2
+                    else:
+                        redundant_idx = idx2
+                        keeper_idx = idx1
+                    
+                    redundant_pairs.append((redundant_idx, keeper_idx, corr))
+        
+        # Add redundant features to deletion list
+        seen_redundant = set()
+        for redundant_idx, keeper_idx, corr in redundant_pairs:
+            if redundant_idx in seen_redundant:
+                continue
+                
+            fname_redundant = self.feature_cols[redundant_idx]
+            fname_keeper = self.feature_cols[keeper_idx]
+            question = self.questions_map.get(fname_redundant, f"Does it have {fname_redundant}?")
+            
+            deletion_candidates.append({
+                'feature_name': fname_redundant,
+                'question_text': question,
+                'reason': 'highly_correlated',
+                'nan_percentage': float(self.col_nan_frac[redundant_idx]),
+                'variance': float(self.col_var[redundant_idx]) if not np.isnan(self.col_var[redundant_idx]) else 0.0,
+                'correlation_with': f"{fname_keeper} (r={corr:.3f})"
+            })
+            seen_redundant.add(redundant_idx)
+        
+        print(f"  Found {len(redundant_pairs)} highly correlated feature pairs")
+        
+        # 4. Create DataFrame and save
+        if deletion_candidates:
+            df_delete = pd.DataFrame(deletion_candidates)
+            df_delete['timestamp'] = start_time.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Sort by reason and nan_percentage
+            df_delete = df_delete.sort_values(['reason', 'nan_percentage'], ascending=[True, False])
+            
+            # Save to CSV
+            df_delete.to_csv(output_file, index=False)
+            
+            print(f"\n{'='*60}")
+            print(f"SUMMARY:")
+            print(f"  Total features analyzed: {len(self.feature_cols)}")
+            print(f"  Features flagged for deletion: {len(deletion_candidates)}")
+            print(f"    - Excessive missing data: {len(high_nan_indices)}")
+            print(f"    - Low variance: {len(low_var_indices)}")
+            print(f"    - Highly correlated: {len(redundant_pairs)}")
+            print(f"\n  Results saved to: {output_file}")
+            print(f"  Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'='*60}\n")
+            
+            return df_delete
+        else:
+            print(f"\n{'='*60}")
+            print("No features flagged for deletion.")
+            print(f"Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'='*60}\n")
+            return pd.DataFrame()

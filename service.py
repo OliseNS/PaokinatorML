@@ -69,6 +69,18 @@ class AkinatorService:
             self._prediction_cache.clear()
             
         print(f"✅ All engines loaded. Serving {len(self.engines)} domains.")
+        print(f"Now checking for uneeded features to delete this will be saved in the csv file")
+        # Run the analysis
+        df_to_delete = engine.to_delete(
+            similarity_threshold=0.85,  # Correlation threshold
+            min_variance=0.01,          # Minimum useful variance
+            output_file='questions_to_delete.csv'
+        )
+        """Pushing to prod and do not want this method to run uncomment to run it
+        This method in the engine.py can be run on the development environment and it will save a csv file on low variance or bad quality data
+        ***NEVER PUSH TO PRODUCTION WITH THIS UNCOMMENTED***
+        print(df_to_delete)
+        """
 
     def _background_reload(self):
         """Runs in a thread to reload all engines."""
