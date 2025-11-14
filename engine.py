@@ -6,13 +6,13 @@ class AkinatorEngine:
     Akinator guessing engine (V2.5).
 
     CHANGELOG:
-    - (Patience Fix 1) Increased min questions in 'should_make_guess' to 15 (was 12)
-      and raised confidence_ratio thresholds to force more questions.
+    - (Patience Fix 1) Increased min questions in 'should_make_guess' to 20 (was 15)
+      and raised confidence_ratio thresholds to 1000/800 to force more questions.
     - (Patience Fix 2) Drastically lowered 'get_discriminative_question'
-      threshold to 0.05 (was 0.20) to make the engine *always* prefer
+      threshold to 0.01 (was 0.05) to make the engine *always* prefer
       a "smart" confirmation question when it's confident.
     - (Patience Fix 3) Slowed temperature decay in 'select_question' to
-      explore new questions for ~15 rounds (was ~5).
+      explore new questions for ~20 rounds (was ~15).
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -276,10 +276,9 @@ class AkinatorEngine:
         # --- PATIENCE FIX 3: SLOW DOWN DECAY ---
         # The old implementation (0.3) decayed to 0.01 in 5 questions,
         # stopping exploration too early.
-        # This new implementation (0.1) decays over 15 questions,
-        # allowing for more question variety.
-        temperature = max(0.01, 1.5 - (question_count * 0.1))
-        # (Q0=1.5, Q5=1.0, Q10=0.5, Q15=0.01)
+        # This new implementation (0.07) decays over ~20 questions
+        temperature = max(0.01, 1.5 - (question_count * 0.07))
+        # (Q0=1.5, Q5=1.15, Q10=0.8, Q15=0.45, Q20=0.1)
         # --- END PATIENCE FIX 3 ---
         
         exp_gains = np.exp((top_gains - np.max(top_gains)) / (temperature + 1e-5))
@@ -333,7 +332,7 @@ class AkinatorEngine:
         # This makes the engine EXTREMELY willing to ask a "smart"
         # confirmation question, even if it's not a perfect separator.
         # This directly addresses your "rat/plague" example.
-        if weighted_diffs[best_local_idx] > 0.05: 
+        if weighted_diffs[best_local_idx] > 0.01: 
         # --- END PATIENCE FIX 2 ---
             best_feat_idx = candidate_indices[best_local_idx]
             feature_name = self.feature_cols[best_feat_idx]
@@ -352,7 +351,7 @@ class AkinatorEngine:
         q_count = game_state['question_count']
         
         # --- PATIENCE FIX 1 ---
-        if q_count < 15: # Was 12
+        if q_count < 20: # Was 12
         # --- END PATIENCE FIX 1 ---
             return False, None, None
             
@@ -404,7 +403,7 @@ class AkinatorEngine:
         # --- PATIENCE FIX 1: Stricter thresholds & cleaner logic ---
         # Q15-Q21: "Perfect"
         if q_count < 22: # Was < 25
-            if top_prob > 0.995 and confidence_ratio > 800.0 and entropy < 0.05 and is_consistent: # Was 600.0
+            if top_prob > 0.995 and confidence_ratio > 1000.0 and entropy < 0.05 and is_consistent: # Was 600.0
                 print(f"[Q{q_count}] PERFECT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
@@ -412,7 +411,7 @@ class AkinatorEngine:
         # Q22+ "Confident"
         if q_count >= 22: # Was elif q_count >= 22
             # (Note: Relaxed entropy slightly but kept ratio high)
-            if top_prob > 0.99 and confidence_ratio > 600.0 and entropy < 0.05 and is_consistent: # Was 400.0 / 0.03
+            if top_prob > 0.99 and confidence_ratio > 800.0 and entropy < 0.05 and is_consistent: # Was 400.0 / 0.03
                 print(f"[Q{q_count}] CONFIDENT: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
                 game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'

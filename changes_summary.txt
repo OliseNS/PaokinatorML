@@ -1,0 +1,9 @@
+Here is a summary of the changes made to improve the Akinator game logic:
+
+1.  **Increased Patience:** The engine now requires a minimum of 20 questions (previously 15) before it can make a guess. This forces the game to gather more information and avoid premature conclusions.
+
+2.  **Stricter Guessing Confidence:** The confidence thresholds for making a guess have been significantly increased. The engine must be much more certain about its top guess before presenting it to the user, reducing the frequency of incorrect guesses.
+
+3.  **Smarter Questioning:** The engine is now more eager to ask "smart" clarifying questions when it's close to an answer. This helps it differentiate between two similar possibilities (e.g., a rat vs. a mouse) instead of just guessing.
+
+4.  **Broader Question Exploration:** The question selection algorithm has been adjusted to explore a wider variety of questions for a longer period. This improves its ability to narrow down the possibilities from a large pool of candidates.
