@@ -179,14 +179,17 @@ class AkinatorEngine:
         
         likelihoods = self.likelihood_table[f_quant, a_idx].copy()
         
-        # SOFTER PENALTIES (0.05 = 95% penalty)
-        # This is more robust to a single user mistake.
+        # --- FIX 2: STRONGER PENALTIES ---
+        # Changed penalty from 0.05 to 0.0001.
+        # This fixes the "furniture" / "paper clip" problem by making
+        # hard contradictions apply a massive score penalty.
         if answer_val >= 0.9:  
             contradictions = (f_col < 0.15) & (~nan_mask)
-            likelihoods[contradictions] *= 0.05
+            likelihoods[contradictions] *= 0.0001
         elif answer_val <= 0.1:  
             contradictions = (f_col > 0.85) & (~nan_mask)
-            likelihoods[contradictions] *= 0.05
+            likelihoods[contradictions] *= 0.0001
+        # --- END FIX 2 ---
 
         scores = np.log(likelihoods + 1e-10)
         
@@ -378,20 +381,26 @@ class AkinatorEngine:
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
 
+        # --- FIX 1: INCREASED PATIENCE ---
+        # Raised q_count from 8 to 15 and ratio from 800 to 1000.
+        # This forces the engine to ask more questions before its
+        # first standard guess, addressing your primary complaint.
+        
         # Tier 2: Standard-Confidence Guess (requires more questions)
-        # A balanced threshold for making a guess after a reasonable number of questions.
-        if q_count > 8 and top_prob > 0.85 and confidence_ratio > 800 and entropy < 0.5:
+        if q_count > 15 and top_prob > 0.85 and confidence_ratio > 1000 and entropy < 0.5:
             print(f"[Q{q_count}] STANDARD-CONFIDENCE GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
 
+        # Raised q_count from 20 to 25 and ratio from 500 to 800.
+        # This makes the "long game" guess also require more certainty.
+        
         # Tier 3: Final Attempt (for long games)
-        # If the game has gone on for a long time, the engine can make a guess
-        # with slightly lower confidence to avoid getting stuck.
-        if q_count > 20 and top_prob > 0.75 and confidence_ratio > 500:
+        if q_count > 25 and top_prob > 0.75 and confidence_ratio > 800:
             print(f"[Q{q_count}] EXTENDED-GAME GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
+        # --- END FIX 1 ---
 
         # If no thresholds are met, continue asking questions.
         return False, None, None
@@ -431,7 +440,7 @@ class AkinatorEngine:
             else:
                 remaining_allowed = np.setdiff1d(self.allowed_feature_indices, useful_nan_indices).copy()
                 if len(remaining_allowed) > 0:
-                    np.random_shuffle(remaining_allowed)
+                    np.random.shuffle(remaining_allowed)
                     needed_more = num_features - len(useful_nan_indices)
                     selected_indices = np.concatenate((useful_nan_indices, remaining_allowed[:needed_more]))
                 else:
@@ -442,7 +451,7 @@ class AkinatorEngine:
         
         if len(selected_indices) < num_features and len(self.allowed_feature_indices) >= num_features:
             remaining = np.setdiff1d(self.allowed_feature_indices, selected_indices).copy()
-            np.random_shuffle(remaining)
+            np.random.shuffle(remaining)
             needed = num_features - len(selected_indices)
             selected_indices = np.concatenate((selected_indices, remaining[:needed]))
             
