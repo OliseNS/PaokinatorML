@@ -3,19 +3,16 @@ import numpy as np
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V2.3).
+    Akinator guessing engine (V2.4).
 
-    Key logic principles:
-    1.  Aggressive Temperature Decay:
-        - 'select_question' temperature starts at 1.5 (high exploration)
-          and decays rapidly to 0.01 (high exploitation) by Question 5.
-    2.  Stricter Guessing Thresholds:
-        - All guessing thresholds ('should_make_guess') are high
-          to ensure extreme confidence before making a guess.
-        - Minimum question count before any guess is 12.
-    3.  Error Robustness:
-        - 'update' function uses a soft contradiction penalty (0.05)
-          to be more forgiving of single user mistakes.
+    CHANGELOG:
+    - Fixed 'select_question' temperature calculation to match comment's intent,
+      improving early-game exploration.
+    - Lowered 'get_discriminative_question' threshold to 0.20 (was 0.35)
+      to make the engine "smarter" by being more willing to ask a
+      confirmation question.
+    - Added 'get_all_feature_gains' to answer user's question about
+      calculating gains for all features.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -81,9 +78,9 @@ class AkinatorEngine:
         
         if len(self.animals) > 0:
             n = len(self.animals)
-            uniform_prior = np.ones(n, dtype=np.float32) / n
+            self.uniform_prior = np.ones(n, dtype=np.float32) / n
             
-            initial_gains = self._compute_gains_batched(uniform_prior, self.allowed_feature_indices, batch_size=256)
+            initial_gains = self._compute_gains_batched(self.uniform_prior, self.allowed_feature_indices, batch_size=256)
             
             variance_boost = col_var[self.allowed_feature_indices] / (np.max(col_var[self.allowed_feature_indices]) + 1e-5)
             boosted_gains = initial_gains * (1.0 + variance_boost * 0.5)
@@ -91,6 +88,7 @@ class AkinatorEngine:
             sorted_indices = np.argsort(boosted_gains)[::-1]
             self.sorted_initial_feature_indices = self.allowed_feature_indices[sorted_indices]
         else:
+            self.uniform_prior = np.array([], dtype=np.float32)
             self.sorted_initial_feature_indices = np.array([], dtype=np.int32)
 
     def _calculate_entropy(self, probs: np.ndarray) -> float:
@@ -227,8 +225,7 @@ class AkinatorEngine:
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
         Selects the next best question using a temperature-based random choice.
-        Uses an aggressive temperature decay (1.5 -> 0.01 by Q5) to move
-        from exploration to exploitation quickly.
+        Uses a controlled temperature decay to move from exploration to exploitation.
         """
         
         asked_set = set(asked_features)
@@ -276,8 +273,14 @@ class AkinatorEngine:
         top_local_indices = sorted_gain_indices[:top_n]
         top_gains = gains[top_local_indices]
         
-        # Q0=1.5, Q1=1.2, Q2=0.9, Q3=0.6, Q4=0.3, Q5=0.01 (min)
-        temperature = max(0.01, 15 - (question_count * 5))
+        # --- SMART FIX ---
+        # The comment "Q0=1.5, Q1=1.2, ... Q5=0.01" is good.
+        # The old implementation "15 - (qc * 5)" was a bug and led to
+        # T=15, T=10, T=5, T=0.01, which is far too aggressive.
+        # This implementation matches the comment's intent.
+        temperature = max(0.01, 1.5 - (question_count * 0.3))
+        # (Q0=1.5, Q1=1.2, Q2=0.9, Q3=0.6, Q4=0.3, Q5=0.01)
+        # --- END SMART FIX ---
         
         exp_gains = np.exp((top_gains - np.max(top_gains)) / (temperature + 1e-5))
         probs = exp_gains / np.sum(exp_gains)
@@ -325,7 +328,13 @@ class AkinatorEngine:
         
         best_local_idx = np.argmax(weighted_diffs)
         
-        if weighted_diffs[best_local_idx] > 0.35: 
+        # --- SMART FIX ---
+        # Lowered threshold from 0.35 to 0.20.
+        # This makes the engine much more willing to ask a "confirmation"
+        # question, even if it's not a perfect separator. This makes
+        # the engine feel much "smarter" and less random.
+        if weighted_diffs[best_local_idx] > 0.20: 
+        # --- END SMART FIX ---
             best_feat_idx = candidate_indices[best_local_idx]
             feature_name = self.feature_cols[best_feat_idx]
             return feature_name, self.questions_map.get(feature_name, f"Does it have {feature_name}?")
@@ -489,22 +498,44 @@ class AkinatorEngine:
     """
     New group of functions that help me figure out uneeded features that add no gain to the system
     """
-    def _format_features(self, indices):
-        """Format feature indices into the expected output format."""
+    
+    # --- NEW FUNCTION ---
+    def get_all_feature_gains(self, initial_prior: np.ndarray = None) -> list[dict]:
+        """
+        Calculates and returns the initial information gain for all
+        allowed features. This directly answers the question about
+        calculating gain for all features.
+        """
+        if initial_prior is None:
+            if hasattr(self, 'uniform_prior'):
+                initial_prior = self.uniform_prior
+            else:
+                if len(self.animals) == 0:
+                    return []
+                initial_prior = np.ones(len(self.animals), dtype=np.float32) / len(self.animals)
+        
+        indices_to_calc = self.allowed_feature_indices
+        if len(indices_to_calc) == 0:
+            return []
+        
+        print(f"Calculating gains for {len(indices_to_calc)} features...")
+        gains = self._compute_gains_batched(initial_prior, indices_to_calc, batch_size=128)
+        
         results = []
-        for idx in indices:
-            py_idx = int(idx)
-            if py_idx >= len(self.feature_cols) or py_idx >= len(self.col_nan_frac):
-                continue
-                    
-            fname = str(self.feature_cols[py_idx])
+        for i, idx in enumerate(indices_to_calc):
+            feature_name = self.feature_cols[idx]
             results.append({
-                "feature_name": fname,
-                "question": str(self.questions_map.get(fname, f"Is it {fname}?")),
-                "nan_percentage": float(self.col_nan_frac[py_idx])
+                'feature_name': feature_name,
+                'question': self.questions_map.get(feature_name, "N/A"),
+                'initial_gain': float(gains[i]),
+                'variance': float(self.col_var[idx]) if not np.isnan(self.col_var[idx]) else 0.0,
+                'nan_percentage': float(self.col_nan_frac[idx])
             })
             
+        # Sort by gain, descending
+        results.sort(key=lambda x: x['initial_gain'], reverse=True)
         return results
+    # --- END NEW FUNCTION ---
     
     def to_delete(self, similarity_threshold=0.85, min_variance=0.01, output_file='questions_to_delete.csv'):
         """

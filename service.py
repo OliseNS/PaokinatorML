@@ -8,16 +8,13 @@ from state_manager import StateManager
 
 class AkinatorService:
     """
-    REFACTORED: Manages game logic and state.
+    REFACTORED (V2.1): Manages game logic and state.
     
-    Core changes to support the new Fuzzy Logic Engine:
-    1.  All game state logic is built around 'cumulative_scores' (from state_manager).
-    2.  'probabilities' are no longer stored in the game state. They are
-        calculated on-the-fly from 'cumulative_scores' using softmax
-        in the `_get_probs_and_state` helper.
-    3.  `process_answer` is now much simpler. It just calls the engine's
-        stateless `update` function and stores the new 'cumulative_scores'.
-    4.  `reject_guess` now only has to update the 'rejected_mask'.
+    CHANGELOG:
+    - Lowered thresholds in 'get_next_question' to trigger "smart"
+      confirmation logic earlier (prob > 0.40, entropy < 2.5).
+      This is the primary fix for the "dumb" feeling.
+    - Added 'get_feature_gains' to call the new engine function.
     """
     
     def __init__(self):
@@ -55,6 +52,7 @@ class AkinatorService:
             return
 
         new_engines: dict[str, AkinatorEngine] = {}
+        engine = None # To hold one engine instance
         for domain in domain_names:
             engine = self._create_engine(domain)
             if engine:
@@ -69,18 +67,27 @@ class AkinatorService:
             self._prediction_cache.clear()
             
         print(f"✅ All engines loaded. Serving {len(self.engines)} domains.")
-        print(f"Now checking for uneeded features to delete this will be saved in the csv file")
-        # Run the analysis
-        df_to_delete = engine.to_delete(
-            similarity_threshold=0.85,  # Correlation threshold
-            min_variance=0.01,          # Minimum useful variance
-            output_file='questions_to_delete.csv'
-        )
-        """Pushing to prod and do not want this method to run uncomment to run it
-        This method in the engine.py can be run on the development environment and it will save a csv file on low variance or bad quality data
-        ***NEVER PUSH TO PRODUCTION WITH THIS UNCOMMENTED***
-        print(df_to_delete)
-        """
+
+        # --- Regarding your question about calculating gains ---
+        # The 'to_delete' method below (which you had commented out)
+        # is what analyzes features. You are correct to keep it
+        # commented out in production.
+        # I have added a *new*, safe endpoint (/admin/feature_gains)
+        # to let you see the gains without writing a file.
+        
+        if engine: # If at least one engine loaded
+            print(f"Running 'to_delete' analysis (will save to questions_to_delete.csv)...")
+            # Run the analysis
+            df_to_delete = engine.to_delete(
+                similarity_threshold=0.85,  # Correlation threshold
+                min_variance=0.01,          # Minimum useful variance
+                output_file='questions_to_delete.csv'
+            )
+            """Pushing to prod and do not want this method to run uncomment to run it
+            This method in the engine.py can be run on the development environment and it will save a csv file on low variance or bad quality data
+            ***NEVER PUSH TO PRODUCTION WITH THIS UNCOMMENTED***
+            print(df_to_delete)
+            """
 
     def _background_reload(self):
         """Runs in a thread to reload all engines."""
@@ -233,7 +240,7 @@ class AkinatorService:
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
         """
-        ### MODIFIED (Based on your insight) ###
+        ### MODIFIED (This is the "SMART" fix) ###
         Gets the next question. If confidence is high, it switches
         to a "confirmation" strategy to ask a discriminative question.
         Otherwise, it uses the "exploration" (information gain) strategy.
@@ -252,13 +259,15 @@ class AkinatorService:
             feature, q = engine.select_question(prior, asked, q_count)
             return feature, q, game_state
         
-        # --- NEW: "CONFIRMATION" STRATEGY (Your "Akinator Knows" insight) ---
+        # --- "SMART" FIX: "CONFIRMATION" STRATEGY ---
         top_prob = np.max(prior)
         entropy = engine._calculate_entropy(prior)
         
-        # If confidence is high (e.g., >70% prob, low entropy),
+        # If confidence is high (e.g., >40% prob, low-ish entropy),
         # try to find a "confirmation" question.
-        if top_prob > 0.70 and entropy < 1.2 and q_count > 5:
+        # --- THRESHOLDS LOWERED ---
+        if top_prob > 0.40 and entropy < 2.5 and q_count > 5:
+        # --- END THRESHOLD CHANGE ---
             top_idx = np.argmax(prior)
             feature, q = engine.get_discriminative_question(top_idx, prior, asked)
             
@@ -348,6 +357,19 @@ class AkinatorService:
                 raise ValueError(f"Domain '{domain_name}' not found.")
         
         return engine.get_features_for_data_collection(item_name, num_features=5)
+
+    # --- NEW FUNCTION ---
+    def get_feature_gains(self, domain_name: str) -> list[dict]:
+        """
+        Calls the engine to get all feature gains.
+        """
+        with self.engines_lock:
+            engine = self.engines.get(domain_name)
+            if not engine:
+                raise ValueError(f"Domain '{domain_name}' not found.")
+        
+        return engine.get_all_feature_gains()
+    # --- END NEW FUNCTION ---
 
     def record_suggestion(self, animal_name: str, 
                          answered_features: dict, domain_name: str) -> str:

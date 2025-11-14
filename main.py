@@ -84,7 +84,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Akinator API",
     description="Multi-domain Akinator-style game server.",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -522,6 +522,40 @@ async def trigger_reload(reload_token: str = Header(..., alias="X-Reload-Token")
     except Exception as e:
         print(f"ERROR: /admin/reload failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to start reload process")
+
+
+# --- NEW ENDPOINT ---
+@app.get("/admin/feature_gains/{domain_name}", include_in_schema=False)
+async def get_feature_gains(
+    domain_name: str,
+    reload_token: str = Header(..., alias="X-Reload-Token")
+):
+    """
+    NEW: This endpoint directly answers your question about
+    calculating the gain for all features. It returns a JSON
+    list of all features and their initial information gain.
+    """
+    if not config.RELOAD_SECRET_TOKEN:
+        raise HTTPException(status_code=503, detail="Admin endpoints are not configured")
+        
+    if reload_token != config.RELOAD_SECRET_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing reload token")
+    
+    srv = get_service()
+    
+    try:
+        gains_data = srv.get_feature_gains(domain_name)
+        return {
+            "domain_name": domain_name,
+            "feature_count": len(gains_data),
+            "features_by_gain": gains_data
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        print(f"ERROR: /admin/feature_gains failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to calculate gains")
+# --- END NEW ENDPOINT ---
 
 
 if __name__ == "__main__":
