@@ -3,16 +3,15 @@ import numpy as np
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V2.5).
+    Akinator guessing engine (V3.0 - Adaptive & Robust).
 
-    CHANGELOG:
-    - (Patience Fix 1) Increased min questions in 'should_make_guess' to 20 (was 15)
-      and raised confidence_ratio thresholds to 1000/800 to force more questions.
-    - (Patience Fix 2) Drastically lowered 'get_discriminative_question'
-      threshold to 0.01 (was 0.05) to make the engine *always* prefer
-      a "smart" confirmation question when it's confident.
-    - (Patience Fix 3) Slowed temperature decay in 'select_question' to
-      explore new questions for ~20 rounds (was ~15).
+    IMPROVEMENTS (V3.0):
+    1. Adaptive Guessing: Guessing thresholds now adjust based on the
+       number of remaining candidates (N_active) rather than just Q_count.
+    2. Gain Penalty: Features with high NaN percentage or values near 0.5
+       (ambiguous) are penalized during information gain calculation.
+    3. Contradiction Penalty: Penalty strength is now a smooth function
+       of contradiction severity, instead of a fixed 0.0001 multiplier.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -50,10 +49,11 @@ class AkinatorEngine:
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
                 
+                # Tighter sigma for Yes/No answers for higher discrimination
                 if a_val == 1.0 or a_val == 0.0:
-                    sigma = 0.10
+                    sigma = 0.08  # Was 0.10
                 else:
-                    sigma = 0.16
+                    sigma = 0.14  # Was 0.16
 
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
                 self.likelihood_table[i, j] = max(likelihood, 0.0001)
@@ -66,7 +66,14 @@ class AkinatorEngine:
         self.nan_mask = np.isnan(self.features)
         
         self.col_nan_frac = np.mean(self.nan_mask, axis=0)
-        col_var = np.nanvar(self.features, axis=0)
+        
+        # Calculate variance only on non-NaN values
+        nan_masked_features = np.ma.masked_invalid(self.features)
+        col_var = nan_masked_features.var(axis=0).data
+        
+        # Calculate ambiguity (how close the mean is to 0.5)
+        col_mean = nan_masked_features.mean(axis=0).data
+        self.col_ambiguity = 1.0 - 2.0 * np.abs(col_mean - 0.5) # 0.0=min ambiguity, 1.0=max ambiguity (near 0.5)
 
         self.allowed_feature_mask = (self.col_nan_frac < 1.0)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
@@ -82,8 +89,18 @@ class AkinatorEngine:
             
             initial_gains = self._compute_gains_batched(self.uniform_prior, self.allowed_feature_indices, batch_size=256)
             
+            # --- IMPROVEMENT 2: PENALIZE AMBIGUOUS/SPARSE FEATURES IN INITIAL RANKING ---
+            # Boost: Max variance is still good.
             variance_boost = col_var[self.allowed_feature_indices] / (np.max(col_var[self.allowed_feature_indices]) + 1e-5)
-            boosted_gains = initial_gains * (1.0 + variance_boost * 0.5)
+            
+            # Penalty: Penalize features with lots of NaNs or means near 0.5
+            penalty = 1.0 - (
+                0.3 * self.col_nan_frac[self.allowed_feature_indices] + 
+                0.3 * self.col_ambiguity[self.allowed_feature_indices]
+            )
+            penalty = np.clip(penalty, 0.5, 1.0)
+            
+            boosted_gains = initial_gains * (1.0 + variance_boost * 0.5) * penalty
             
             sorted_indices = np.argsort(boosted_gains)[::-1]
             self.sorted_initial_feature_indices = self.allowed_feature_indices[sorted_indices]
@@ -94,12 +111,14 @@ class AkinatorEngine:
     def _calculate_entropy(self, probs: np.ndarray) -> float:
         """Robust Shannon entropy calculation."""
         p = np.clip(probs, 1e-10, 1.0)
+        # Use log2 for information gain/entropy
         return -np.sum(p * np.log2(p))
 
+    # _compute_gains_batched remains mostly the same, but must ensure 
+    # the new penalty is applied before selection in select_question.
     def _compute_gains_batched(self, prior: np.ndarray, feature_indices: np.ndarray, batch_size: int = 64) -> np.ndarray:
         """
         Computes information gain in batches for memory efficiency.
-        Uses a vectorized entropy calculation and active-item slicing for speed.
         """
         n_features = len(feature_indices)
         n_answers = len(self.answer_values)
@@ -112,7 +131,6 @@ class AkinatorEngine:
         active_mask = prior > 1e-6
         n_active = np.sum(active_mask)
         
-        # Optimization: Slice prior and features if a large portion is inactive
         if n_active < len(prior) * 0.8 and n_active > 0:
             active_prior = prior[active_mask]
             active_prior = active_prior / active_prior.sum()
@@ -128,6 +146,7 @@ class AkinatorEngine:
             end = min(i + batch_size, n_features)
             batch_indices = feature_indices[i:end]
             
+            # Features sliced only to active items
             f_batch = self.features[active_mask][:, batch_indices]
             
             f_batch_filled = np.nan_to_num(f_batch, nan=0.5)
@@ -138,21 +157,27 @@ class AkinatorEngine:
 
             nan_batch_mask = np.isnan(f_batch)
             nan_expand = np.repeat(nan_batch_mask[:, :, np.newaxis], n_answers, axis=2)
-            likelihoods[nan_expand] = 1.0 # (n_active, batch_size, n_answers)
+            likelihoods[nan_expand] = 1.0 # Ignore likelihood if feature value is NaN
 
             batch_gains = np.zeros(len(batch_indices), dtype=np.float32)
             
             for f_local_idx in range(len(batch_indices)):
                 L_f = likelihoods[:, f_local_idx, :] # (n_active, n_answers)
                 
+                # p(Answer | Current State) = Sum_{i in Active} p(i) * L(Answer | Feature_i)
                 p_answers = active_prior @ L_f
                 
                 # --- Vectorized Entropy Calculation ---
+                # Posterior = (p(i) * L(Answer | Feature_i)) / p(Answer | Current State)
                 posteriors = active_prior[:, np.newaxis] * L_f
                 posteriors /= (p_answers + 1e-10)
                 posteriors = np.clip(posteriors, 1e-10, 1.0)
+                
                 p_logs = np.log2(posteriors)
+                # Entropy(Post_k) = -Sum_i Post_{ik} * log2(Post_{ik})
                 entropies_per_answer = -np.sum(posteriors * p_logs, axis=0)
+                
+                # Expected Entropy = Sum_k p(Answer_k) * Entropy(Post_k)
                 expected_entropy = p_answers @ entropies_per_answer
                 
                 batch_gains[f_local_idx] = current_entropy - expected_entropy
@@ -165,9 +190,8 @@ class AkinatorEngine:
                current_scores: np.ndarray) -> np.ndarray:
         """
         Updates item scores based on a user's answer.
-        Applies a soft penalty (0.05) for contradictions to be robust to user error.
+        IMPROVEMENT 3: Uses a contradiction penalty proportional to contradiction severity.
         """
-        # Default to 0.5 ('sometimes') if the answer is not recognized
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         
         f_col = self.features[:, feature_idx]
@@ -179,56 +203,54 @@ class AkinatorEngine:
         
         likelihoods = self.likelihood_table[f_quant, a_idx].copy()
         
-        # --- FIX 2: STRONGER PENALTIES ---
-        # Changed penalty from 0.05 to 0.0001.
-        # This fixes the "furniture" / "paper clip" problem by making
-        # hard contradictions apply a massive score penalty.
-        if answer_val >= 0.9:  
-            contradictions = (f_col < 0.15) & (~nan_mask)
-            likelihoods[contradictions] *= 0.0001
-        elif answer_val <= 0.1:  
-            contradictions = (f_col > 0.85) & (~nan_mask)
-            likelihoods[contradictions] *= 0.0001
-        # --- END FIX 2 ---
+        # --- IMPROVEMENT 3: ADAPTIVE CONTRADICTION PENALTY ---
+        
+        # Calculate contradiction severity for each item
+        # Severity = 1.0 (maximal contradiction) when feature_val=1.0 and answer=0.0 (or vice versa)
+        # Severity = 0.0 (no contradiction) when feature_val=answer_val
+        
+        # Contradiction is high when feature value is far from the answer value
+        # and the feature value itself is "certain" (near 0 or 1).
+        
+        # Distance (0 to 1)
+        distance = np.abs(f_col - answer_val)
+        
+        # Certainty: how close the stored feature value is to 0 or 1
+        # Certainty is max(1 - 2*|f_col - 0.5|). It's 1 at 0/1 and 0 at 0.5.
+        certainty = np.clip(1.0 - 2.0 * np.abs(f_col - 0.5), 0.0, 1.0)
+        
+        # Contradiction Severity is proportional to how far the value is (distance) 
+        # AND how certain the existing value is (certainty).
+        severity = distance * certainty
+        
+        # Only apply penalty to non-NaN items
+        severity[nan_mask] = 0.0
+        
+        # Penalize items with severity > 0.5 (e.g., f=1.0, answer=0.5 => severity=0.5)
+        # Use a smooth penalty function: P = 1.0 - tanh(Severity * Factor)
+        # Factor determines how fast the penalty drops. 10 is aggressive.
+        
+        # Original penalty was 0.0001 (log likelihood of -9.2).
+        # We want likelihoods to approach 0.0001 for max severity.
+        
+        penalty_factor = 10.0
+        # This yields a multiplier between ~0.00004 (max severity) and 1.0 (min severity)
+        penalty_multiplier = np.exp(-penalty_factor * severity)
+        
+        # Apply the penalty (multiplier is always <= 1.0)
+        likelihoods *= penalty_multiplier
+        # --- END IMPROVEMENT 3 ---
 
         scores = np.log(likelihoods + 1e-10)
         
         new_cumulative_scores = current_scores + scores
 
         return new_cumulative_scores
-
-    def get_sparse_question_for_game(self, prior: np.ndarray, asked_features_names: set) -> tuple[str, str]:
-        """
-        Finds the best information-gain question from *only* sparse features.
-        Note: This is currently unused by select_question() but kept for
-        potential data collection or alternative game logic.
-        """
-        
-        candidates_to_eval = [
-            idx for idx in self.sparse_indices
-            if self.feature_cols[idx] not in asked_features_names
-        ]
-
-        if not candidates_to_eval:
-            return None, None
-
-        gains = self._compute_gains_batched(prior, np.array(candidates_to_eval), batch_size=32)
-        
-        if np.max(gains) < 1e-5:
-            return None, None
-
-        best_local_idx = np.argmax(gains)
-        best_feat_idx = candidates_to_eval[best_local_idx]
-        
-        feature_name = self.feature_cols[best_feat_idx]
-        question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
-        
-        return feature_name, question_text
         
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
         Selects the next best question using a temperature-based random choice.
-        Uses a controlled temperature decay to move from exploration to exploitation.
+        IMPROVEMENT 1 is applied here by penalizing gains from ambiguous features.
         """
         
         asked_set = set(asked_features)
@@ -240,49 +262,55 @@ class AkinatorEngine:
             print("[Question] No more features to ask.")
             return None, None
 
-        # Sub-sample candidates for performance, balancing top-ranked and random features.
-        if len(candidates_indices) > 100:
-            scored_candidates = []
-            for idx in candidates_indices:
-                initial_rank = np.where(self.sorted_initial_feature_indices == idx)[0]
-                rank_score = 1.0 / (initial_rank[0] + 1) if len(initial_rank) > 0 else 0
-                var_score = self.col_var[idx] / (np.max(self.col_var[self.allowed_feature_indices]) + 1e-5)
-                scored_candidates.append((idx, rank_score + var_score))
-            
-            scored_candidates.sort(key=lambda x: x[1], reverse=True)
-            top_candidates = [idx for idx, _ in scored_candidates[:80]]
-            
-            other_candidates = [idx for idx in candidates_indices if idx not in top_candidates]
-            if other_candidates:
-                random_extras = np.random.choice(other_candidates, 
-                                                 size=min(len(other_candidates), 20), 
-                                                 replace=False)
-                candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
-            else:
-                candidates_to_eval = np.array(top_candidates, dtype=np.int32)
-        else:
-            candidates_to_eval = np.array(candidates_indices, dtype=np.int32)
+        # Sub-sample candidates for performance (similar to original)
+        candidates_to_eval = self._select_candidate_subset(candidates_indices)
             
         if len(candidates_to_eval) == 0:
             return None, None
 
         gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=128)
         
+        # --- IMPROVEMENT 1: PENALIZE AMBIGUOUS FEATURES IN LIVE GAIN CALC ---
+        # Map candidates_to_eval indices back to col_nan_frac and col_ambiguity
+        
+        # Create a mapping from feature index to its position in the full feature list
+        idx_map = {idx: i for i, idx in enumerate(self.allowed_feature_indices)}
+        
+        penalty_gains = np.ones_like(gains)
+        
+        for i, feat_idx in enumerate(candidates_to_eval):
+            # Find the position of feat_idx in self.allowed_feature_indices
+            idx_in_allowed = idx_map.get(feat_idx) 
+            if idx_in_allowed is None:
+                 # Should not happen if candidates_to_eval is a subset of allowed_feature_indices
+                continue
+
+            nan_frac = self.col_nan_frac[feat_idx]
+            ambiguity = self.col_ambiguity[feat_idx]
+
+            # Stronger penalty for high NaNs or high ambiguity (mean near 0.5)
+            penalty = 1.0 - (
+                0.5 * nan_frac + 
+                0.5 * ambiguity
+            )
+            penalty = np.clip(penalty, 0.2, 1.0) # Cap penalty at 80% loss of gain
+            
+            penalty_gains[i] = gains[i] * penalty
+
+        # Use penalized gains for selection
+        gains = penalty_gains
+        # --- END IMPROVEMENT 1 ---
+        
         sorted_gain_indices = np.argsort(gains)[::-1]
         
-        # Less randomness (Top 2)
+        # Selection using temperature decay
         top_n = min(2, len(sorted_gain_indices))
         
         top_local_indices = sorted_gain_indices[:top_n]
         top_gains = gains[top_local_indices]
         
-        # --- PATIENCE FIX 3: SLOW DOWN DECAY ---
-        # The old implementation (0.3) decayed to 0.01 in 5 questions,
-        # stopping exploration too early.
-        # This new implementation (0.07) decays over ~20 questions
+        # PATIENCE FIX 3: SLOW DOWN DECAY (Q0=1.5, Q20=0.1)
         temperature = max(0.01, 1.5 - (question_count * 0.07))
-        # (Q0=1.5, Q5=1.15, Q10=0.8, Q15=0.45, Q20=0.1)
-        # --- END PATIENCE FIX 3 ---
         
         exp_gains = np.exp((top_gains - np.max(top_gains)) / (temperature + 1e-5))
         probs = exp_gains / np.sum(exp_gains)
@@ -295,8 +323,37 @@ class AkinatorEngine:
         
         return feature_name, question_text
 
+    def _select_candidate_subset(self, candidates_indices):
+        """Helper to sample feature candidates efficiently."""
+        if len(candidates_indices) <= 100:
+            return np.array(candidates_indices, dtype=np.int32)
+        
+        scored_candidates = []
+        for idx in candidates_indices:
+            # Score based on initial rank and variance (same as original)
+            initial_rank = np.where(self.sorted_initial_feature_indices == idx)[0]
+            rank_score = 1.0 / (initial_rank[0] + 1) if len(initial_rank) > 0 else 0
+            var_score = self.col_var[idx] / (np.max(self.col_var[self.allowed_feature_indices]) + 1e-5)
+            scored_candidates.append((idx, rank_score + var_score))
+        
+        scored_candidates.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = [idx for idx, _ in scored_candidates[:80]]
+        
+        other_candidates = [idx for idx in candidates_indices if idx not in top_candidates]
+        if other_candidates:
+            # Randomly sample remaining candidates
+            random_extras = np.random.choice(other_candidates, 
+                                             size=min(len(other_candidates), 20), 
+                                             replace=False)
+            candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
+        else:
+            candidates_to_eval = np.array(top_candidates, dtype=np.int32)
+            
+        return candidates_to_eval
+
     def get_discriminative_question(self, top_animal_idx: int, prior: np.ndarray, asked_features: list) -> tuple[str, str]:
         """Find a question that best separates the top candidate from its rivals."""
+        # ... (Implementation remains the same as it is already highly optimized) ...
         top_prob = prior[top_animal_idx]
         
         rival_threshold = top_prob * 0.2
@@ -330,13 +387,8 @@ class AkinatorEngine:
         
         best_local_idx = np.argmax(weighted_diffs)
         
-        # --- PATIENCE FIX 2: "SMART" QUESTIONING ---
-        # Lowered threshold from 0.20 to 0.05.
-        # This makes the engine EXTREMELY willing to ask a "smart"
-        # confirmation question, even if it's not a perfect separator.
-        # This directly addresses your "rat/plague" example.
+        # PATIENCE FIX 2: "SMART" QUESTIONING (Lowered threshold from 0.20 to 0.01)
         if weighted_diffs[best_local_idx] > 0.01: 
-        # --- END PATIENCE FIX 2 ---
             best_feat_idx = candidate_indices[best_local_idx]
             feature_name = self.feature_cols[best_feat_idx]
             return feature_name, self.questions_map.get(feature_name, f"Does it have {feature_name}?")
@@ -346,8 +398,7 @@ class AkinatorEngine:
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
         Determines if the engine is confident enough to make a guess.
-        This logic is now flexible, removing the hard requirement for a minimum
-        number of questions and instead relying on tiered confidence thresholds.
+        IMPROVEMENT 2: Guessing logic is now adaptive based on the number of active candidates.
         """
         q_count = game_state['question_count']
 
@@ -364,52 +415,91 @@ class AkinatorEngine:
 
         confidence_ratio = top_prob / (second_prob + 1e-9)
         entropy = self._calculate_entropy(probs)
+        
+        # --- IMPROVEMENT 2: ADAPTIVE GUESSING ---
+        # Get the number of remaining active candidates with probability > 0.001
+        n_active = np.sum(probs > 0.001)
+        
+        # Calculate a required minimum confidence ratio based on N_active
+        # Ratio Requirement = 1000 + (1000 * log10(N_active))
+        # N_active=1000 => Ratio=4000
+        # N_active=100  => Ratio=3000
+        # N_active=10   => Ratio=2000
+        # N_active=1    => Ratio=1000
+        ratio_requirement = 1000.0 + (1000.0 * np.log10(max(1.0, n_active)))
+        
+        # Minimum questions required before a guess
+        min_q = 15 + np.clip(int(np.log2(n_active)), 0, 10)
+        # N_active=1000 => min_q=25
+        # N_active=10   => min_q=18
+        # N_active=1    => min_q=15
 
-        # Prevent guessing again too soon after a rejection
+        # Prevent guessing again too soon after a rejection (PATIENCE FIX)
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 3:
                 return False, None, None
-            else:
-                # Reset for the next potential guess
-                game_state['continue_mode'] = False
-                game_state['questions_since_last_guess'] = 0
+            # Do not reset continue_mode/questions_since_last_guess here, 
+            # let service.py handle it after a successful guess attempt.
 
-        # Tier 1: High-Confidence Guess (can happen early)
-        # Requires near-certainty. Allows the engine to feel "smart" for obvious characters.
-        if top_prob > 0.95 and confidence_ratio > 1500 and entropy < 0.1:
-            print(f"[Q{q_count}] HIGH-CONFIDENCE GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+        # Tier 1: High-Confidence Guess (Can happen early if data is perfect)
+        if top_prob > 0.95 and confidence_ratio > 2000 and entropy < 0.1:
+            print(f"[Q{q_count}] HIGH-CONFIDENCE GUESS (Adaptive): prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
 
-        # --- FIX 1: INCREASED PATIENCE ---
-        # Raised q_count from 8 to 15 and ratio from 800 to 1000.
-        # This forces the engine to ask more questions before its
-        # first standard guess, addressing your primary complaint.
-        
-        # Tier 2: Standard-Confidence Guess (requires more questions)
-        if q_count > 15 and top_prob > 0.85 and confidence_ratio > 1000 and entropy < 0.5:
-            print(f"[Q{q_count}] STANDARD-CONFIDENCE GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+        # Tier 2: Standard-Confidence Guess (Requires sufficient questions and high ratio)
+        # Use the adaptive minimum question count and ratio requirement
+        if q_count >= min_q and top_prob > 0.85 and confidence_ratio > ratio_requirement and entropy < 0.5:
+            print(f"[Q{q_count}] STANDARD-CONFIDENCE GUESS (Adaptive): prob={top_prob:.3f}, ratio={confidence_ratio:.0f}, N_active={n_active:.0f}")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
 
-        # Raised q_count from 20 to 25 and ratio from 500 to 800.
-        # This makes the "long game" guess also require more certainty.
-        
-        # Tier 3: Final Attempt (for long games)
+        # Tier 3: Final Attempt (For long games where certainty is hard to reach)
+        # Fixed q_count of 25 for absolute finality, but still requires good ratio
         if q_count > 25 and top_prob > 0.75 and confidence_ratio > 800:
-            print(f"[Q{q_count}] EXTENDED-GAME GUESS: prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
+            print(f"[Q{q_count}] EXTENDED-GAME GUESS (Adaptive): prob={top_prob:.3f}, ratio={confidence_ratio:.0f}")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
-        # --- END FIX 1 ---
+        # --- END IMPROVEMENT 2 ---
 
         # If no thresholds are met, continue asking questions.
         return False, None, None
     
+    # ... (Other utility methods like get_sparse_question_for_game, 
+    # get_features_for_data_collection, _get_random_allowed_features, 
+    # _format_features, get_all_feature_gains, and to_delete remain the same) ...
+    
+    # Keeping the original to_delete and get_all_feature_gains for completeness and utility
+
+    def get_sparse_question_for_game(self, prior: np.ndarray, asked_features_names: set) -> tuple[str, str]:
+        """
+        Finds the best information-gain question from *only* sparse features.
+        """
+        # ... (Implementation remains the same) ...
+        candidates_to_eval = [
+            idx for idx in self.sparse_indices
+            if self.feature_cols[idx] not in asked_features_names
+        ]
+
+        if not candidates_to_eval:
+            return None, None
+
+        gains = self._compute_gains_batched(prior, np.array(candidates_to_eval), batch_size=32)
+        
+        if np.max(gains) < 1e-5:
+            return None, None
+
+        best_local_idx = np.argmax(gains)
+        best_feat_idx = candidates_to_eval[best_local_idx]
+        
+        feature_name = self.feature_cols[best_feat_idx]
+        question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
+        
+        return feature_name, question_text
+        
     def get_features_for_data_collection(self, item_name, num_features=5):
         """
         Gets a list of features for data collection for a specific item.
-        Prioritizes features that are unknown (NaN) for the item,
-        then falls back to globally sparse features.
         """
         try:
             matches = np.where(self.animals == item_name)[0]
@@ -446,7 +536,7 @@ class AkinatorEngine:
                 else:
                     selected_indices = useful_nan_indices
         else:
-            np.random_shuffle(useful_nan_indices)
+            np.random.shuffle(useful_nan_indices)
             selected_indices = useful_nan_indices[:num_features]
         
         if len(selected_indices) < num_features and len(self.allowed_feature_indices) >= num_features:
@@ -483,16 +573,10 @@ class AkinatorEngine:
             
         return results
     
-    """
-    New group of functions that help me figure out uneeded features that add no gain to the system
-    """
-    
-    # --- NEW FUNCTION ---
     def get_all_feature_gains(self, initial_prior: np.ndarray = None) -> list[dict]:
         """
         Calculates and returns the initial information gain for all
-        allowed features. This directly answers the question about
-        calculating gain for all features.
+        allowed features.
         """
         if initial_prior is None:
             if hasattr(self, 'uniform_prior'):
@@ -523,25 +607,10 @@ class AkinatorEngine:
         # Sort by gain, descending
         results.sort(key=lambda x: x['initial_gain'], reverse=True)
         return results
-    # --- END NEW FUNCTION ---
     
     def to_delete(self, similarity_threshold=0.85, min_variance=0.01, output_file='questions_to_delete.csv'):
         """
         Identifies and logs redundant, similar, or low-quality questions that should be deleted.
-        
-        Criteria for deletion:
-        1. Highly correlated features (similarity > threshold)
-        2. Low variance features (variance < min_variance)
-        3. Features with >95% missing data
-        4. Features that provide minimal information gain
-        
-        Args:
-            similarity_threshold: Correlation threshold above which features are considered redundant
-            min_variance: Minimum variance threshold for useful features
-            output_file: CSV file to save the deletion candidates
-            
-        Returns:
-            DataFrame with features to delete and their reasons
         """
         from datetime import datetime
         import os
@@ -601,7 +670,6 @@ class AkinatorEngine:
         allowed_indices = self.allowed_feature_indices
         redundant_pairs = []
         
-        # Sample correlation check for performance
         sample_size = min(len(allowed_indices), 200)
         if len(allowed_indices) > sample_size:
             indices_to_check = np.random.choice(allowed_indices, sample_size, replace=False)
@@ -613,7 +681,6 @@ class AkinatorEngine:
                 col1 = self.features[:, idx1]
                 col2 = self.features[:, idx2]
                 
-                # Only compare where both have data
                 valid_mask = ~np.isnan(col1) & ~np.isnan(col2)
                 if np.sum(valid_mask) < 10:
                     continue
@@ -621,7 +688,6 @@ class AkinatorEngine:
                 corr = np.corrcoef(col1[valid_mask], col2[valid_mask])[0, 1]
                 
                 if not np.isnan(corr) and abs(corr) > similarity_threshold:
-                    # Keep the feature with less missing data
                     if self.col_nan_frac[idx1] > self.col_nan_frac[idx2]:
                         redundant_idx = idx1
                         keeper_idx = idx2
@@ -631,7 +697,6 @@ class AkinatorEngine:
                     
                     redundant_pairs.append((redundant_idx, keeper_idx, corr))
         
-        # Add redundant features to deletion list
         seen_redundant = set()
         for redundant_idx, keeper_idx, corr in redundant_pairs:
             if redundant_idx in seen_redundant:
@@ -658,10 +723,8 @@ class AkinatorEngine:
             df_delete = pd.DataFrame(deletion_candidates)
             df_delete['timestamp'] = start_time.strftime('%Y-%m-%d %H:%M:%S')
             
-            # Sort by reason and nan_percentage
             df_delete = df_delete.sort_values(['reason', 'nan_percentage'], ascending=[True, False])
             
-            # Save to CSV
             df_delete.to_csv(output_file, index=False)
             
             print(f"\n{'='*60}")
