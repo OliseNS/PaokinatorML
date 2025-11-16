@@ -5,12 +5,12 @@ import os
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V5.0 - High Precision Mode).
+    Akinator guessing engine (V6.0 - "Blood Seeking" Mode).
 
-    CHANGES:
-    1. STRICT CONFIDENCE: Will NOT guess unless probability >= 94% (except at Q25 limit).
-    2. RANDOM START: Q1 is random from top features to vary gameplay.
-    3. DISCRIMINATION: Aggressive tie-breaking logic when two items are close.
+    STRATEGY:
+    1. TIERED OPENING: Q1 (Top 50) -> Q2 (Top 10) -> Q3 (Top 5) -> Q4+ (Greedy).
+    2. HARD VETO: Massive penalties for contradictions (prevents "Blackboard" scenarios).
+    3. FAST CONVERGENCE: Tighter sigma curves to eliminate candidates quickly.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -20,7 +20,7 @@ class AkinatorEngine:
         
         self.MAX_QUESTIONS = None 
         
-        # Granular answer values for precision
+        # Granular answer values
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         
         self.fuzzy_map = {
@@ -34,12 +34,10 @@ class AkinatorEngine:
         self._precompute_likelihood_tables()
         self._build_arrays()
         print(f"✓ Engine initialized: {len(self.animals)} items, {len(self.feature_cols)} features.")
-        if len(self.allowed_feature_indices) < len(self.feature_cols):
-            print(f"  (Filtered {len(self.feature_cols) - len(self.allowed_feature_indices)} unusable features)")
 
     def _precompute_likelihood_tables(self):
         """
-        Likelihood calculation with adaptive sigma to punish mismatches.
+        Likelihood calculation with TIGHTER sigma to force faster convergence.
         """
         steps = 101
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
@@ -51,19 +49,21 @@ class AkinatorEngine:
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
                 
-                # Tighter sigma for definite answers (0.0/1.0) to drive probabilities apart faster
+                # Tighter sigmas for faster convergence
                 if a_val == 1.0 or a_val == 0.0:
-                    sigma = 0.06
+                    sigma = 0.05  # Very sharp for Yes/No
                 elif a_val == 0.75 or a_val == 0.25:
-                    sigma = 0.12
+                    sigma = 0.10  # Sharp for Probably/Rarely
                 else:
-                    sigma = 0.18
+                    sigma = 0.15  # Looser for Don't Know/Sometimes
 
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
-                self.likelihood_table[i, j] = max(likelihood, 0.001)
+                
+                # Floor at a small epsilon, but not too small to allow penalties to work
+                self.likelihood_table[i, j] = max(likelihood, 0.0001)
 
     def _build_arrays(self):
-        """Converts dataframe to optimized numpy arrays with quality metrics."""
+        """Converts dataframe to optimized numpy arrays."""
         self.animals = self.df['animal_name'].values
         
         self.features = self.df[self.feature_cols].values.astype(np.float32)
@@ -73,33 +73,30 @@ class AkinatorEngine:
         
         nan_masked_features = np.ma.masked_invalid(self.features)
         col_var = nan_masked_features.var(axis=0).data
-        
         col_mean = nan_masked_features.mean(axis=0).data
         self.col_ambiguity = 1.0 - 2.0 * np.abs(col_mean - 0.5)
 
+        # Filter features that are 100% empty
         self.allowed_feature_mask = (self.col_nan_frac < 1.0)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
 
+        # Identify sparse features for data collection phases
         sparse_mask = (self.col_nan_frac >= 0.50) & self.allowed_feature_mask
         self.sparse_indices = np.where(sparse_mask)[0].astype(np.int32)
         
         self.col_var = col_var
         
+        # Precompute initial importance for Q1 heuristic
         if len(self.animals) > 0:
             n = len(self.animals)
             self.uniform_prior = np.ones(n, dtype=np.float32) / n
             
-            initial_gains = self._compute_gains_batched(self.uniform_prior, self.allowed_feature_indices, batch_size=256)
+            # Simple variance-based heuristic for fast startup
+            initial_gains = col_var[self.allowed_feature_indices]
             
-            variance_boost = col_var[self.allowed_feature_indices] / (np.max(col_var[self.allowed_feature_indices]) + 1e-5)
-            
-            penalty = 1.0 - (
-                0.4 * self.col_nan_frac[self.allowed_feature_indices] + 
-                0.4 * self.col_ambiguity[self.allowed_feature_indices]
-            )
-            penalty = np.clip(penalty, 0.3, 1.0)
-            
-            boosted_gains = initial_gains * (1.0 + variance_boost * 0.6) * penalty
+            # Penalize empty columns
+            penalty = 1.0 - (0.5 * self.col_nan_frac[self.allowed_feature_indices])
+            boosted_gains = initial_gains * penalty
             
             sorted_indices = np.argsort(boosted_gains)[::-1]
             self.sorted_initial_feature_indices = self.allowed_feature_indices[sorted_indices]
@@ -108,12 +105,11 @@ class AkinatorEngine:
             self.sorted_initial_feature_indices = np.array([], dtype=np.int32)
 
     def _calculate_entropy(self, probs: np.ndarray) -> float:
-        """Robust Shannon entropy calculation."""
         p = np.clip(probs, 1e-10, 1.0)
         return -np.sum(p * np.log2(p))
 
     def _compute_gains_batched(self, prior: np.ndarray, feature_indices: np.ndarray, batch_size: int = 64) -> np.ndarray:
-        """Computes information gain in batches for memory efficiency."""
+        """Computes information gain."""
         n_features = len(feature_indices)
         n_answers = len(self.answer_values)
         gains = np.zeros(n_features, dtype=np.float32)
@@ -122,45 +118,54 @@ class AkinatorEngine:
         if current_entropy < 1e-5 or n_features == 0:
             return gains
 
+        # Optimization: Only look at animals with > 0 probability
         active_mask = prior > 1e-6
         n_active = np.sum(active_mask)
         
         if n_active < len(prior) * 0.8 and n_active > 0:
             active_prior = prior[active_mask]
             active_prior = active_prior / active_prior.sum()
+            active_features_subset = self.features[active_mask]
         else:
             active_prior = prior
+            active_features_subset = self.features
             active_mask = slice(None)
-            n_active = len(prior)
 
-        if n_active == 0:
-            return gains
+        if n_active == 0: return gains
 
+        # Iterate in batches
         for i in range(0, n_features, batch_size):
             end = min(i + batch_size, n_features)
             batch_indices = feature_indices[i:end]
             
-            f_batch = self.features[active_mask][:, batch_indices]
+            # Get features for active animals
+            f_batch = active_features_subset[:, batch_indices]
+            
+            # Quantize features for lookup
             f_batch_filled = np.nan_to_num(f_batch, nan=0.5)
             f_batch_quant = np.clip(np.rint(f_batch_filled * 100), 0, 100).astype(np.int16)
 
+            # Look up likelihoods
             likelihoods = self.likelihood_table[f_batch_quant]
 
+            # Handle NaNs (neutral likelihood)
             nan_batch_mask = np.isnan(f_batch)
-            nan_expand = np.repeat(nan_batch_mask[:, :, np.newaxis], n_answers, axis=2)
-            likelihoods[nan_expand] = 1.0
+            if np.any(nan_batch_mask):
+                nan_expand = np.repeat(nan_batch_mask[:, :, np.newaxis], n_answers, axis=2)
+                likelihoods[nan_expand] = 1.0
 
             batch_gains = np.zeros(len(batch_indices), dtype=np.float32)
             
+            # Vectorized Entropy Calculation
             for f_local_idx in range(len(batch_indices)):
                 L_f = likelihoods[:, f_local_idx, :]
-                p_answers = active_prior @ L_f
+                p_answers = active_prior @ L_f # Probability of user giving each answer
                 
                 posteriors = active_prior[:, np.newaxis] * L_f
                 posteriors /= (p_answers + 1e-10)
-                posteriors = np.clip(posteriors, 1e-10, 1.0)
                 
-                p_logs = np.log2(posteriors)
+                # Fast entropy
+                p_logs = np.log2(np.clip(posteriors, 1e-10, 1.0))
                 entropies_per_answer = -np.sum(posteriors * p_logs, axis=0)
                 expected_entropy = p_answers @ entropies_per_answer
                 
@@ -171,124 +176,134 @@ class AkinatorEngine:
         return gains
 
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """Updates probability scores based on answer with contradiction handling."""
+        """
+        Updates scores with HARD VETO logic for contradictions.
+        This fixes the 'Blackboard' vs 'Electronics' issue.
+        """
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         
         f_col = self.features[:, feature_idx]
         nan_mask = self.nan_mask[:, feature_idx]
         
+        # 1. Standard Gaussian Update
         f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 100), 0, 100).astype(np.int32)
         a_idx = np.abs(self.answer_values - answer_val).argmin()
-        
         likelihoods = self.likelihood_table[f_quant, a_idx].copy()
         
-        # Contradiction penalty
-        distance = np.abs(f_col - answer_val)
-        certainty = np.clip(1.0 - 2.0 * np.abs(f_col - 0.5), 0.0, 1.0)
-        severity = distance * certainty
-        severity[nan_mask] = 0.0
+        # 2. THE VETO: Hard Penalty for contradictions
+        # If user says "Yes" (1.0) and animal is "No" (0.0) -> Diff is 1.0
+        # If user says "No" (0.0) and animal is "Yes" (1.0) -> Diff is 1.0
+        diff = np.abs(f_col - answer_val)
         
-        penalty_factor = 12.0
-        penalty_multiplier = np.exp(-penalty_factor * severity)
+        # We apply a massive penalty if the difference is huge (> 0.8).
+        # This effectively kills the candidate, unless it was the only one left.
+        veto_mask = (diff > 0.8) & (~nan_mask)
         
-        likelihoods *= penalty_multiplier
-
+        # Apply standard update
         scores = np.log(likelihoods + 1e-10)
-        new_cumulative_scores = current_scores + scores
+        
+        # Apply VETO penalty (approx -25.0 in log space is massive)
+        scores[veto_mask] -= 25.0 
 
+        new_cumulative_scores = current_scores + scores
         return new_cumulative_scores
         
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
-        Smart question selection.
-        - Q1: Random from top features (Exploration/Variety)
-        - Q2-Q14: Greedy Info Gain
-        - Q15+: Discriminative (Tie-breaking)
+        Tiered selection strategy:
+        Q1: Random Top 50
+        Q2: Random Top 10
+        Q3: Random Top 5
+        Q4+: Pure Greedy (Top 1)
         """
         asked_set = set(asked_features)
-        candidates_indices = [idx for idx in self.allowed_feature_indices 
-                              if self.feature_cols[idx] not in asked_set]
-
-        if not candidates_indices:
-            print("[Question] No more features to ask.")
-            return None, None
-
-        # Q1: Random exploration from top features (Kept as per request)
+        
+        # 1. Determine Candidate Pool Size based on Game Stage
         if question_count == 0:
-            top_20_pct = max(1, len(self.sorted_initial_feature_indices) // 5)
-            available_top = [idx for idx in self.sorted_initial_feature_indices[:top_20_pct] 
-                           if idx in candidates_indices]
-            
-            if available_top:
-                best_feat_idx = np.random.choice(available_top)
-                feature_name = self.feature_cols[best_feat_idx]
-                question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
-                print(f"[Q1] EXPLORATION: Random question from top features")
-                return feature_name, question_text
+            candidates_to_eval = self.sorted_initial_feature_indices[:200] # Eval top 200 to find top 50
+        elif question_count < 4:
+            candidates_indices = [idx for idx in self.allowed_feature_indices 
+                                  if self.feature_cols[idx] not in asked_set]
+            # Heuristic trim to speed up calculation, but keep enough for accurate top-k
+            candidates_to_eval = self._select_candidate_subset(candidates_indices, limit=150) 
+        else:
+            # Greedy Mode: Optimize heavily
+            candidates_indices = [idx for idx in self.allowed_feature_indices 
+                                  if self.feature_cols[idx] not in asked_set]
+            candidates_to_eval = self._select_candidate_subset(candidates_indices, limit=100)
 
-        # Check if we should use discriminative questions (Q15+)
-        if question_count >= 14:
-            top_idx = np.argmax(prior)
-            top_prob = prior[top_idx]
-            
-            # If we have a leader (>40%) but haven't hit 94%, we need to specifically attack rivals
-            if top_prob > 0.40 and top_prob < 0.94:
-                discriminative_q = self.get_discriminative_question(top_idx, prior, asked_features)
-                if discriminative_q[0] is not None:
-                    print(f"[Q{question_count + 1}] DISCRIMINATIVE: Separating top candidate (prob={top_prob:.3f})")
-                    return discriminative_q
-
-        # Standard greedy information gain
-        candidates_to_eval = self._select_candidate_subset(candidates_indices)
-            
         if len(candidates_to_eval) == 0:
             return None, None
 
+        # 2. Compute Information Gain (The "Blood Seeking" part)
         gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=128)
         
-        # Apply quality penalties to prefer clean data
+        # Apply quality penalties (prefer questions with less NaNs)
         penalty_gains = np.ones_like(gains)
         for i, feat_idx in enumerate(candidates_to_eval):
             nan_frac = self.col_nan_frac[feat_idx]
             ambiguity = self.col_ambiguity[feat_idx]
-            penalty = 1.0 - (0.6 * nan_frac + 0.5 * ambiguity)
-            penalty = np.clip(penalty, 0.15, 1.0)
+            # Less penalty than before to prioritize pure splitting power
+            penalty = 1.0 - (0.3 * nan_frac + 0.2 * ambiguity) 
             penalty_gains[i] = gains[i] * penalty
 
-        gains = penalty_gains
+        # 3. Selection Logic based on Turn
         
-        # Select best gain
-        best_local_idx = np.argmax(gains)
-        best_feat_idx = candidates_to_eval[best_local_idx]
+        # Sort candidates by gain (Desc)
+        sorted_local_indices = np.argsort(penalty_gains)[::-1]
+        sorted_real_indices = candidates_to_eval[sorted_local_indices]
         
+        # Ensure we have enough candidates to sample from
+        n_available = len(sorted_real_indices)
+        
+        if question_count == 0:
+            # Random from Top 50
+            top_k = min(50, n_available)
+            choice_idx = np.random.choice(top_k)
+            best_feat_idx = sorted_real_indices[choice_idx]
+            print(f"[Q1] Opening: Selected rank {choice_idx+1}/{top_k} (Gain: {penalty_gains[sorted_local_indices[choice_idx]]:.4f})")
+            
+        elif question_count == 1:
+            # Random from Top 10
+            top_k = min(10, n_available)
+            choice_idx = np.random.choice(top_k)
+            best_feat_idx = sorted_real_indices[choice_idx]
+            print(f"[Q2] Narrowing: Selected rank {choice_idx+1}/{top_k}")
+            
+        elif question_count == 2:
+            # Random from Top 5
+            top_k = min(5, n_available)
+            choice_idx = np.random.choice(top_k)
+            best_feat_idx = sorted_real_indices[choice_idx]
+            print(f"[Q3] Precision: Selected rank {choice_idx+1}/{top_k}")
+            
+        else:
+            # Q4+: PURE GREEDY BLOOD SEEKING
+            best_feat_idx = sorted_real_indices[0]
+            # print(f"[Q{question_count+1}] GREEDY: Best Gain {penalty_gains[sorted_local_indices[0]]:.4f}")
+
         feature_name = self.feature_cols[best_feat_idx]
         question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
         
         return feature_name, question_text
 
-    def _select_candidate_subset(self, candidates_indices):
-        """Helper to sample feature candidates efficiently."""
-        if len(candidates_indices) <= 120:
+    def _select_candidate_subset(self, candidates_indices, limit=100):
+        """Heuristic to select which features to calculate gain for."""
+        if len(candidates_indices) <= limit:
             return np.array(candidates_indices, dtype=np.int32)
         
+        # Score based on variance and initial rank (pre-computed)
         scored_candidates = []
         for idx in candidates_indices:
-            initial_rank = np.where(self.sorted_initial_feature_indices == idx)[0]
-            rank_score = 1.0 / (initial_rank[0] + 1) if len(initial_rank) > 0 else 0
-            var_score = self.col_var[idx] / (np.max(self.col_var[self.allowed_feature_indices]) + 1e-5)
-            scored_candidates.append((idx, rank_score + var_score))
+            # Using cached variance
+            score = self.col_var[idx]
+            scored_candidates.append((idx, score))
         
+        # Sort by raw variance as a heuristic proxy for information gain
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = [idx for idx, _ in scored_candidates[:90]]
+        top_candidates = [idx for idx, _ in scored_candidates[:limit]]
         
-        other_candidates = [idx for idx in candidates_indices if idx not in top_candidates]
-        if other_candidates:
-            random_extras = np.random.choice(other_candidates, size=min(len(other_candidates), 30), replace=False)
-            candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
-        else:
-            candidates_to_eval = np.array(top_candidates, dtype=np.int32)
-            
-        return candidates_to_eval
+        return np.array(top_candidates, dtype=np.int32)
 
     def get_discriminative_question(self, top_animal_idx: int, prior: np.ndarray, asked_features: list) -> tuple[str, str]:
         """Finds questions that best separate top candidate from rivals."""
@@ -299,10 +314,7 @@ class AkinatorEngine:
         rival_indices = np.where(rival_mask)[0]
         
         if len(rival_indices) == 0:
-            rival_indices = np.where(prior > 0.001)[0]
-            rival_indices = rival_indices[rival_indices != top_animal_idx]
-            if len(rival_indices) == 0:
-                return None, None
+            return None, None
             
         asked_set = set(asked_features)
         candidate_indices = [idx for idx in self.allowed_feature_indices 
@@ -311,6 +323,7 @@ class AkinatorEngine:
         if not candidate_indices:
             return None, None
 
+        # Calculate average difference between Top Dog and Rivals
         top_feats = self.features[top_animal_idx, candidate_indices]
         rival_feats = self.features[rival_indices][:, candidate_indices]
         rival_weights = prior[rival_indices]
@@ -318,12 +331,15 @@ class AkinatorEngine:
         avg_rival_feats = np.average(rival_feats, axis=0, weights=rival_weights)
         
         diffs = np.abs(np.nan_to_num(top_feats, nan=0.5) - np.nan_to_num(avg_rival_feats, nan=0.5))
-        opinion_strength = 1.0 + 2.0 * np.abs(np.nan_to_num(top_feats, nan=0.5) - 0.5)
-        weighted_diffs = diffs * opinion_strength
+        
+        # Prioritize features where the Top Dog has a STRONG opinion (0 or 1)
+        # We don't want to ask something where the top dog is "Maybe"
+        certainty = 1.0 + 2.0 * np.abs(np.nan_to_num(top_feats, nan=0.5) - 0.5)
+        weighted_diffs = diffs * certainty
         
         best_local_idx = np.argmax(weighted_diffs)
         
-        if weighted_diffs[best_local_idx] > 0.15:
+        if weighted_diffs[best_local_idx] > 0.25:
             best_feat_idx = candidate_indices[best_local_idx]
             feature_name = self.feature_cols[best_feat_idx]
             return feature_name, self.questions_map.get(feature_name, f"Does it have {feature_name}?")
@@ -332,8 +348,7 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
             """
-            STRICT GUESSING LOGIC:
-            Only guesses if probability >= 94%, OR if we hit the safety question limit (Q25).
+            Decides if we should stop and guess.
             """
             q_count = game_state['question_count']
 
@@ -347,63 +362,27 @@ class AkinatorEngine:
             probs_copy = probs.copy()
             probs_copy[top_idx] = 0.0
             second_prob = np.max(probs_copy)
-
-            # Ratio of Top / Second best (e.g., 0.95 / 0.01 = 95)
-            confidence_ratio = top_prob / (second_prob + 1e-9)
             
-            # Prevent guessing too soon after a user rejection
+            # Prevent guessing too soon after a user rejection in continue mode
             if game_state.get('continue_mode', False):
-                # If we are continuing, ALWAYS wait at least 4 questions before trying again
-                # regardless of the total question count.
                 if game_state.get('questions_since_last_guess', 0) < 4:
                     return False, None, None
 
-            # --- TIER 1: SAFETY NET (Q25) ---
-            # Must guess here to prevent infinite games, even if prob < 94%.
-            # FIX: Only force this if we aren't already in continue mode.
+            # --- 1. Forced Safety Net (Q25) ---
             if q_count >= 25 and not game_state.get('continue_mode', False):
-                print(f"[Q{q_count}] FORCED GUESS (Safety Net): prob={top_prob:.4f}")
-                game_state['has_made_initial_guess'] = True
                 return True, top_animal, 'final'
 
-            # --- TIER 2: ULTRA CONFIDENT (Early Game) ---
-            if top_prob > 0.98 and confidence_ratio > 500 and q_count >= 5:
-                print(f"[Q{q_count}] INSTANT CERTAINTY: prob={top_prob:.4f}")
-                game_state['has_made_initial_guess'] = True
+            # --- 2. Instant Victory (Early Game) ---
+            # If prob > 97% and we have a massive lead
+            if top_prob > 0.97 and top_prob > (second_prob * 100) and q_count >= 5:
                 return True, top_animal, 'final'
 
-            # --- TIER 3: HIGH PRECISION (Standard Win) ---
-            # STRICT 94% THRESHOLD
-            if top_prob >= 0.94 and confidence_ratio > 100 and q_count >= 10:
-                print(f"[Q{q_count}] PRECISION GUESS: prob={top_prob:.4f}")
-                game_state['has_made_initial_guess'] = True
+            # --- 3. Standard Win (Late Game) ---
+            if top_prob >= 0.94 and top_prob > (second_prob * 10) and q_count >= 10:
                 return True, top_animal, 'final'
 
-            # No guess if below 94% and not at Q25
             return False, None, None
-    def get_sparse_question_for_game(self, prior: np.ndarray, asked_features_names: set) -> tuple[str, str]:
-        """Finds the best information-gain question from *only* sparse features."""
-        candidates_to_eval = [
-            idx for idx in self.sparse_indices
-            if self.feature_cols[idx] not in asked_features_names
-        ]
 
-        if not candidates_to_eval:
-            return None, None
-
-        gains = self._compute_gains_batched(prior, np.array(candidates_to_eval), batch_size=32)
-        
-        if np.max(gains) < 1e-5:
-            return None, None
-
-        best_local_idx = np.argmax(gains)
-        best_feat_idx = candidates_to_eval[best_local_idx]
-        
-        feature_name = self.feature_cols[best_feat_idx]
-        question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
-        
-        return feature_name, question_text
-        
     def get_features_for_data_collection(self, item_name, num_features=5):
         """Gets a list of features for data collection for a specific item."""
         try:
@@ -480,7 +459,6 @@ class AkinatorEngine:
         indices_to_calc = self.allowed_feature_indices
         if len(indices_to_calc) == 0: return []
         
-        print(f"Calculating gains for {len(indices_to_calc)} features...")
         gains = self._compute_gains_batched(initial_prior, indices_to_calc, batch_size=128)
         
         results = []
@@ -497,14 +475,11 @@ class AkinatorEngine:
         return results
  
     def to_delete(self, similarity_threshold=0.85, min_variance=0.01, output_file='questions_to_delete.csv'):
-            """Identifies and logs redundant, similar, or low-quality questions that should be deleted."""
+            """Identifies and logs redundant, similar, or low-quality questions."""
             start_time = datetime.now()
-            print(f"\n{'='*60}\nStarted redundancy analysis at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n{'='*60}\n")
-            
             deletion_candidates = []
             
-            # 1. Find features with excessive missing data (>95%)
-            print("Checking for features with excessive missing data...")
+            # 1. Excessive missing data
             high_nan_mask = self.col_nan_frac >= 0.40
             high_nan_indices = np.where(high_nan_mask)[0]
             
@@ -519,8 +494,7 @@ class AkinatorEngine:
                     'correlation_with': None
                 })
             
-            # 2. Find low variance features
-            print("Checking for low variance features...")
+            # 2. Low variance
             valid_var_mask = ~np.isnan(self.col_var) & (self.col_var < min_variance)
             low_var_indices = np.where(valid_var_mask)[0]
             
@@ -535,53 +509,6 @@ class AkinatorEngine:
                     'variance': float(self.col_var[idx]),
                     'correlation_with': None
                 })
-            
-            # 3. Find highly correlated (redundant) features
-            print("Checking for highly correlated features...")
-            allowed_indices = self.allowed_feature_indices
-            redundant_pairs = []
-            sample_size = min(len(allowed_indices), 200)
-            indices_to_check = np.random.choice(allowed_indices, sample_size, replace=False) if len(allowed_indices) > sample_size else allowed_indices
-            
-            for i, idx1 in enumerate(indices_to_check):
-                for idx2 in indices_to_check[i+1:]:
-                    col1 = self.features[:, idx1]
-                    col2 = self.features[:, idx2]
-                    valid_mask = ~np.isnan(col1) & ~np.isnan(col2)
-                    
-                    # Skip if not enough overlapping data points
-                    if np.sum(valid_mask) < 10: continue
-                    
-                    c1_masked = col1[valid_mask]
-                    c2_masked = col2[valid_mask]
-                    
-                    # FIX: Check for zero variance in the masked subset to avoid RuntimeWarning
-                    if np.std(c1_masked) == 0 or np.std(c2_masked) == 0:
-                        continue
-
-                    corr = np.corrcoef(c1_masked, c2_masked)[0, 1]
-                    
-                    if not np.isnan(corr) and abs(corr) > similarity_threshold:
-                        if self.col_nan_frac[idx1] > self.col_nan_frac[idx2]:
-                            redundant_pairs.append((idx1, idx2, corr))
-                        else:
-                            redundant_pairs.append((idx2, idx1, corr))
-            
-            seen_redundant = set()
-            for redundant_idx, keeper_idx, corr in redundant_pairs:
-                if redundant_idx in seen_redundant: continue
-                fname_redundant = self.feature_cols[redundant_idx]
-                fname_keeper = self.feature_cols[keeper_idx]
-                
-                deletion_candidates.append({
-                    'feature_name': fname_redundant,
-                    'question_text': self.questions_map.get(fname_redundant, f"Does it have {fname_redundant}?"),
-                    'reason': 'highly_correlated',
-                    'nan_percentage': float(self.col_nan_frac[redundant_idx]),
-                    'variance': float(self.col_var[redundant_idx]) if not np.isnan(self.col_var[redundant_idx]) else 0.0,
-                    'correlation_with': f"{fname_keeper} (r={corr:.3f})"
-                })
-                seen_redundant.add(redundant_idx)
             
             if deletion_candidates:
                 df_delete = pd.DataFrame(deletion_candidates)
