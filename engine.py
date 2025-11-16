@@ -268,12 +268,12 @@ class AkinatorEngine:
             if game_state.get('questions_since_last_guess', 0) < 8:
                 return False, None, None
         # --- TIER 1: ABSOLUTE CERTAINTY ---
-        if top_prob >= 0.98 and q_count >= 10:
+        if top_prob >= 0.995 and q_count >= 10:
             print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
         # --- TIER 2: SAFETY NET (Q35) ---
-        if q_count >= 35 and not game_state.get('continue_mode', False):
+        if q_count >= 20 and not game_state.get('continue_mode', False):
             print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
