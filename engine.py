@@ -24,7 +24,7 @@ class AkinatorEngine:
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0,
             'mostly': 0.75, 'usually': 0.75, 'probably': 0.75,
-            'sort of': 0.5, 'sometimes': 0.5, 
+            'sort of': 0.5, 'sometimes': 0.5,
             'not really': 0.25, 'rarely': 0.25,
             'no': 0.0, 'n': 0.0,
         }
@@ -32,10 +32,10 @@ class AkinatorEngine:
         self._precompute_likelihood_tables()
         self._build_arrays()
         print(f"✓ Engine initialized: {len(self.animals)} items, {len(self.feature_cols)} features.")
-
+    
     def _precompute_likelihood_tables(self):
         """Likelihood calculation with adaptive sigma."""
-        steps = 101
+        steps = 1001  # Increased for higher resolution
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
         n_answers = len(self.answer_values)
         
@@ -51,10 +51,9 @@ class AkinatorEngine:
                     sigma = 0.12
                 else:
                     sigma = 0.18
-
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
                 self.likelihood_table[i, j] = max(likelihood, 0.001)
-
+    
     def _build_arrays(self):
         """Converts dataframe to optimized numpy arrays."""
         self.animals = self.df['animal_name'].values
@@ -67,10 +66,8 @@ class AkinatorEngine:
         col_var = nan_masked_features.var(axis=0).data
         col_mean = nan_masked_features.mean(axis=0).data
         self.col_ambiguity = 1.0 - 2.0 * np.abs(col_mean - 0.5)
-
         self.allowed_feature_mask = (self.col_nan_frac < 1.0)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
-
         sparse_mask = (self.col_nan_frac >= 0.50) & self.allowed_feature_mask
         self.sparse_indices = np.where(sparse_mask)[0].astype(np.int32)
         self.col_var = col_var
@@ -91,12 +88,12 @@ class AkinatorEngine:
         else:
             self.uniform_prior = np.array([], dtype=np.float32)
             self.sorted_initial_feature_indices = np.array([], dtype=np.int32)
-
+    
     def _calculate_entropy(self, probs: np.ndarray) -> float:
         """Robust Shannon entropy calculation."""
         p = np.clip(probs, 1e-10, 1.0)
         return -np.sum(p * np.log2(p))
-
+    
     def _compute_gains_batched(self, prior: np.ndarray, feature_indices: np.ndarray, batch_size: int = 64) -> np.ndarray:
         """Computes information gain in batches."""
         n_features = len(feature_indices)
@@ -106,7 +103,6 @@ class AkinatorEngine:
         current_entropy = self._calculate_entropy(prior)
         if current_entropy < 1e-5 or n_features == 0:
             return gains
-
         active_mask = prior > 1e-6
         n_active = np.sum(active_mask)
         
@@ -116,22 +112,18 @@ class AkinatorEngine:
         else:
             active_prior = prior
             active_mask = slice(None)
-
         if n_active == 0: return gains
-
         for i in range(0, n_features, batch_size):
             end = min(i + batch_size, n_features)
             batch_indices = feature_indices[i:end]
             
             f_batch = self.features[active_mask][:, batch_indices]
             f_batch_filled = np.nan_to_num(f_batch, nan=0.5)
-            f_batch_quant = np.clip(np.rint(f_batch_filled * 100), 0, 100).astype(np.int16)
-
+            f_batch_quant = np.clip(np.rint(f_batch_filled * 1000), 0, 1000).astype(np.int32)  # Updated for higher resolution
             likelihoods = self.likelihood_table[f_batch_quant]
             nan_batch_mask = np.isnan(f_batch)
             nan_expand = np.repeat(nan_batch_mask[:, :, np.newaxis], n_answers, axis=2)
             likelihoods[nan_expand] = 1.0
-
             batch_gains = np.zeros(len(batch_indices), dtype=np.float32)
             
             for f_local_idx in range(len(batch_indices)):
@@ -145,18 +137,17 @@ class AkinatorEngine:
                 entropies_per_answer = -np.sum(posteriors * p_logs, axis=0)
                 expected_entropy = p_answers @ entropies_per_answer
                 batch_gains[f_local_idx] = current_entropy - expected_entropy
-
             gains[i:end] = batch_gains
             
         return gains
-
+    
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
         """Updates probability scores based on answer."""
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         f_col = self.features[:, feature_idx]
         nan_mask = self.nan_mask[:, feature_idx]
         
-        f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 100), 0, 100).astype(np.int32)
+        f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 1000), 0, 1000).astype(np.int32)  # Updated for higher resolution
         a_idx = np.abs(self.answer_values - answer_val).argmin()
         likelihoods = self.likelihood_table[f_quant, a_idx].copy()
         
@@ -169,7 +160,6 @@ class AkinatorEngine:
         penalty_factor = 12.0
         penalty_multiplier = np.exp(-penalty_factor * severity)
         likelihoods *= penalty_multiplier
-
         scores = np.log(likelihoods + 1e-10)
         return current_scores + scores
         
@@ -181,18 +171,16 @@ class AkinatorEngine:
         - Q2+: Greedy max entropy.
         """
         asked_set = set(asked_features)
-        candidates_indices = [idx for idx in self.allowed_feature_indices 
+        candidates_indices = [idx for idx in self.allowed_feature_indices
                               if self.feature_cols[idx] not in asked_set]
-
         if not candidates_indices:
             print("[Question] No more features to ask.")
             return None, None
-
         # --- Q0: Fast Random Start ---
         # Uses pre-computed 'sorted_initial_feature_indices' for speed and variety.
         if question_count == 0:
             top_20_pct = max(1, len(self.sorted_initial_feature_indices) // 5)
-            available_top = [idx for idx in self.sorted_initial_feature_indices[:top_20_pct] 
+            available_top = [idx for idx in self.sorted_initial_feature_indices[:top_20_pct]
                            if idx in candidates_indices]
             if available_top:
                 best_feat_idx = np.random.choice(available_top)
@@ -200,11 +188,9 @@ class AkinatorEngine:
                 question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
                 print(f"[Q1] START: Random selection from top 20% features.")
                 return feature_name, question_text
-
         # --- Calculate Real Information Gain ---
         candidates_to_eval = self._select_candidate_subset(candidates_indices)
         if len(candidates_to_eval) == 0: return None, None
-
         gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=128)
         
         # Quality Penalties
@@ -241,7 +227,7 @@ class AkinatorEngine:
         question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
         
         return feature_name, question_text
-
+    
     def _select_candidate_subset(self, candidates_indices):
         """Helper to sample feature candidates efficiently."""
         if len(candidates_indices) <= 120:
@@ -264,40 +250,35 @@ class AkinatorEngine:
         else:
             candidates_to_eval = np.array(top_candidates, dtype=np.int32)
         return candidates_to_eval
-
+    
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
-            """
-            STRICT GUESSING LOGIC:
-            1. High Confidence (>95%).
-            2. Safety Net (Q25) ONLY if we haven't made a guess yet.
-            """
-            q_count = game_state['question_count']
-
-            if probs.sum() < 1e-10:
-                return False, None, None
-
-            top_idx = np.argmax(probs)
-            top_prob = probs[top_idx]
-            top_animal = self.animals[top_idx]
-            
-            if game_state.get('continue_mode', False):
-                if game_state.get('questions_since_last_guess', 0) < 5:
-                    return False, None, None
-
-            # --- TIER 1: ABSOLUTE CERTAINTY ---
-            if top_prob >= 0.95:
-                print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f})")
-                game_state['has_made_initial_guess'] = True
-                return True, top_animal, 'final'
-
-            # --- TIER 2: SAFETY NET (Q25) ---
-            if q_count >= 25 and not game_state.get('continue_mode', False):
-                print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
-                game_state['has_made_initial_guess'] = True
-                return True, top_animal, 'final'
-
+        """
+        STRICT GUESSING LOGIC:
+        1. High Confidence (>98%) after at least 10 questions.
+        2. Safety Net (Q35) ONLY if we haven't made a guess yet.
+        """
+        q_count = game_state['question_count']
+        if probs.sum() < 1e-10:
             return False, None, None
-
+        top_idx = np.argmax(probs)
+        top_prob = probs[top_idx]
+        top_animal = self.animals[top_idx]
+        
+        if game_state.get('continue_mode', False):
+            if game_state.get('questions_since_last_guess', 0) < 8:
+                return False, None, None
+        # --- TIER 1: ABSOLUTE CERTAINTY ---
+        if top_prob >= 0.98 and q_count >= 10:
+            print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f})")
+            game_state['has_made_initial_guess'] = True
+            return True, top_animal, 'final'
+        # --- TIER 2: SAFETY NET (Q35) ---
+        if q_count >= 35 and not game_state.get('continue_mode', False):
+            print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
+            game_state['has_made_initial_guess'] = True
+            return True, top_animal, 'final'
+        return False, None, None
+    
     def get_features_for_data_collection(self, item_name, num_features=5):
         """Gets a list of features for data collection."""
         try:
@@ -310,7 +291,6 @@ class AkinatorEngine:
             item_feats = self.features[item_idx]
         except Exception:
             return self._get_random_allowed_features(num_features)
-
         nan_indices = np.where(np.isnan(item_feats))[0]
         useful_nan_indices = np.intersect1d(nan_indices, self.allowed_feature_indices).copy()
         
@@ -369,6 +349,6 @@ class AkinatorEngine:
             })
         results.sort(key=lambda x: x['initial_gain'], reverse=True)
         return results
- 
+    
     def to_delete(self, similarity_threshold=0.85, min_variance=0.01, output_file='questions_to_delete.csv'):
             return pd.DataFrame()
