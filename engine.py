@@ -331,55 +331,56 @@ class AkinatorEngine:
         return None, None
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
-        """
-        STRICT GUESSING LOGIC:
-        Only guesses if probability >= 94%, OR if we hit the safety question limit (Q25).
-        """
-        q_count = game_state['question_count']
+            """
+            STRICT GUESSING LOGIC:
+            Only guesses if probability >= 94%, OR if we hit the safety question limit (Q25).
+            """
+            q_count = game_state['question_count']
 
-        if probs.sum() < 1e-10:
-            return False, None, None
+            if probs.sum() < 1e-10:
+                return False, None, None
 
-        top_idx = np.argmax(probs)
-        top_prob = probs[top_idx]
-        top_animal = self.animals[top_idx]
+            top_idx = np.argmax(probs)
+            top_prob = probs[top_idx]
+            top_animal = self.animals[top_idx]
 
-        probs_copy = probs.copy()
-        probs_copy[top_idx] = 0.0
-        second_prob = np.max(probs_copy)
+            probs_copy = probs.copy()
+            probs_copy[top_idx] = 0.0
+            second_prob = np.max(probs_copy)
 
-        # Ratio of Top / Second best (e.g., 0.95 / 0.01 = 95)
-        confidence_ratio = top_prob / (second_prob + 1e-9)
-        
-        # Prevent guessing too soon after a user rejection
-        if game_state.get('continue_mode', False):
-            if game_state.get('questions_since_last_guess', 0) < 4:
-                if q_count < 25: # Still honor forced guess
+            # Ratio of Top / Second best (e.g., 0.95 / 0.01 = 95)
+            confidence_ratio = top_prob / (second_prob + 1e-9)
+            
+            # Prevent guessing too soon after a user rejection
+            if game_state.get('continue_mode', False):
+                # If we are continuing, ALWAYS wait at least 4 questions before trying again
+                # regardless of the total question count.
+                if game_state.get('questions_since_last_guess', 0) < 4:
                     return False, None, None
 
-        # --- TIER 1: SAFETY NET (Q25) ---
-        # Must guess here to prevent infinite games, even if prob < 94%
-        if q_count >= 25:
-            print(f"[Q{q_count}] FORCED GUESS (Safety Net): prob={top_prob:.4f}")
-            game_state['has_made_initial_guess'] = True
-            return True, top_animal, 'final'
+            # --- TIER 1: SAFETY NET (Q25) ---
+            # Must guess here to prevent infinite games, even if prob < 94%.
+            # FIX: Only force this if we aren't already in continue mode.
+            if q_count >= 25 and not game_state.get('continue_mode', False):
+                print(f"[Q{q_count}] FORCED GUESS (Safety Net): prob={top_prob:.4f}")
+                game_state['has_made_initial_guess'] = True
+                return True, top_animal, 'final'
 
-        # --- TIER 2: ULTRA CONFIDENT (Early Game) ---
-        if top_prob > 0.98 and confidence_ratio > 500 and q_count >= 5:
-            print(f"[Q{q_count}] INSTANT CERTAINTY: prob={top_prob:.4f}")
-            game_state['has_made_initial_guess'] = True
-            return True, top_animal, 'final'
+            # --- TIER 2: ULTRA CONFIDENT (Early Game) ---
+            if top_prob > 0.98 and confidence_ratio > 500 and q_count >= 5:
+                print(f"[Q{q_count}] INSTANT CERTAINTY: prob={top_prob:.4f}")
+                game_state['has_made_initial_guess'] = True
+                return True, top_animal, 'final'
 
-        # --- TIER 3: HIGH PRECISION (Standard Win) ---
-        # STRICT 94% THRESHOLD
-        if top_prob >= 0.94 and confidence_ratio > 100 and q_count >= 10:
-            print(f"[Q{q_count}] PRECISION GUESS: prob={top_prob:.4f}")
-            game_state['has_made_initial_guess'] = True
-            return True, top_animal, 'final'
+            # --- TIER 3: HIGH PRECISION (Standard Win) ---
+            # STRICT 94% THRESHOLD
+            if top_prob >= 0.94 and confidence_ratio > 100 and q_count >= 10:
+                print(f"[Q{q_count}] PRECISION GUESS: prob={top_prob:.4f}")
+                game_state['has_made_initial_guess'] = True
+                return True, top_animal, 'final'
 
-        # No guess if below 94% and not at Q25
-        return False, None, None
-    
+            # No guess if below 94% and not at Q25
+            return False, None, None
     def get_sparse_question_for_game(self, prior: np.ndarray, asked_features_names: set) -> tuple[str, str]:
         """Finds the best information-gain question from *only* sparse features."""
         candidates_to_eval = [
