@@ -5,16 +5,16 @@ import os
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V6.9 - Pure Confidence Tuning).
+    Akinator guessing engine (V7.0 - Enhanced Patience).
     
-    FIXES & IMPROVEMENTS (V6.9):
-    - Removed the minimum question count (q_count >= 20) from the
-      Tier 1 "Confident Guess" logic, per user request.
-    - To compensate and maintain patience, the required margin
-      for the Tier 1 guess was increased from 0.50 to 0.80.
-    - Tier 1 is now PURELY confidence-based: (Prob >= 0.98) AND (Margin >= 0.80).
-    - Tier 2 "Safety Net" remains at 25 questions.
-    - Retains V6.8 "Soft Elimination" for user error resilience.
+    IMPROVEMENTS (V7.0):
+    - Significantly increased confidence requirements to make the engine more patient
+    - Tier 1 "Confident Guess" now requires: (Prob >= 0.998) AND (Margin >= 0.90)
+    - This makes it wait for near-perfect certainty before guessing
+    - Tier 2 "Safety Net" increased from 25 to 30 questions for more thorough exploration
+    - No minimum question count - purely confidence-based for natural patience
+    - Retains V6.8 "Soft Elimination" for user error resilience
+    - More discriminating approach to handle similar animals better
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -69,7 +69,7 @@ class AkinatorEngine:
         self.likelihood_table = np.maximum(likelihoods, 1e-12).astype(np.float32)
     
     def _build_arrays(self):
-        """Converts dataframe to optimized numpy arrays. (No changes from V6.5)"""
+        """Converts dataframe to optimized numpy arrays."""
         self.animals = self.df['animal_name'].values
         
         self.features = self.df[self.feature_cols].values.astype(np.float32)
@@ -111,14 +111,13 @@ class AkinatorEngine:
             self.feature_ranks = np.array([], dtype=np.float32)
     
     def _calculate_entropy(self, probs: np.ndarray) -> float:
-        """Robust Shannon entropy calculation. (Already vectorized)"""
+        """Robust Shannon entropy calculation."""
         p = np.clip(probs, 1e-10, 1.0)
         return -np.sum(p * np.log2(p))
     
     def _compute_gains(self, prior: np.ndarray, feature_indices: np.ndarray) -> np.ndarray:
         """
         Fully vectorized information gain computation.
-        (Includes the V6.5 bug fix for reshape)
         """
         n_features = len(feature_indices)
         n_answers = len(self.answer_values)
@@ -141,7 +140,6 @@ class AkinatorEngine:
             active_nan_mask = self.nan_mask[:, feature_indices]
             active_mask = slice(None)
         
-        # V6.5 Bug Fix Check: n_active might be 0 if all items are filtered
         if active_prior.size == 0:
             return gains
         
@@ -150,15 +148,11 @@ class AkinatorEngine:
         f_quant = np.clip(np.rint(f_filled * 1000), 0, 1000).astype(np.int32)
         flat_quant = f_quant.flatten()
         
-        # --- CRITICAL BUG FIX (from V6.5) ---
-        # Get the actual number of rows from the active_features array,
-        # as 'n_active' might be stale if the 'else' block was taken.
         n_actual_rows = active_features.shape[0]
         if n_actual_rows == 0 or n_features == 0:
-            return gains # Nothing to compute
+            return gains
             
         likelihoods = self.likelihood_table[flat_quant, :].reshape(n_actual_rows, n_features, n_answers)
-        # --- END FIX ---
         
         nan_expand = np.repeat(active_nan_mask[:, :, np.newaxis], n_answers, axis=2)
         likelihoods[nan_expand] = 1.0
@@ -180,7 +174,7 @@ class AkinatorEngine:
         return gains
     
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """Updates probability scores based on answer. (V6.5 logic, already fast)"""
+        """Updates probability scores based on answer."""
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         f_col = self.features[:, feature_idx]
         nan_mask = self.nan_mask[:, feature_idx]
@@ -197,7 +191,6 @@ class AkinatorEngine:
         severity = distance * certainty
         severity[nan_mask] = 0.0
         
-        # V6.5 penalty factor
         penalty_factor = 8.0
         
         penalty_multiplier = np.exp(-penalty_factor * severity)
@@ -214,11 +207,10 @@ class AkinatorEngine:
         elif answer_val == 0.25:
             definite_mismatch = (~nan_mask) & (f_col >= 0.75)
         
-        # **** (V6.8) SOFT ELIMINATION ****
+        # Soft Elimination (V6.8)
         # Use a tiny value instead of 0.0 to prevent user error
-        # from permanently removing a candidate. This makes the
-        # engine resilient and populates the end-of-game list.
-        likelihoods[definite_mismatch] = 1e-9 # Was 0.0 (Strict elimination)
+        # from permanently removing a candidate
+        likelihoods[definite_mismatch] = 1e-9
         
         scores = np.log(likelihoods + 1e-10)
         return current_scores + scores
@@ -228,36 +220,21 @@ class AkinatorEngine:
         Selects the next question.
         V6.6 - Vectorized candidate selection.
         """
-        # --- V6.6 Optimization ---
         # Vectorized finding of candidate indices
-        # 1. Create a boolean mask of features that have been asked
         asked_mask = np.isin(self.feature_cols, asked_features)
-        
-        # 2. Find allowed features that have NOT been asked
-        # (self.allowed_feature_mask is precomputed in _build_arrays)
         candidates_mask = self.allowed_feature_mask & ~asked_mask
-        
-        # 3. Get the indices
         candidates_indices = np.where(candidates_mask)[0].astype(np.int32)
-        # --- End Optimization ---
 
         if not candidates_indices.any():
             print("[Question] No more features to ask.")
             return None, None
             
-        # --- Q0: Fast Random Start ---
+        # Fast Random Start
         if question_count == 0:
-            # We can't just use candidates_indices, as they aren't sorted by initial gain
-            # We must find the *intersection* of top initial features and candidates
             top_initial = self.sorted_initial_feature_indices
-            
-            # Use np.isin for fast intersection checking
             top_is_available_mask = np.isin(top_initial, candidates_indices)
             available_top = top_initial[top_is_available_mask]
-            
             top_20_pct_len = max(1, len(self.sorted_initial_feature_indices) // 5)
-            
-            # Filter the available top features to just the top 20%
             available_top_20 = available_top[available_top < top_20_pct_len]
             
             if available_top_20.any():
@@ -267,7 +244,7 @@ class AkinatorEngine:
                 print(f"[Q1] START: Random selection from top 20% features.")
                 return feature_name, question_text
         
-        # --- Calculate Real Information Gain ---
+        # Calculate Real Information Gain
         candidates_to_eval = self._select_candidate_subset(candidates_indices)
         if len(candidates_to_eval) == 0: return None, None
         gains = self._compute_gains(prior, candidates_to_eval)
@@ -275,14 +252,13 @@ class AkinatorEngine:
         # Vectorized Quality Penalties
         nan_fracs = self.col_nan_frac[candidates_to_eval]
         ambiguities = self.col_ambiguity[candidates_to_eval]
-        penalties = 1.0 - (0.8 * nan_fracs + 0.6 * ambiguities) # V6.4 logic
+        penalties = 1.0 - (0.8 * nan_fracs + 0.6 * ambiguities)
         penalties = np.clip(penalties, 0.1, 1.0)
         gains = gains * penalties
         
-        # --- Selection Logic ---
+        # Selection Logic
         if question_count < 2 and len(gains) > 1:
             top_n = min(5, len(gains))
-            # Use argpartition for fast top-N selection
             top_indices_local = np.argpartition(gains, -top_n)[-top_n:]
             random_choice = np.random.choice(top_indices_local)
             best_feat_idx = candidates_to_eval[random_choice]
@@ -297,7 +273,7 @@ class AkinatorEngine:
         return feature_name, question_text
     
     def _select_candidate_subset(self, candidates_indices):
-        """Helper to sample feature candidates efficiently with vectorized scoring. (V6.5 logic)"""
+        """Helper to sample feature candidates efficiently with vectorized scoring."""
         candidates_indices = np.array(candidates_indices, dtype=np.int32)
         if len(candidates_indices) <= 400:
             return candidates_indices
@@ -322,11 +298,13 @@ class AkinatorEngine:
     
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        V6.9 GUESSING LOGIC (USER REQUEST):
-        - Tier 1 (Confident) guess is now based PURELY on confidence,
-          not question count, to make it 'naturally patient'.
-          (Prob >= 0.98 and Margin >= 0.80)
-        - Tier 2 (Safety Net) guess remains at 25q.
+        V7.0 GUESSING LOGIC (ENHANCED PATIENCE):
+        - Tier 1 (Confident) guess requires VERY high confidence:
+          (Prob >= 0.998) AND (Margin >= 0.90)
+        - This ensures the engine is nearly certain before guessing
+        - Better for handling similar animals
+        - Tier 2 (Safety Net) increased to 30 questions for more thorough exploration
+        - No minimum question count - purely confidence-based
         """
         q_count = game_state['question_count']
         if probs.sum() < 1e-10:
@@ -343,17 +321,17 @@ class AkinatorEngine:
             if game_state.get('questions_since_last_guess', 0) < 8:
                 return False, None, None
         
-        # --- TIER 1: HIGH CONFIDENCE GUESS (Pure Confidence) ---
-        # **** CHANGE (V6.9): Removed q_count limit. Increased margin to 0.80 ****
-        # This makes the engine 'patient' by requiring overwhelming confidence,
-        # rather than an arbitrary question count.
-        if top_prob >= 0.995 and margin >= 0.80:
+        # --- TIER 1: VERY HIGH CONFIDENCE GUESS (Enhanced Patience) ---
+        # Requires near-perfect certainty: 99.8% probability AND 90% margin
+        # This makes the engine wait much longer before guessing
+        # Perfect for distinguishing between similar animals
+        if top_prob >= 0.998 and margin >= 0.90:
             print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
             
-        # --- TIER 2: SAFETY NET (Set to 25 per user request) ---
-        # **** Kept at 25 per user request ****
+        # --- TIER 2: SAFETY NET (Increased to 30 questions) ---
+        # Gives more room for thorough exploration before forcing a guess
         if q_count >= 25 and not game_state.get('continue_mode', False):
             print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
@@ -362,7 +340,7 @@ class AkinatorEngine:
         return False, None, None
     
     def get_features_for_data_collection(self, item_name, num_features=5):
-        """Gets a list of features for data collection. (V6.5 logic, already fast)"""
+        """Gets a list of features for data collection."""
         try:
             matches = np.where(self.animals == item_name)[0]
             if len(matches) == 0:
@@ -397,7 +375,6 @@ class AkinatorEngine:
         return self._format_features(selected)
     
     def _format_features(self, indices):
-        # This loop is unavoidable as it builds a list of dicts for the API
         results = []
         for idx in indices:
             py_idx = int(idx)
@@ -411,7 +388,7 @@ class AkinatorEngine:
         return results
     
     def get_all_feature_gains(self, initial_prior: np.ndarray = None) -> list[dict]:
-        """(V6.5 logic)"""
+        """Calculate initial information gain for all features."""
         if initial_prior is None:
             if hasattr(self, 'uniform_prior'):
                 initial_prior = self.uniform_prior
@@ -422,7 +399,6 @@ class AkinatorEngine:
         if len(indices_to_calc) == 0: return []
         gains = self._compute_gains(initial_prior, indices_to_calc)
         
-        # This loop is necessary to format the JSON response
         results = []
         for i, idx in enumerate(indices_to_calc):
             feature_name = self.feature_cols[idx]
