@@ -5,15 +5,13 @@ import os
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V6.2 - Random Start + Pure Entropy + Fixes).
+    Akinator guessing engine (V6.3 - Random Start + Pure Entropy + Fixes + Patience).
     
-    FIXES & IMPROVEMENTS:
-    - Corrected certainty calculation in update() for stricter elimination on definite mismatches.
-    - Vectorized information gain computation for speed (removed batching loops).
-    - Tightened sigma values in likelihood precomputation for stricter fuzzy matching.
-    - Increased candidate subset size for better question selection without performance hit.
-    - Added explicit zeroing of likelihoods in update() for strong contradictions.
-    - UX: Maintains variety in early questions while ensuring efficient convergence.
+    FIXES & IMPROVEMENTS (V6.3):
+    - Increased patience in guessing: Raised minimum questions for confident guess to 15 (from 10), safety net to 35 (from 20).
+    - Vectorized penalty calculations in select_question() to eliminate the loop.
+    - Vectorized candidate scoring in _select_candidate_subset() using precomputed rank array for efficiency.
+    - Minor: Adjusted confident threshold to 0.98 for slightly more flexibility while maintaining high certainty.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -88,9 +86,15 @@ class AkinatorEngine:
             
             sorted_indices = np.argsort(boosted_gains)[::-1]
             self.sorted_initial_feature_indices = self.allowed_feature_indices[sorted_indices]
+            
+            # Precompute ranks for vectorized scoring
+            max_rank = len(self.feature_cols) + 1
+            self.feature_ranks = np.full(len(self.feature_cols), max_rank, dtype=np.float32)
+            self.feature_ranks[self.sorted_initial_feature_indices] = np.arange(len(self.sorted_initial_feature_indices)) + 1
         else:
             self.uniform_prior = np.array([], dtype=np.float32)
             self.sorted_initial_feature_indices = np.array([], dtype=np.int32)
+            self.feature_ranks = np.array([], dtype=np.float32)
     
     def _calculate_entropy(self, probs: np.ndarray) -> float:
         """Robust Shannon entropy calculation."""
@@ -205,15 +209,12 @@ class AkinatorEngine:
         if len(candidates_to_eval) == 0: return None, None
         gains = self._compute_gains(prior, candidates_to_eval)
         
-        # Quality Penalties
-        penalty_gains = np.ones_like(gains)
-        for i, feat_idx in enumerate(candidates_to_eval):
-            nan_frac = self.col_nan_frac[feat_idx]
-            ambiguity = self.col_ambiguity[feat_idx]
-            penalty = 1.0 - (0.6 * nan_frac + 0.5 * ambiguity)
-            penalty = np.clip(penalty, 0.15, 1.0)
-            penalty_gains[i] = gains[i] * penalty
-        gains = penalty_gains
+        # Vectorized Quality Penalties
+        nan_fracs = self.col_nan_frac[candidates_to_eval]
+        ambiguities = self.col_ambiguity[candidates_to_eval]
+        penalties = 1.0 - (0.6 * nan_fracs + 0.5 * ambiguities)
+        penalties = np.clip(penalties, 0.15, 1.0)
+        gains = gains * penalties
         
         # --- Selection Logic ---
         if question_count < 2 and len(gains) > 1:
@@ -232,32 +233,33 @@ class AkinatorEngine:
         return feature_name, question_text
     
     def _select_candidate_subset(self, candidates_indices):
-        """Helper to sample feature candidates efficiently, increased limits for better selection."""
+        """Helper to sample feature candidates efficiently with vectorized scoring."""
+        candidates_indices = np.array(candidates_indices, dtype=np.int32)
         if len(candidates_indices) <= 300:
-            return np.array(candidates_indices, dtype=np.int32)
+            return candidates_indices
         
-        scored_candidates = []
-        for idx in candidates_indices:
-            initial_rank = np.where(self.sorted_initial_feature_indices == idx)[0]
-            rank_score = 1.0 / (initial_rank[0] + 1) if len(initial_rank) > 0 else 0
-            var_score = self.col_var[idx] / (np.max(self.col_var[self.allowed_feature_indices]) + 1e-5)
-            scored_candidates.append((idx, rank_score + var_score))
+        # Vectorized scoring
+        ranks = self.feature_ranks[candidates_indices]
+        rank_scores = np.where(ranks < self.feature_ranks.size + 1, 1.0 / ranks, 0.0)
+        max_var = np.max(self.col_var[self.allowed_feature_indices]) + 1e-5
+        var_scores = self.col_var[candidates_indices] / max_var
+        scores = rank_scores + var_scores
         
-        scored_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = [idx for idx, _ in scored_candidates[:200]]
+        sorted_local_indices = np.argsort(scores)[::-1]
+        top_candidates = candidates_indices[sorted_local_indices[:200]]
         
-        other_candidates = [idx for idx in candidates_indices if idx not in top_candidates]
-        if other_candidates:
+        other_candidates = candidates_indices[sorted_local_indices[200:]]
+        if len(other_candidates) > 0:
             random_extras = np.random.choice(other_candidates, size=min(len(other_candidates), 100), replace=False)
             candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
         else:
-            candidates_to_eval = np.array(top_candidates, dtype=np.int32)
+            candidates_to_eval = top_candidates
         return candidates_to_eval
     
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        STRICT GUESSING LOGIC:
-        1. High Confidence (>98%) after at least 10 questions.
+        STRICT GUESSING LOGIC (More Patient):
+        1. High Confidence (>98%) after at least 15 questions.
         2. Safety Net (Q35) ONLY if we haven't made a guess yet.
         """
         q_count = game_state['question_count']
@@ -271,12 +273,12 @@ class AkinatorEngine:
             if game_state.get('questions_since_last_guess', 0) < 8:
                 return False, None, None
         # --- TIER 1: ABSOLUTE CERTAINTY ---
-        if top_prob >= 0.995 and q_count >= 10:
+        if top_prob >= 0.98 and q_count >= 15:
             print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
         # --- TIER 2: SAFETY NET (Q35) ---
-        if q_count >= 20 and not game_state.get('continue_mode', False):
+        if q_count >= 35 and not game_state.get('continue_mode', False):
             print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
