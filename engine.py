@@ -5,13 +5,14 @@ import os
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V6.3 - Random Start + Pure Entropy + Fixes + Patience).
+    Akinator guessing engine (V6.4 - Random Start + Pure Entropy + Fixes + Patience + Stricter Elimination).
     
-    FIXES & IMPROVEMENTS (V6.3):
-    - Increased patience in guessing: Raised minimum questions for confident guess to 15 (from 10), safety net to 35 (from 20).
-    - Vectorized penalty calculations in select_question() to eliminate the loop.
-    - Vectorized candidate scoring in _select_candidate_subset() using precomputed rank array for efficiency.
-    - Minor: Adjusted confident threshold to 0.98 for slightly more flexibility while maintaining high certainty.
+    FIXES & IMPROVEMENTS (V6.4):
+    - Extended strict elimination in update() to moderate answers (mostly/not really) for better removal of contradictory items.
+    - Added margin requirement (top prob - second prob >= 0.3) for confident guesses to prevent premature wrong guesses.
+    - Tightened sigma values further for even stricter fuzzy matching.
+    - Increased penalties for sparse/ambiguous features (0.8 * nan_frac + 0.6 * ambiguity) to avoid irrelevant questions like emojis early on.
+    - Expanded candidate subset to 250 top + 150 random for broader high-quality question selection.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -35,7 +36,7 @@ class AkinatorEngine:
         print(f"✓ Engine initialized: {len(self.animals)} items, {len(self.feature_cols)} features.")
     
     def _precompute_likelihood_tables(self):
-        """Likelihood calculation with tighter sigma for stricter matching."""
+        """Likelihood calculation with even tighter sigma for stricter matching."""
         steps = 1001  # Kept for resolution
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
         n_answers = len(self.answer_values)
@@ -45,13 +46,13 @@ class AkinatorEngine:
         for i, f_val in enumerate(self.feature_grid):
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
-                # Tighter sigma for stricter elimination
+                # Even tighter sigma for stricter elimination
                 if a_val == 1.0 or a_val == 0.0:
-                    sigma = 0.03  # Was 0.06
+                    sigma = 0.025
                 elif a_val == 0.75 or a_val == 0.25:
-                    sigma = 0.08  # Was 0.12
+                    sigma = 0.06
                 else:
-                    sigma = 0.15  # Was 0.18
+                    sigma = 0.12
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
                 self.likelihood_table[i, j] = max(likelihood, 1e-12)  # Lower floor for numerical stability
     
@@ -151,7 +152,7 @@ class AkinatorEngine:
         return gains
     
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """Updates probability scores based on answer with fixed certainty and strict elimination."""
+        """Updates probability scores based on answer with fixed certainty and extended strict elimination."""
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         f_col = self.features[:, feature_idx]
         nan_mask = self.nan_mask[:, feature_idx]
@@ -172,10 +173,17 @@ class AkinatorEngine:
         penalty_multiplier = np.exp(-penalty_factor * severity)
         likelihoods *= penalty_multiplier
         
-        # Strict elimination for definite contradictions
-        if answer_val in [0.0, 1.0]:
-            definite_mismatch = (~nan_mask) & (f_col == (1.0 - answer_val))
-            likelihoods[definite_mismatch] = 0.0
+        # Extended strict elimination for definite and moderate contradictions
+        definite_mismatch = np.zeros_like(nan_mask, dtype=bool)
+        if answer_val == 1.0:
+            definite_mismatch = (~nan_mask) & (f_col == 0.0)
+        elif answer_val == 0.0:
+            definite_mismatch = (~nan_mask) & (f_col == 1.0)
+        elif answer_val == 0.75:
+            definite_mismatch = (~nan_mask) & (f_col <= 0.25)
+        elif answer_val == 0.25:
+            definite_mismatch = (~nan_mask) & (f_col >= 0.75)
+        likelihoods[definite_mismatch] = 0.0
         
         scores = np.log(likelihoods + 1e-10)
         return current_scores + scores
@@ -209,11 +217,11 @@ class AkinatorEngine:
         if len(candidates_to_eval) == 0: return None, None
         gains = self._compute_gains(prior, candidates_to_eval)
         
-        # Vectorized Quality Penalties
+        # Vectorized Quality Penalties (stronger to avoid irrelevant features)
         nan_fracs = self.col_nan_frac[candidates_to_eval]
         ambiguities = self.col_ambiguity[candidates_to_eval]
-        penalties = 1.0 - (0.6 * nan_fracs + 0.5 * ambiguities)
-        penalties = np.clip(penalties, 0.15, 1.0)
+        penalties = 1.0 - (0.8 * nan_fracs + 0.6 * ambiguities)
+        penalties = np.clip(penalties, 0.1, 1.0)
         gains = gains * penalties
         
         # --- Selection Logic ---
@@ -235,7 +243,7 @@ class AkinatorEngine:
     def _select_candidate_subset(self, candidates_indices):
         """Helper to sample feature candidates efficiently with vectorized scoring."""
         candidates_indices = np.array(candidates_indices, dtype=np.int32)
-        if len(candidates_indices) <= 300:
+        if len(candidates_indices) <= 400:
             return candidates_indices
         
         # Vectorized scoring
@@ -246,11 +254,11 @@ class AkinatorEngine:
         scores = rank_scores + var_scores
         
         sorted_local_indices = np.argsort(scores)[::-1]
-        top_candidates = candidates_indices[sorted_local_indices[:200]]
+        top_candidates = candidates_indices[sorted_local_indices[:250]]
         
-        other_candidates = candidates_indices[sorted_local_indices[200:]]
+        other_candidates = candidates_indices[sorted_local_indices[250:]]
         if len(other_candidates) > 0:
-            random_extras = np.random.choice(other_candidates, size=min(len(other_candidates), 100), replace=False)
+            random_extras = np.random.choice(other_candidates, size=min(len(other_candidates), 150), replace=False)
             candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
         else:
             candidates_to_eval = top_candidates
@@ -258,23 +266,26 @@ class AkinatorEngine:
     
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        STRICT GUESSING LOGIC (More Patient):
-        1. High Confidence (>98%) after at least 15 questions.
+        STRICT GUESSING LOGIC (More Patient + Margin):
+        1. High Confidence (>98% with >=0.3 margin over second) after at least 15 questions.
         2. Safety Net (Q35) ONLY if we haven't made a guess yet.
         """
         q_count = game_state['question_count']
         if probs.sum() < 1e-10:
             return False, None, None
-        top_idx = np.argmax(probs)
+        sorted_indices = np.argsort(probs)[::-1]
+        top_idx = sorted_indices[0]
+        second_idx = sorted_indices[1] if len(sorted_indices) > 1 else -1
         top_prob = probs[top_idx]
+        second_prob = probs[second_idx] if second_idx != -1 else 0.0
         top_animal = self.animals[top_idx]
         
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 8:
                 return False, None, None
-        # --- TIER 1: ABSOLUTE CERTAINTY ---
-        if top_prob >= 0.98 and q_count >= 15:
-            print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f})")
+        # --- TIER 1: ABSOLUTE CERTAINTY WITH MARGIN ---
+        if top_prob >= 0.98 and top_prob - second_prob >= 0.3 and q_count >= 15:
+            print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={top_prob - second_prob:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
         # --- TIER 2: SAFETY NET (Q35) ---
