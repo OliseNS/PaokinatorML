@@ -16,5 +16,6 @@ dependencies = [
     "redis",
     "msgpack",
     "msgpack-numpy",
-    "python-dotenv"
+    "python-dotenv",
+    "scikit-learn"
 ]

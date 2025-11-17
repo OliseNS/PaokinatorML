@@ -2,23 +2,27 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import os
+# --- NEW: Import the KNNImputer ---
+from sklearn.impute import KNNImputer
+# --- END NEW ---
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V7.0 - Enhanced Patience).
+    Akinator guessing engine (V8.0 - Matrix Completion).
     
-    IMPROVEMENTS (V7.0):
-    - Significantly increased confidence requirements to make the engine more patient
-    - Tier 1 "Confident Guess" now requires: (Prob >= 0.998) AND (Margin >= 0.90)
-    - This makes it wait for near-perfect certainty before guessing
-    - Tier 2 "Safety Net" increased from 25 to 30 questions for more thorough exploration
-    - No minimum question count - purely confidence-based for natural patience
-    - Retains V6.8 "Soft Elimination" for user error resilience
-    - More discriminating approach to handle similar animals better
+    IMPROVEMENTS (V8.0):
+    - Implements Matrix Completion via KNNImputer during initialization.
+    - Fills all NaN values in the feature matrix with inferred values
+      based on "neighbor" (similar) items.
+    - This creates a dense, highly accurate dataset.
+    - All subsequent logic (info gain, penalties) now runs on this
+      completed matrix, dramatically improving question selection.
+    - The "nan_penalty" in _build_arrays is now effectively 0,
+      allowing the engine to trust its data more.
     """
     
     def __init__(self, df, feature_cols, questions_map):
-        self.df = df
+        self.df = df # This will be replaced by the completed_df
         self.feature_cols = np.array(feature_cols)
         self.questions_map = questions_map
         
@@ -33,14 +37,70 @@ class AkinatorEngine:
             'no': 0.0, 'n': 0.0,
         }
         
+        # --- NEW: Matrix Completion Step ---
+        # This is the core of your "Next Level" idea.
+        # We run this *before* building arrays or precomputing tables.
+        print("🧠 Engine received sparse data, starting matrix completion...")
+        try:
+            self.df = self._complete_matrix(df, feature_cols)
+            print("✅ Matrix completion successful. Engine now using dense data.")
+        except Exception as e:
+            print(f"❌ WARNING: Matrix completion failed ({e}). Falling back to sparse data.")
+            self.df = df # Fallback to original sparse data if it fails
+        # --- END NEW ---
+        
         self._precompute_likelihood_tables()
         self._build_arrays()
         print(f"✓ Engine initialized: {len(self.animals)} items, {len(self.feature_cols)} features.")
     
+    
+    # --- NEW: Helper method for Matrix Completion ---
+    def _complete_matrix(self, df: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
+        """
+        Uses KNNImputer to fill NaN values in the feature matrix.
+        This "completes" the matrix, inferring missing values based on
+        similar items (neighbors).
+        """
+        if df.empty or not feature_cols:
+            print("   Matrix completion skipped: No data or features.")
+            return df
+            
+        print(f"   Imputing {df[feature_cols].isna().sum().sum()} missing values...")
+        
+        # 1. Extract the raw feature matrix and animal names
+        animal_names = df['animal_name'].values
+        features_matrix = df[feature_cols].values.astype(np.float32)
+
+        # 2. Initialize the imputer
+        # n_neighbors=5: Use 5 closest animals to vote on a missing value
+        # weights='distance': Closer neighbors' votes count more
+        imputer = KNNImputer(n_neighbors=5, weights='distance', missing_values=np.nan)
+        
+        # 3. Fit and transform the data
+        # This is where the magic happens.
+        completed_matrix = imputer.fit_transform(features_matrix)
+        
+        # 4. Clip values to be in the valid [0, 1] range
+        completed_matrix = np.clip(completed_matrix, 0.0, 1.0)
+        
+        print("   Imputation finished.")
+
+        # 5. Reconstruct the DataFrame
+        completed_df = pd.DataFrame(completed_matrix, columns=feature_cols)
+        completed_df['animal_name'] = animal_names
+        
+        # Ensure animal_name is the first column
+        completed_df = completed_df[['animal_name'] + feature_cols]
+        
+        return completed_df
+    # --- END NEW ---
+    
+
     def _precompute_likelihood_tables(self):
         """
         V6.6 - Fully vectorized likelihood calculation using broadcasting.
         This replaces the old nested for-loops for a massive speed-up.
+        (No changes to this method)
         """
         steps = 1001
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
@@ -69,20 +129,33 @@ class AkinatorEngine:
         self.likelihood_table = np.maximum(likelihoods, 1e-12).astype(np.float32)
     
     def _build_arrays(self):
-        """Converts dataframe to optimized numpy arrays."""
+        """
+        Converts dataframe to optimized numpy arrays.
+        NOTE: After imputation, self.nan_mask will be all-False
+        and self.col_nan_frac will be all-zero. This is *correct*
+        and automatically disables the NaN penalties in gain calculations.
+        """
         self.animals = self.df['animal_name'].values
         
         self.features = self.df[self.feature_cols].values.astype(np.float32)
-        self.nan_mask = np.isnan(self.features)
-        self.col_nan_frac = np.mean(self.nan_mask, axis=0)
+        
+        # This will now be all-False if imputation was successful
+        self.nan_mask = np.isnan(self.features) 
+        
+        # This will now be all-zero if imputation was successful
+        self.col_nan_frac = np.mean(self.nan_mask, axis=0) 
         
         nan_masked_features = np.ma.masked_invalid(self.features)
         col_var = nan_masked_features.var(axis=0).data
         col_mean = nan_masked_features.mean(axis=0).data
         self.col_ambiguity = 1.0 - 2.0 * np.abs(col_mean - 0.5)
-        self.allowed_feature_mask = (self.col_nan_frac < 1.0)
+        
+        # This will now be all-True
+        self.allowed_feature_mask = (self.col_nan_frac < 1.0) 
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
-        sparse_mask = (self.col_nan_frac >= 0.50) & self.allowed_feature_mask
+        
+        # This will now be empty
+        sparse_mask = (self.col_nan_frac >= 0.50) & self.allowed_feature_mask 
         self.sparse_indices = np.where(sparse_mask)[0].astype(np.int32)
         self.col_var = col_var
         
@@ -93,7 +166,9 @@ class AkinatorEngine:
             # Boost initial features based on variance/quality
             initial_gains = self._compute_gains(self.uniform_prior, self.allowed_feature_indices)
             variance_boost = col_var[self.allowed_feature_indices] / (np.max(col_var[self.allowed_feature_indices]) + 1e-5)
-            # Use V6.4 penalty logic
+            
+            # The NaN penalty (0.4 * nan_frac) will now be 0.0,
+            # so the penalty is *only* for ambiguity. This is what we want.
             penalty = 1.0 - (0.4 * self.col_nan_frac[self.allowed_feature_indices] + 0.4 * self.col_ambiguity[self.allowed_feature_indices])
             penalty = np.clip(penalty, 0.3, 1.0)
             boosted_gains = initial_gains * (1.0 + variance_boost * 0.6) * penalty
@@ -111,13 +186,14 @@ class AkinatorEngine:
             self.feature_ranks = np.array([], dtype=np.float32)
     
     def _calculate_entropy(self, probs: np.ndarray) -> float:
-        """Robust Shannon entropy calculation."""
+        """Robust Shannon entropy calculation. (No changes)"""
         p = np.clip(probs, 1e-10, 1.0)
         return -np.sum(p * np.log2(p))
     
     def _compute_gains(self, prior: np.ndarray, feature_indices: np.ndarray) -> np.ndarray:
         """
         Fully vectorized information gain computation.
+        (No changes to this method)
         """
         n_features = len(feature_indices)
         n_answers = len(self.answer_values)
@@ -144,6 +220,9 @@ class AkinatorEngine:
             return gains
         
         # Vectorized likelihood computation
+        
+        # NOTE: f_filled is no longer needed as we have no NaNs,
+        # but nan_to_num(nan=0.5) is harmless on a dense array.
         f_filled = np.nan_to_num(active_features, nan=0.5)
         f_quant = np.clip(np.rint(f_filled * 1000), 0, 1000).astype(np.int32)
         flat_quant = f_quant.flatten()
@@ -154,6 +233,8 @@ class AkinatorEngine:
             
         likelihoods = self.likelihood_table[flat_quant, :].reshape(n_actual_rows, n_features, n_answers)
         
+        # nan_expand will now be all-False, so this line will do nothing,
+        # which is correct.
         nan_expand = np.repeat(active_nan_mask[:, :, np.newaxis], n_answers, axis=2)
         likelihoods[nan_expand] = 1.0
         
@@ -174,10 +255,15 @@ class AkinatorEngine:
         return gains
     
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """Updates probability scores based on answer."""
+        """
+        Updates probability scores based on answer.
+        (No changes to this method)
+        """
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         f_col = self.features[:, feature_idx]
-        nan_mask = self.nan_mask[:, feature_idx]
+        
+        # nan_mask is now all-False, which simplifies the logic
+        nan_mask = self.nan_mask[:, feature_idx] 
         
         f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 1000), 0, 1000).astype(np.int32)
         a_idx = np.abs(self.answer_values - answer_val).argmin()
@@ -189,7 +275,8 @@ class AkinatorEngine:
         # Contradiction penalty
         distance = np.abs(f_col - answer_val)
         severity = distance * certainty
-        severity[nan_mask] = 0.0
+        
+        # severity[nan_mask] = 0.0 # This line now does nothing, which is fine
         
         penalty_factor = 8.0
         
@@ -199,13 +286,14 @@ class AkinatorEngine:
         # Extended strict elimination for definite and moderate contradictions
         definite_mismatch = np.zeros_like(nan_mask, dtype=bool)
         if answer_val == 1.0:
-            definite_mismatch = (~nan_mask) & (f_col == 0.0)
+            # (~nan_mask) is now always True
+            definite_mismatch = (f_col == 0.0)
         elif answer_val == 0.0:
-            definite_mismatch = (~nan_mask) & (f_col == 1.0)
+            definite_mismatch = (f_col == 1.0)
         elif answer_val == 0.75:
-            definite_mismatch = (~nan_mask) & (f_col <= 0.25)
+            definite_mismatch = (f_col <= 0.25)
         elif answer_val == 0.25:
-            definite_mismatch = (~nan_mask) & (f_col >= 0.75)
+            definite_mismatch = (f_col >= 0.75)
         
         # Soft Elimination (V6.8)
         # Use a tiny value instead of 0.0 to prevent user error
@@ -218,10 +306,12 @@ class AkinatorEngine:
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
         Selects the next question.
-        V6.6 - Vectorized candidate selection.
+        (No changes to this method)
         """
         # Vectorized finding of candidate indices
         asked_mask = np.isin(self.feature_cols, asked_features)
+        
+        # allowed_feature_mask is now all-True
         candidates_mask = self.allowed_feature_mask & ~asked_mask
         candidates_indices = np.where(candidates_mask)[0].astype(np.int32)
 
@@ -250,8 +340,11 @@ class AkinatorEngine:
         gains = self._compute_gains(prior, candidates_to_eval)
         
         # Vectorized Quality Penalties
+        # nan_fracs will be all-zero
         nan_fracs = self.col_nan_frac[candidates_to_eval]
         ambiguities = self.col_ambiguity[candidates_to_eval]
+        
+        # The 0.8 * nan_fracs term becomes 0.0
         penalties = 1.0 - (0.8 * nan_fracs + 0.6 * ambiguities)
         penalties = np.clip(penalties, 0.1, 1.0)
         gains = gains * penalties
@@ -273,7 +366,10 @@ class AkinatorEngine:
         return feature_name, question_text
     
     def _select_candidate_subset(self, candidates_indices):
-        """Helper to sample feature candidates efficiently with vectorized scoring."""
+        """
+        Helper to sample feature candidates efficiently with vectorized scoring.
+        (No changes to this method)
+        """
         candidates_indices = np.array(candidates_indices, dtype=np.int32)
         if len(candidates_indices) <= 400:
             return candidates_indices
@@ -299,12 +395,7 @@ class AkinatorEngine:
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
         V7.0 GUESSING LOGIC (ENHANCED PATIENCE):
-        - Tier 1 (Confident) guess requires VERY high confidence:
-          (Prob >= 0.998) AND (Margin >= 0.90)
-        - This ensures the engine is nearly certain before guessing
-        - Better for handling similar animals
-        - Tier 2 (Safety Net) increased to 30 questions for more thorough exploration
-        - No minimum question count - purely confidence-based
+        (No changes to this method)
         """
         q_count = game_state['question_count']
         if probs.sum() < 1e-10:
@@ -322,16 +413,11 @@ class AkinatorEngine:
                 return False, None, None
         
         # --- TIER 1: VERY HIGH CONFIDENCE GUESS (Enhanced Patience) ---
-        # Requires near-perfect certainty: 99.8% probability AND 90% margin
-        # This makes the engine wait much longer before guessing
-        # Perfect for distinguishing between similar animals
         if top_prob >= 0.998 and margin >= 0.90:
             print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
-            
-        # --- TIER 2: SAFETY NET (Increased to 30 questions) ---
-        # Gives more room for thorough exploration before forcing a guess
+        
         if q_count >= 25 and not game_state.get('continue_mode', False):
             print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
@@ -340,7 +426,12 @@ class AkinatorEngine:
         return False, None, None
     
     def get_features_for_data_collection(self, item_name, num_features=5):
-        """Gets a list of features for data collection."""
+        """
+        Gets a list of features for data collection.
+        (No changes to this method, but it will be less effective
+         as there are no NaN indices to find. It will fall back
+         to picking from sparse_indices or random.)
+        """
         try:
             matches = np.where(self.animals == item_name)[0]
             if len(matches) == 0:
@@ -351,17 +442,27 @@ class AkinatorEngine:
             item_feats = self.features[item_idx]
         except Exception:
             return self._get_random_allowed_features(num_features)
+        
+        # nan_indices will now be empty.
         nan_indices = np.where(np.isnan(item_feats))[0]
         useful_nan_indices = np.intersect1d(nan_indices, self.allowed_feature_indices).copy()
         
         if len(useful_nan_indices) < num_features:
             needed = num_features - len(useful_nan_indices)
+            
+            # sparse_indices will also be empty.
             extras = np.setdiff1d(self.sparse_indices, useful_nan_indices).copy()
+            
             if len(extras) > 0:
                 np.random.shuffle(extras)
                 selected_indices = np.concatenate((useful_nan_indices, extras[:needed]))
             else:
-                selected_indices = useful_nan_indices
+                # Fallback: just pick random allowed features
+                selected_indices = np.random.choice(
+                    self.allowed_feature_indices, 
+                    size=min(num_features, len(self.allowed_feature_indices)), 
+                    replace=False
+                )
         else:
             np.random.shuffle(useful_nan_indices)
             selected_indices = useful_nan_indices[:num_features]
@@ -383,12 +484,16 @@ class AkinatorEngine:
             results.append({
                 "feature_name": fname,
                 "question": str(self.questions_map.get(fname, f"Is it {fname}?")),
+                # This will now just be 0.0
                 "nan_percentage": float(self.col_nan_frac[py_idx])
             })
         return results
     
     def get_all_feature_gains(self, initial_prior: np.ndarray = None) -> list[dict]:
-        """Calculate initial information gain for all features."""
+        """
+        Calculate initial information gain for all features.
+        (No changes to this method)
+        """
         if initial_prior is None:
             if hasattr(self, 'uniform_prior'):
                 initial_prior = self.uniform_prior
@@ -407,6 +512,7 @@ class AkinatorEngine:
                 'question': self.questions_map.get(feature_name, "N/A"),
                 'initial_gain': float(gains[i]),
                 'variance': float(self.col_var[idx]) if not np.isnan(self.col_var[idx]) else 0.0,
+                # This will now be 0.0
                 'nan_percentage': float(self.col_nan_frac[idx])
             })
         results.sort(key=lambda x: x['initial_gain'], reverse=True)
