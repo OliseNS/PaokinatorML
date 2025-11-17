@@ -5,15 +5,16 @@ import os
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V6.6 - Vectorized).
+    Akinator guessing engine (V6.9 - Pure Confidence Tuning).
     
-    FIXES & IMPROVEMENTS (V6.6):
-    - Replaced for-loops in _precompute_likelihood_tables with fully
-      vectorized NumPy broadcasting for a significant startup speed-up.
-    - Replaced list comprehension in select_question with vectorized
-      np.isin and boolean masking for faster candidate selection every turn.
-    - Retains all "smarter-strict" logic from V6.5 for accuracy.
-    - Retains the critical bug fix in _compute_gains.
+    FIXES & IMPROVEMENTS (V6.9):
+    - Removed the minimum question count (q_count >= 20) from the
+      Tier 1 "Confident Guess" logic, per user request.
+    - To compensate and maintain patience, the required margin
+      for the Tier 1 guess was increased from 0.50 to 0.80.
+    - Tier 1 is now PURELY confidence-based: (Prob >= 0.98) AND (Margin >= 0.80).
+    - Tier 2 "Safety Net" remains at 25 questions.
+    - Retains V6.8 "Soft Elimination" for user error resilience.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -203,7 +204,6 @@ class AkinatorEngine:
         likelihoods *= penalty_multiplier
         
         # Extended strict elimination for definite and moderate contradictions
-        # This is "strict" logic and remains.
         definite_mismatch = np.zeros_like(nan_mask, dtype=bool)
         if answer_val == 1.0:
             definite_mismatch = (~nan_mask) & (f_col == 0.0)
@@ -213,7 +213,12 @@ class AkinatorEngine:
             definite_mismatch = (~nan_mask) & (f_col <= 0.25)
         elif answer_val == 0.25:
             definite_mismatch = (~nan_mask) & (f_col >= 0.75)
-        likelihoods[definite_mismatch] = 0.0 # Strict elimination
+        
+        # **** (V6.8) SOFT ELIMINATION ****
+        # Use a tiny value instead of 0.0 to prevent user error
+        # from permanently removing a candidate. This makes the
+        # engine resilient and populates the end-of-game list.
+        likelihoods[definite_mismatch] = 1e-9 # Was 0.0 (Strict elimination)
         
         scores = np.log(likelihoods + 1e-10)
         return current_scores + scores
@@ -317,8 +322,11 @@ class AkinatorEngine:
     
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        V6.5 GUESSING LOGIC:
-        More confident, more patient.
+        V6.9 GUESSING LOGIC (USER REQUEST):
+        - Tier 1 (Confident) guess is now based PURELY on confidence,
+          not question count, to make it 'naturally patient'.
+          (Prob >= 0.98 and Margin >= 0.80)
+        - Tier 2 (Safety Net) guess remains at 25q.
         """
         q_count = game_state['question_count']
         if probs.sum() < 1e-10:
@@ -335,14 +343,18 @@ class AkinatorEngine:
             if game_state.get('questions_since_last_guess', 0) < 8:
                 return False, None, None
         
-        # --- TIER 1: HIGH CONFIDENCE GUESS (Faster, Higher Margin) ---
-        if top_prob >= 0.95 and margin >= 0.50 and q_count >= 10:
+        # --- TIER 1: HIGH CONFIDENCE GUESS (Pure Confidence) ---
+        # **** CHANGE (V6.9): Removed q_count limit. Increased margin to 0.80 ****
+        # This makes the engine 'patient' by requiring overwhelming confidence,
+        # rather than an arbitrary question count.
+        if top_prob >= 0.995 and margin >= 0.80:
             print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
             
-        # --- TIER 2: SAFETY NET (More Patient) ---
-        if q_count >= 40 and not game_state.get('continue_mode', False):
+        # --- TIER 2: SAFETY NET (Set to 25 per user request) ---
+        # **** Kept at 25 per user request ****
+        if q_count >= 25 and not game_state.get('continue_mode', False):
             print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
