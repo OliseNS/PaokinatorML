@@ -5,12 +5,15 @@ import os
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V6.1 - Random Start + Pure Entropy).
+    Akinator guessing engine (V6.2 - Random Start + Pure Entropy + Fixes).
     
-    UX IMPROVEMENT:
-    - Q1 & Q2: Random selection from top candidates to vary gameplay.
-    - Q3+: Pure Information Gain (Greedy) for efficiency.
-    - No artificial "discriminative" phases.
+    FIXES & IMPROVEMENTS:
+    - Corrected certainty calculation in update() for stricter elimination on definite mismatches.
+    - Vectorized information gain computation for speed (removed batching loops).
+    - Tightened sigma values in likelihood precomputation for stricter fuzzy matching.
+    - Increased candidate subset size for better question selection without performance hit.
+    - Added explicit zeroing of likelihoods in update() for strong contradictions.
+    - UX: Maintains variety in early questions while ensuring efficient convergence.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -34,8 +37,8 @@ class AkinatorEngine:
         print(f"✓ Engine initialized: {len(self.animals)} items, {len(self.feature_cols)} features.")
     
     def _precompute_likelihood_tables(self):
-        """Likelihood calculation with adaptive sigma."""
-        steps = 1001  # Increased for higher resolution
+        """Likelihood calculation with tighter sigma for stricter matching."""
+        steps = 1001  # Kept for resolution
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
         n_answers = len(self.answer_values)
         
@@ -44,15 +47,15 @@ class AkinatorEngine:
         for i, f_val in enumerate(self.feature_grid):
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
-                # Tighter sigma for definite answers
+                # Tighter sigma for stricter elimination
                 if a_val == 1.0 or a_val == 0.0:
-                    sigma = 0.06
+                    sigma = 0.03  # Was 0.06
                 elif a_val == 0.75 or a_val == 0.25:
-                    sigma = 0.12
+                    sigma = 0.08  # Was 0.12
                 else:
-                    sigma = 0.18
+                    sigma = 0.15  # Was 0.18
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
-                self.likelihood_table[i, j] = max(likelihood, 0.001)
+                self.likelihood_table[i, j] = max(likelihood, 1e-12)  # Lower floor for numerical stability
     
     def _build_arrays(self):
         """Converts dataframe to optimized numpy arrays."""
@@ -77,7 +80,7 @@ class AkinatorEngine:
             self.uniform_prior = np.ones(n, dtype=np.float32) / n
             
             # Boost initial features based on variance/quality
-            initial_gains = self._compute_gains_batched(self.uniform_prior, self.allowed_feature_indices, batch_size=256)
+            initial_gains = self._compute_gains(self.uniform_prior, self.allowed_feature_indices)
             variance_boost = col_var[self.allowed_feature_indices] / (np.max(col_var[self.allowed_feature_indices]) + 1e-5)
             penalty = 1.0 - (0.4 * self.col_nan_frac[self.allowed_feature_indices] + 0.4 * self.col_ambiguity[self.allowed_feature_indices])
             penalty = np.clip(penalty, 0.3, 1.0)
@@ -94,8 +97,8 @@ class AkinatorEngine:
         p = np.clip(probs, 1e-10, 1.0)
         return -np.sum(p * np.log2(p))
     
-    def _compute_gains_batched(self, prior: np.ndarray, feature_indices: np.ndarray, batch_size: int = 64) -> np.ndarray:
-        """Computes information gain in batches."""
+    def _compute_gains(self, prior: np.ndarray, feature_indices: np.ndarray) -> np.ndarray:
+        """Fully vectorized information gain computation for speed."""
         n_features = len(feature_indices)
         n_answers = len(self.answer_values)
         gains = np.zeros(n_features, dtype=np.float32)
@@ -109,57 +112,67 @@ class AkinatorEngine:
         if n_active < len(prior) * 0.8 and n_active > 0:
             active_prior = prior[active_mask]
             active_prior = active_prior / active_prior.sum()
+            active_features = self.features[active_mask][:, feature_indices]
+            active_nan_mask = self.nan_mask[active_mask][:, feature_indices]
         else:
             active_prior = prior
+            active_features = self.features[:, feature_indices]
+            active_nan_mask = self.nan_mask[:, feature_indices]
             active_mask = slice(None)
         if n_active == 0: return gains
-        for i in range(0, n_features, batch_size):
-            end = min(i + batch_size, n_features)
-            batch_indices = feature_indices[i:end]
-            
-            f_batch = self.features[active_mask][:, batch_indices]
-            f_batch_filled = np.nan_to_num(f_batch, nan=0.5)
-            f_batch_quant = np.clip(np.rint(f_batch_filled * 1000), 0, 1000).astype(np.int32)  # Updated for higher resolution
-            likelihoods = self.likelihood_table[f_batch_quant]
-            nan_batch_mask = np.isnan(f_batch)
-            nan_expand = np.repeat(nan_batch_mask[:, :, np.newaxis], n_answers, axis=2)
-            likelihoods[nan_expand] = 1.0
-            batch_gains = np.zeros(len(batch_indices), dtype=np.float32)
-            
-            for f_local_idx in range(len(batch_indices)):
-                L_f = likelihoods[:, f_local_idx, :]
-                p_answers = active_prior @ L_f
-                posteriors = active_prior[:, np.newaxis] * L_f
-                posteriors /= (p_answers + 1e-10)
-                posteriors = np.clip(posteriors, 1e-10, 1.0)
-                
-                p_logs = np.log2(posteriors)
-                entropies_per_answer = -np.sum(posteriors * p_logs, axis=0)
-                expected_entropy = p_answers @ entropies_per_answer
-                batch_gains[f_local_idx] = current_entropy - expected_entropy
-            gains[i:end] = batch_gains
-            
+        
+        # Vectorized likelihood computation
+        f_filled = np.nan_to_num(active_features, nan=0.5)
+        f_quant = np.clip(np.rint(f_filled * 1000), 0, 1000).astype(np.int32)
+        flat_quant = f_quant.flatten()
+        likelihoods = self.likelihood_table[flat_quant, :].reshape(n_active, n_features, n_answers)
+        
+        nan_expand = np.repeat(active_nan_mask[:, :, np.newaxis], n_answers, axis=2)
+        likelihoods[nan_expand] = 1.0
+        
+        # Vectorized posterior and entropy computation
+        p_answers = np.einsum('i,ijk->jk', active_prior, likelihoods)  # (n_features, n_answers)
+        
+        posteriors = active_prior[:, np.newaxis, np.newaxis] * likelihoods  # (n_active, n_features, n_answers)
+        posteriors /= (p_answers[np.newaxis, :, :] + 1e-10)
+        posteriors = np.clip(posteriors, 1e-10, 1.0)
+        
+        p_logs = np.log2(posteriors)
+        entropies_per_answer = -np.sum(posteriors * p_logs, axis=0)  # (n_features, n_answers)
+        
+        expected_entropy = np.sum(p_answers * entropies_per_answer, axis=1)  # (n_features,)
+        
+        gains = current_entropy - expected_entropy
+        
         return gains
     
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """Updates probability scores based on answer."""
+        """Updates probability scores based on answer with fixed certainty and strict elimination."""
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         f_col = self.features[:, feature_idx]
         nan_mask = self.nan_mask[:, feature_idx]
         
-        f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 1000), 0, 1000).astype(np.int32)  # Updated for higher resolution
+        f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 1000), 0, 1000).astype(np.int32)
         a_idx = np.abs(self.answer_values - answer_val).argmin()
         likelihoods = self.likelihood_table[f_quant, a_idx].copy()
         
+        # Fixed certainty: high for definite values (close to 0/1), low for ambiguous (close to 0.5)
+        certainty = np.clip(2.0 * np.abs(f_col - 0.5), 0.0, 1.0)
+        
         # Contradiction penalty
         distance = np.abs(f_col - answer_val)
-        certainty = np.clip(1.0 - 2.0 * np.abs(f_col - 0.5), 0.0, 1.0)
         severity = distance * certainty
         severity[nan_mask] = 0.0
         
         penalty_factor = 12.0
         penalty_multiplier = np.exp(-penalty_factor * severity)
         likelihoods *= penalty_multiplier
+        
+        # Strict elimination for definite contradictions
+        if answer_val in [0.0, 1.0]:
+            definite_mismatch = (~nan_mask) & (f_col == (1.0 - answer_val))
+            likelihoods[definite_mismatch] = 0.0
+        
         scores = np.log(likelihoods + 1e-10)
         return current_scores + scores
         
@@ -177,11 +190,10 @@ class AkinatorEngine:
             print("[Question] No more features to ask.")
             return None, None
         # --- Q0: Fast Random Start ---
-        # Uses pre-computed 'sorted_initial_feature_indices' for speed and variety.
         if question_count == 0:
             top_20_pct = max(1, len(self.sorted_initial_feature_indices) // 5)
             available_top = [idx for idx in self.sorted_initial_feature_indices[:top_20_pct]
-                           if idx in candidates_indices]
+                             if idx in candidates_indices]
             if available_top:
                 best_feat_idx = np.random.choice(available_top)
                 feature_name = self.feature_cols[best_feat_idx]
@@ -191,7 +203,7 @@ class AkinatorEngine:
         # --- Calculate Real Information Gain ---
         candidates_to_eval = self._select_candidate_subset(candidates_indices)
         if len(candidates_to_eval) == 0: return None, None
-        gains = self._compute_gains_batched(prior, candidates_to_eval, batch_size=128)
+        gains = self._compute_gains(prior, candidates_to_eval)
         
         # Quality Penalties
         penalty_gains = np.ones_like(gains)
@@ -204,22 +216,13 @@ class AkinatorEngine:
         gains = penalty_gains
         
         # --- Selection Logic ---
-        
-        # Q1 (Second Question): Random from top 5 to prevent robotic pathing
-        # We check 'question_count < 2' to cover cases where Q0 might have been skipped or manually set
         if question_count < 2 and len(gains) > 1:
-             # Get indices of the top 5 gains
-             top_n = min(5, len(gains))
-             # argpartition puts top_n elements at the end
-             top_indices_local = np.argpartition(gains, -top_n)[-top_n:]
-             
-             # Pick one random index from these top N
-             random_choice = np.random.choice(top_indices_local)
-             best_feat_idx = candidates_to_eval[random_choice]
-             print(f"[Q{question_count+1}] VARIETY: Random selection from top {top_n} gains.")
-             
+            top_n = min(5, len(gains))
+            top_indices_local = np.argpartition(gains, -top_n)[-top_n:]
+            random_choice = np.random.choice(top_indices_local)
+            best_feat_idx = candidates_to_eval[random_choice]
+            print(f"[Q{question_count+1}] VARIETY: Random selection from top {top_n} gains.")
         else:
-            # Q2+: Pure Greedy (Max Gain)
             best_local_idx = np.argmax(gains)
             best_feat_idx = candidates_to_eval[best_local_idx]
         
@@ -229,8 +232,8 @@ class AkinatorEngine:
         return feature_name, question_text
     
     def _select_candidate_subset(self, candidates_indices):
-        """Helper to sample feature candidates efficiently."""
-        if len(candidates_indices) <= 120:
+        """Helper to sample feature candidates efficiently, increased limits for better selection."""
+        if len(candidates_indices) <= 300:
             return np.array(candidates_indices, dtype=np.int32)
         
         scored_candidates = []
@@ -241,11 +244,11 @@ class AkinatorEngine:
             scored_candidates.append((idx, rank_score + var_score))
         
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = [idx for idx, _ in scored_candidates[:90]]
+        top_candidates = [idx for idx, _ in scored_candidates[:200]]
         
         other_candidates = [idx for idx in candidates_indices if idx not in top_candidates]
         if other_candidates:
-            random_extras = np.random.choice(other_candidates, size=min(len(other_candidates), 30), replace=False)
+            random_extras = np.random.choice(other_candidates, size=min(len(other_candidates), 100), replace=False)
             candidates_to_eval = np.unique(np.concatenate((top_candidates, random_extras))).astype(np.int32)
         else:
             candidates_to_eval = np.array(top_candidates, dtype=np.int32)
@@ -336,7 +339,7 @@ class AkinatorEngine:
                 initial_prior = np.ones(len(self.animals), dtype=np.float32) / len(self.animals)
         indices_to_calc = self.allowed_feature_indices
         if len(indices_to_calc) == 0: return []
-        gains = self._compute_gains_batched(initial_prior, indices_to_calc, batch_size=128)
+        gains = self._compute_gains(initial_prior, indices_to_calc)
         results = []
         for i, idx in enumerate(indices_to_calc):
             feature_name = self.feature_cols[idx]
@@ -351,4 +354,4 @@ class AkinatorEngine:
         return results
     
     def to_delete(self, similarity_threshold=0.85, min_variance=0.01, output_file='questions_to_delete.csv'):
-            return pd.DataFrame()
+        return pd.DataFrame()
