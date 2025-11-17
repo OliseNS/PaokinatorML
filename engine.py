@@ -5,14 +5,17 @@ import os
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V6.4 - Random Start + Pure Entropy + Fixes + Patience + Stricter Elimination).
+    Akinator guessing engine (V6.5 - Smarter-Strict).
     
-    FIXES & IMPROVEMENTS (V6.4):
-    - Extended strict elimination in update() to moderate answers (mostly/not really) for better removal of contradictory items.
-    - Added margin requirement (top prob - second prob >= 0.3) for confident guesses to prevent premature wrong guesses.
-    - Tightened sigma values further for even stricter fuzzy matching.
-    - Increased penalties for sparse/ambiguous features (0.8 * nan_frac + 0.6 * ambiguity) to avoid irrelevant questions like emojis early on.
-    - Expanded candidate subset to 250 top + 150 random for broader high-quality question selection.
+    FIXES & IMPROVEMENTS (V6.5):
+    - Relaxed likelihood sigmas to prevent premature elimination due to minor
+      disagreements (e.g., User 'Yes' vs. DB 'Mostly'). This provides the
+      "space for stupidity" (or data ambiguity) the user requested.
+    - Reduced contradiction penalty_factor to 8.0 to work with new sigmas.
+    - Kept strict elimination for clear contradictions (Yes vs. No).
+    - Made guessing logic more confident: requires a 50% margin over the
+      second-best guess (top_prob >= 0.95 and margin >= 0.5).
+    - Increased patience: forced guess limit moved from 35 to 40 questions.
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -36,8 +39,12 @@ class AkinatorEngine:
         print(f"✓ Engine initialized: {len(self.animals)} items, {len(self.feature_cols)} features.")
     
     def _precompute_likelihood_tables(self):
-        """Likelihood calculation with even tighter sigma for stricter matching."""
-        steps = 1001  # Kept for resolution
+        """
+        Likelihood calculation with balanced sigma for "smarter-strict" matching.
+        This provides a "soft" penalty for minor disagreements (e.g., 1.0 vs 0.75)
+        instead of the "hard" elimination of V6.4.
+        """
+        steps = 1001
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
         n_answers = len(self.answer_values)
         
@@ -46,18 +53,21 @@ class AkinatorEngine:
         for i, f_val in enumerate(self.feature_grid):
             for j, a_val in enumerate(self.answer_values):
                 diff = abs(f_val - a_val)
-                # Even tighter sigma for stricter elimination
-                if a_val == 1.0 or a_val == 0.0:
-                    sigma = 0.025
-                elif a_val == 0.75 or a_val == 0.25:
-                    sigma = 0.06
+                
+                # --- V6.5 CHANGE ---
+                # Relaxed sigmas to be more forgiving of user/data ambiguity.
+                # 'Sometimes' is the most vague, so it gets the widest sigma.
+                if a_val == 0.5:
+                    sigma = 0.20
                 else:
-                    sigma = 0.12
+                    sigma = 0.15 # Was 0.025-0.06, which was far too strict
+                # --- END CHANGE ---
+
                 likelihood = np.exp(-0.5 * (diff / sigma) ** 2)
-                self.likelihood_table[i, j] = max(likelihood, 1e-12)  # Lower floor for numerical stability
+                self.likelihood_table[i, j] = max(likelihood, 1e-12)
     
     def _build_arrays(self):
-        """Converts dataframe to optimized numpy arrays."""
+        """Converts dataframe to optimized numpy arrays. (No changes)"""
         self.animals = self.df['animal_name'].values
         
         self.features = self.df[self.feature_cols].values.astype(np.float32)
@@ -81,6 +91,7 @@ class AkinatorEngine:
             # Boost initial features based on variance/quality
             initial_gains = self._compute_gains(self.uniform_prior, self.allowed_feature_indices)
             variance_boost = col_var[self.allowed_feature_indices] / (np.max(col_var[self.allowed_feature_indices]) + 1e-5)
+            # Use V6.4 penalty logic
             penalty = 1.0 - (0.4 * self.col_nan_frac[self.allowed_feature_indices] + 0.4 * self.col_ambiguity[self.allowed_feature_indices])
             penalty = np.clip(penalty, 0.3, 1.0)
             boosted_gains = initial_gains * (1.0 + variance_boost * 0.6) * penalty
@@ -98,12 +109,12 @@ class AkinatorEngine:
             self.feature_ranks = np.array([], dtype=np.float32)
     
     def _calculate_entropy(self, probs: np.ndarray) -> float:
-        """Robust Shannon entropy calculation."""
+        """Robust Shannon entropy calculation. (No changes)"""
         p = np.clip(probs, 1e-10, 1.0)
         return -np.sum(p * np.log2(p))
     
     def _compute_gains(self, prior: np.ndarray, feature_indices: np.ndarray) -> np.ndarray:
-        """Fully vectorized information gain computation for speed."""
+        """Fully vectorized information gain computation for speed. (No changes)"""
         n_features = len(feature_indices)
         n_answers = len(self.answer_values)
         gains = np.zeros(n_features, dtype=np.float32)
@@ -152,7 +163,7 @@ class AkinatorEngine:
         return gains
     
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """Updates probability scores based on answer with fixed certainty and extended strict elimination."""
+        """Updates probability scores based on answer with reduced penalty factor."""
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         f_col = self.features[:, feature_idx]
         nan_mask = self.nan_mask[:, feature_idx]
@@ -169,11 +180,15 @@ class AkinatorEngine:
         severity = distance * certainty
         severity[nan_mask] = 0.0
         
-        penalty_factor = 12.0
+        # --- V6.5 CHANGE ---
+        penalty_factor = 8.0 # Was 12.0
+        # --- END CHANGE ---
+        
         penalty_multiplier = np.exp(-penalty_factor * severity)
         likelihoods *= penalty_multiplier
         
         # Extended strict elimination for definite and moderate contradictions
+        # This is "strict" logic and remains.
         definite_mismatch = np.zeros_like(nan_mask, dtype=bool)
         if answer_val == 1.0:
             definite_mismatch = (~nan_mask) & (f_col == 0.0)
@@ -183,7 +198,7 @@ class AkinatorEngine:
             definite_mismatch = (~nan_mask) & (f_col <= 0.25)
         elif answer_val == 0.25:
             definite_mismatch = (~nan_mask) & (f_col >= 0.75)
-        likelihoods[definite_mismatch] = 0.0
+        likelihoods[definite_mismatch] = 0.0 # Strict elimination
         
         scores = np.log(likelihoods + 1e-10)
         return current_scores + scores
@@ -191,9 +206,7 @@ class AkinatorEngine:
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
         Selects the next question.
-        - Q0: Random from top 20% of *initial* best features.
-        - Q1: Random from top 5 of *current* best features (using new prior).
-        - Q2+: Greedy max entropy.
+        (No changes to V6.4 logic, which is already good)
         """
         asked_set = set(asked_features)
         candidates_indices = [idx for idx in self.allowed_feature_indices
@@ -217,10 +230,10 @@ class AkinatorEngine:
         if len(candidates_to_eval) == 0: return None, None
         gains = self._compute_gains(prior, candidates_to_eval)
         
-        # Vectorized Quality Penalties (stronger to avoid irrelevant features)
+        # Vectorized Quality Penalties
         nan_fracs = self.col_nan_frac[candidates_to_eval]
         ambiguities = self.col_ambiguity[candidates_to_eval]
-        penalties = 1.0 - (0.8 * nan_fracs + 0.6 * ambiguities)
+        penalties = 1.0 - (0.8 * nan_fracs + 0.6 * ambiguities) # V6.4 logic
         penalties = np.clip(penalties, 0.1, 1.0)
         gains = gains * penalties
         
@@ -241,7 +254,7 @@ class AkinatorEngine:
         return feature_name, question_text
     
     def _select_candidate_subset(self, candidates_indices):
-        """Helper to sample feature candidates efficiently with vectorized scoring."""
+        """Helper to sample feature candidates efficiently with vectorized scoring. (No changes)"""
         candidates_indices = np.array(candidates_indices, dtype=np.int32)
         if len(candidates_indices) <= 400:
             return candidates_indices
@@ -266,9 +279,10 @@ class AkinatorEngine:
     
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        STRICT GUESSING LOGIC (More Patient + Margin):
-        1. High Confidence (>98% with >=0.3 margin over second) after at least 15 questions.
-        2. Safety Net (Q35) ONLY if we haven't made a guess yet.
+        V6.5 GUESSING LOGIC:
+        More confident, more patient.
+        1. High Confidence: (95% prob) AND (50% margin) AND (10+ questions).
+        2. Safety Net: (Q40)
         """
         q_count = game_state['question_count']
         if probs.sum() < 1e-10:
@@ -279,24 +293,28 @@ class AkinatorEngine:
         top_prob = probs[top_idx]
         second_prob = probs[second_idx] if second_idx != -1 else 0.0
         top_animal = self.animals[top_idx]
+        margin = top_prob - second_prob
         
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 8:
                 return False, None, None
-        # --- TIER 1: ABSOLUTE CERTAINTY WITH MARGIN ---
-        if top_prob >= 0.98 and top_prob - second_prob >= 0.3 and q_count >= 15:
-            print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={top_prob - second_prob:.4f})")
+        
+        # --- TIER 1: HIGH CONFIDENCE GUESS (Faster, Higher Margin) ---
+        if top_prob >= 0.95 and margin >= 0.50 and q_count >= 10:
+            print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
-        # --- TIER 2: SAFETY NET (Q35) ---
-        if q_count >= 35 and not game_state.get('continue_mode', False):
+            
+        # --- TIER 2: SAFETY NET (More Patient) ---
+        if q_count >= 40 and not game_state.get('continue_mode', False):
             print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
+            
         return False, None, None
     
     def get_features_for_data_collection(self, item_name, num_features=5):
-        """Gets a list of features for data collection."""
+        """Gets a list of features for data collection. (No changes)"""
         try:
             matches = np.where(self.animals == item_name)[0]
             if len(matches) == 0:
@@ -344,6 +362,7 @@ class AkinatorEngine:
         return results
     
     def get_all_feature_gains(self, initial_prior: np.ndarray = None) -> list[dict]:
+        """(No changes)"""
         if initial_prior is None:
             if hasattr(self, 'uniform_prior'):
                 initial_prior = self.uniform_prior
@@ -366,5 +385,3 @@ class AkinatorEngine:
         results.sort(key=lambda x: x['initial_gain'], reverse=True)
         return results
     
-    def to_delete(self, similarity_threshold=0.85, min_variance=0.01, output_file='questions_to_delete.csv'):
-        return pd.DataFrame()
