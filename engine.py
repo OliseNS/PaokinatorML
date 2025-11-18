@@ -6,13 +6,13 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Akinator guessing engine (V10.0 - Aggressive Elimination).
+    Akinator guessing engine (V11.0 - Smart Discrimination Mode).
     
-    IMPROVEMENTS (V10.0):
-    - Much more aggressive contradiction penalties
-    - Expanded hard elimination rules
-    - Stricter fuzzy answer matching
-    - Better convergence for obvious cases
+    IMPROVEMENTS (V11.0):
+    - Intelligent discrimination between top candidates before guessing
+    - Asks questions that maximize separation between top items
+    - More patient and strategic guessing behavior
+    - Higher confidence thresholds (99.5%/90%)
     """
     
     def __init__(self, df, feature_cols, questions_map):
@@ -22,7 +22,6 @@ class AkinatorEngine:
         
         sparse_df = df.copy()
         
-        # More granular answer mapping for better precision
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         
         self.fuzzy_map = {
@@ -85,7 +84,6 @@ class AkinatorEngine:
         a_vals_row = self.answer_values[np.newaxis, :]
         diffs = np.abs(f_grid_col - a_vals_row)
         
-        # Tighter sigmas for more aggressive matching
         sigmas = np.where(self.answer_values == 0.5, 0.18, 0.12)
         sigmas_row = sigmas[np.newaxis, :]
         likelihoods = np.exp(-0.5 * (diffs / sigmas_row) ** 2)
@@ -188,80 +186,99 @@ class AkinatorEngine:
         gains = current_entropy - expected_entropy
         return gains
     
+    def _compute_discrimination_gains(self, prior: np.ndarray, feature_indices: np.ndarray, 
+                                      top_k_indices: np.ndarray) -> np.ndarray:
+        """
+        Compute gains specifically for discriminating between top-K candidates.
+        This focuses on features that maximize differences between the most likely items.
+        """
+        n_features = len(feature_indices)
+        if n_features == 0 or len(top_k_indices) < 2:
+            return np.zeros(n_features, dtype=np.float32)
+        
+        # Get features for only the top-K candidates
+        top_features = self.features[top_k_indices][:, feature_indices]
+        top_nan_mask = self.is_imputed_mask[top_k_indices][:, feature_indices]
+        
+        # Calculate pairwise feature differences between top candidates
+        # For each feature, how different are the top candidates?
+        discrimination_scores = np.zeros(n_features, dtype=np.float32)
+        
+        for i in range(n_features):
+            feat_vals = top_features[:, i]
+            nan_mask = top_nan_mask[:, i]
+            
+            # Skip if all values are imputed
+            if nan_mask.all():
+                continue
+            
+            # Calculate variance in this feature across top candidates
+            # Higher variance = better discrimination
+            feat_vals_clean = feat_vals[~nan_mask]
+            if len(feat_vals_clean) < 2:
+                continue
+            
+            # Variance-based discrimination
+            variance = np.var(feat_vals_clean)
+            
+            # Also consider max difference (range)
+            max_diff = np.max(feat_vals_clean) - np.min(feat_vals_clean)
+            
+            # Penalize if values are too ambiguous (near 0.5)
+            ambiguity_penalty = 1.0 - np.mean(np.abs(feat_vals_clean - 0.5))
+            
+            # Combined score: prefer high variance, high range, and non-ambiguous values
+            discrimination_scores[i] = (variance * 2.0 + max_diff * 1.5) * ambiguity_penalty
+        
+        return discrimination_scores
+    
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """
-        AGGRESSIVE UPDATE: Much stricter elimination of contradictory items.
-        """
         answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
         f_col = self.features[:, feature_idx]
         imputed_mask = self.is_imputed_mask[:, feature_idx]
         
-        # Start with likelihood calculation
         f_quant = np.clip(np.rint(np.nan_to_num(f_col, nan=0.5) * 1000), 0, 1000).astype(np.int32)
         a_idx = np.abs(self.answer_values - answer_val).argmin()
         likelihoods = self.likelihood_table[f_quant, a_idx].copy()
         
-        # AGGRESSIVE PENALTY CALCULATION
         certainty = np.clip(2.0 * np.abs(f_col - 0.5), 0.0, 1.0)
         distance = np.abs(f_col - answer_val)
         severity = distance * certainty
-        
-        # Don't penalize imputed values
         severity[imputed_mask] = 0.0
         
-        # MUCH MORE AGGRESSIVE PENALTY (increased from 8.0 to 20.0)
         penalty_factor = 20.0
         penalty_multiplier = np.exp(-penalty_factor * severity)
         likelihoods *= penalty_multiplier
         
-        # EXPANDED HARD ELIMINATION RULES
-        # These are much more aggressive than before
         hard_eliminate = np.zeros_like(imputed_mask, dtype=bool)
         
-        # Definite Yes (1.0) answer
         if answer_val == 1.0:
-            # Eliminate if feature is < 0.3 (was 0.0)
             hard_eliminate = (f_col < 0.3)
-        
-        # Definite No (0.0) answer
         elif answer_val == 0.0:
-            # Eliminate if feature is > 0.7 (was 1.0)
             hard_eliminate = (f_col > 0.7)
-        
-        # Mostly/Usually (0.75) answer
         elif answer_val == 0.75:
-            # Eliminate if feature is < 0.2 (was 0.25)
             hard_eliminate = (f_col < 0.2)
-        
-        # Not Really/Rarely (0.25) answer
         elif answer_val == 0.25:
-            # Eliminate if feature is > 0.8 (was 0.75)
             hard_eliminate = (f_col > 0.8)
-        
-        # Sometimes/Sort of (0.5) answer - NEW!
         elif answer_val == 0.5:
-            # Eliminate extremes when answer is middle
             hard_eliminate = (f_col < 0.15) | (f_col > 0.85)
         
-        # ADDITIONAL AGGRESSIVE RULES
-        # If there's a strong contradiction (distance > 0.6 and high certainty)
         strong_contradiction = (distance > 0.6) & (certainty > 0.7) & ~imputed_mask
         hard_eliminate = hard_eliminate | strong_contradiction
-        
-        # Don't eliminate imputed values
         hard_eliminate[imputed_mask] = False
         
-        # Apply hard elimination with very low likelihood
         likelihoods[hard_eliminate] = 1e-12
         
-        # Additional soft penalty for moderate contradictions
         moderate_contradiction = (distance > 0.4) & (certainty > 0.5) & ~imputed_mask & ~hard_eliminate
-        likelihoods[moderate_contradiction] *= 0.01  # 99% reduction
+        likelihoods[moderate_contradiction] *= 0.01
         
         scores = np.log(likelihoods + 1e-12)
         return current_scores + scores
     
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
+        """
+        Intelligent question selection with discrimination mode.
+        """
         asked_mask = np.isin(self.feature_cols, asked_features)
         candidates_mask = self.allowed_feature_mask & ~asked_mask
         candidates_indices = np.where(candidates_mask)[0].astype(np.int32)
@@ -285,38 +302,97 @@ class AkinatorEngine:
                 print(f"[Q1] START: Random selection from top 20% features.")
                 return feature_name, question_text
         
-        # Calculate Information Gain
-        candidates_to_eval = self._select_candidate_subset(candidates_indices)
-        if len(candidates_to_eval) == 0:
-            return None, None
+        # ===== DISCRIMINATION MODE =====
+        # Check if we should enter discrimination mode
+        sorted_probs = np.sort(prior)[::-1]
+        top_prob = sorted_probs[0] if len(sorted_probs) > 0 else 0.0
+        second_prob = sorted_probs[1] if len(sorted_probs) > 1 else 0.0
+        third_prob = sorted_probs[2] if len(sorted_probs) > 2 else 0.0
+        
+        # Enter discrimination mode if:
+        # 1. We have multiple strong candidates (top 3-5 items have significant probability)
+        # 2. Top candidate doesn't dominate (< 80% probability)
+        # 3. We've asked at least 3 questions
+        top_candidates_count = np.sum(prior > 0.05)  # Count items with > 5% probability
+        
+        discrimination_mode = (
+            question_count >= 3 and
+            top_prob < 0.80 and
+            top_candidates_count >= 2 and
+            (second_prob > 0.10 or third_prob > 0.05)
+        )
+        
+        if discrimination_mode:
+            # Find top K candidates (usually 3-5)
+            k = min(5, max(2, top_candidates_count))
+            top_k_indices = np.argsort(prior)[-k:][::-1]
             
-        gains = self._compute_gains(prior, candidates_to_eval)
-        
-        # Quality Penalties
-        nan_fracs = self.col_nan_frac[candidates_to_eval]
-        ambiguities = self.col_ambiguity[candidates_to_eval]
-        penalties = 1.0 - (0.8 * nan_fracs + 0.6 * ambiguities)
-        penalties = np.clip(penalties, 0.1, 1.0)
-        gains = gains * penalties
-        
-        # Correlation Penalty
-        asked_indices = np.where(asked_mask)[0]
-        if len(asked_indices) > 0:
-            corr_slice = self.feature_correlation_matrix[candidates_to_eval, :][:, asked_indices]
-            max_correlations = np.abs(corr_slice).max(axis=1)
-            correlation_penalty = np.exp(-2.5 * max_correlations**2)
-            gains = gains * correlation_penalty
-        
-        # Selection Logic
-        if question_count < 2 and len(gains) > 1:
-            top_n = min(5, len(gains))
-            top_indices_local = np.argpartition(gains, -top_n)[-top_n:]
-            random_choice = np.random.choice(top_indices_local)
-            best_feat_idx = candidates_to_eval[random_choice]
-            print(f"[Q{question_count+1}] VARIETY: Random selection from top {top_n} gains.")
-        else:
-            best_local_idx = np.argmax(gains)
+            print(f"[Q{question_count+1}] DISCRIMINATION MODE: Separating top {k} candidates")
+            print(f"   Top probs: {sorted_probs[:k]}")
+            
+            # Get candidate features to evaluate
+            candidates_to_eval = self._select_candidate_subset(candidates_indices)
+            
+            # Compute discrimination-specific gains
+            discrim_gains = self._compute_discrimination_gains(prior, candidates_to_eval, top_k_indices)
+            
+            # Also compute normal information gains
+            info_gains = self._compute_gains(prior, candidates_to_eval)
+            
+            # Combine both: 70% discrimination, 30% information gain
+            combined_gains = 0.7 * discrim_gains + 0.3 * info_gains
+            
+            # Apply quality penalties
+            nan_fracs = self.col_nan_frac[candidates_to_eval]
+            ambiguities = self.col_ambiguity[candidates_to_eval]
+            penalties = 1.0 - (0.6 * nan_fracs + 0.4 * ambiguities)
+            penalties = np.clip(penalties, 0.2, 1.0)
+            combined_gains = combined_gains * penalties
+            
+            # Correlation penalty (but reduced in discrimination mode)
+            asked_indices = np.where(asked_mask)[0]
+            if len(asked_indices) > 0:
+                corr_slice = self.feature_correlation_matrix[candidates_to_eval, :][:, asked_indices]
+                max_correlations = np.abs(corr_slice).max(axis=1)
+                correlation_penalty = np.exp(-1.5 * max_correlations**2)  # Reduced from -2.5
+                combined_gains = combined_gains * correlation_penalty
+            
+            best_local_idx = np.argmax(combined_gains)
             best_feat_idx = candidates_to_eval[best_local_idx]
+            
+        else:
+            # ===== NORMAL MODE =====
+            candidates_to_eval = self._select_candidate_subset(candidates_indices)
+            if len(candidates_to_eval) == 0:
+                return None, None
+                
+            gains = self._compute_gains(prior, candidates_to_eval)
+            
+            # Quality Penalties
+            nan_fracs = self.col_nan_frac[candidates_to_eval]
+            ambiguities = self.col_ambiguity[candidates_to_eval]
+            penalties = 1.0 - (0.8 * nan_fracs + 0.6 * ambiguities)
+            penalties = np.clip(penalties, 0.1, 1.0)
+            gains = gains * penalties
+            
+            # Correlation Penalty
+            asked_indices = np.where(asked_mask)[0]
+            if len(asked_indices) > 0:
+                corr_slice = self.feature_correlation_matrix[candidates_to_eval, :][:, asked_indices]
+                max_correlations = np.abs(corr_slice).max(axis=1)
+                correlation_penalty = np.exp(-2.5 * max_correlations**2)
+                gains = gains * correlation_penalty
+            
+            # Selection Logic - add variety in early questions
+            if question_count < 2 and len(gains) > 1:
+                top_n = min(5, len(gains))
+                top_indices_local = np.argpartition(gains, -top_n)[-top_n:]
+                random_choice = np.random.choice(top_indices_local)
+                best_feat_idx = candidates_to_eval[random_choice]
+                print(f"[Q{question_count+1}] VARIETY: Random selection from top {top_n} gains.")
+            else:
+                best_local_idx = np.argmax(gains)
+                best_feat_idx = candidates_to_eval[best_local_idx]
         
         feature_name = self.feature_cols[best_feat_idx]
         question_text = self.questions_map.get(feature_name, f"Does it have {feature_name}?")
@@ -347,7 +423,8 @@ class AkinatorEngine:
     
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        More aggressive guessing when confidence is high.
+        Patient and smart guessing with high confidence thresholds.
+        Only guess when we're VERY confident (99.5% prob, 90% margin).
         """
         q_count = game_state['question_count']
         if probs.sum() < 1e-10:
@@ -361,24 +438,27 @@ class AkinatorEngine:
         top_animal = self.animals[top_idx]
         margin = top_prob - second_prob
         
+        # Continue mode requires patience before guessing again
         if game_state.get('continue_mode', False):
-            if game_state.get('questions_since_last_guess', 0) < 8:
+            if game_state.get('questions_since_last_guess', 0) < 10:
                 return False, None, None
         
-        # More aggressive guessing thresholds
-        # Guess earlier if we're very confident
-        if top_prob >= 0.95 and margin >= 0.80:
+        # PATIENT THRESHOLDS: Only guess when VERY confident
+        # 99.5% confidence AND 90% margin
+        if top_prob >= 0.995 and margin >= 0.90:
             print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
         
-        # After 8 questions, guess if reasonably confident
-        if q_count >= 8 and top_prob >= 0.85 and margin >= 0.70:
-            print(f"[Q{q_count}] EARLY GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
-            game_state['has_made_initial_guess'] = True
-            return True, top_animal, 'final'
+        # After many questions (30+), be slightly more lenient but still strict
+        if q_count >= 30 and not game_state.get('continue_mode', False):
+            if top_prob >= 0.98 and margin >= 0.85:
+                print(f"[Q{q_count}] LATE GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
+                game_state['has_made_initial_guess'] = True
+                return True, top_animal, 'final'
         
-        if q_count >= 25 and not game_state.get('continue_mode', False):
+        # Absolute limit at 40 questions
+        if q_count >= 40 and not game_state.get('continue_mode', False):
             print(f"[Q{q_count}] FORCED GUESS (Limit Reached): {top_animal} (prob={top_prob:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
