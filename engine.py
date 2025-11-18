@@ -444,7 +444,7 @@ class AkinatorEngine:
         
         # PATIENT THRESHOLDS: Only guess when VERY confident
         # 99.5% confidence AND 90% margin
-        if top_prob >= 0.995 and margin >= 0.95 and q_count > 8:
+        if top_prob >= 0.995 and margin >= 0.995 and q_count > 8:
             print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
