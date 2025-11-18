@@ -438,14 +438,13 @@ class AkinatorEngine:
         top_animal = self.animals[top_idx]
         margin = top_prob - second_prob
         
-        # Continue mode requires patience before guessing again
         if game_state.get('continue_mode', False):
             if game_state.get('questions_since_last_guess', 0) < 10:
                 return False, None, None
         
         # PATIENT THRESHOLDS: Only guess when VERY confident
         # 99.5% confidence AND 90% margin
-        if top_prob >= 0.995 and margin >= 0.90:
+        if top_prob >= 0.995 and margin >= 0.95 and q_count > 8:
             print(f"[Q{q_count}] CONFIDENT GUESS: {top_animal} (prob={top_prob:.4f}, margin={margin:.4f})")
             game_state['has_made_initial_guess'] = True
             return True, top_animal, 'final'
