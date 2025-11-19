@@ -27,29 +27,40 @@ class StateManager:
     def migrate_state(game_state: dict, new_animal_count: int) -> dict:
         """
         Resize state arrays if the engine grew (new items added in real-time).
+        CRITICAL FIX: Initialize new items with minimum score to prevent 
+        them from hijacking active games.
         """
-        # Get current size from the arrays themselves
         current_scores = game_state.get('cumulative_scores', np.array([]))
         state_n = len(current_scores)
         
-        # If size matches, return (ensure mask exists)
+        # Case 1: Size matches (No change needed)
         if state_n == new_animal_count:
             if 'rejected_mask' not in game_state:
                 game_state['rejected_mask'] = np.zeros(state_n, dtype=bool)
             return game_state
         
-        # If engine is larger than session state -> Pad
+        # Case 2: Engine grew (New items added)
         if new_animal_count > state_n:
             padding_len = new_animal_count - state_n
             
-            # Pad Scores with 0.0 (Neutral probability in log space, relative to others doesn't matter 
-            # as long as they are normalized later. But strictly, if we added a new item, 
-            # its score should ideally be comparable to the start score. 
-            # 0.0 in log space is log(1), which is high. 
-            # The engine initializes new item scores to 0.0 implicitly in 'update' if we don't do it here.
-            # Let's use 0.0 (log(1)) because they haven't been ruled out.)
-            score_pad = np.zeros(padding_len, dtype=np.float32)
+            # --- FIX START ---
+            # Don't use 0.0. Use the worst score in the current active set.
+            # This prevents the new item (which matches nothing yet) from 
+            # beating items that have survived 15 questions.
+            if state_n > 0:
+                # Use min score minus a small buffer to ensure it stays at bottom
+                # checking for -inf to avoid issues
+                valid_scores = current_scores[np.isfinite(current_scores)]
+                if len(valid_scores) > 0:
+                    base_score = np.min(valid_scores) - 1.0
+                else:
+                    base_score = -20.0 # Fallback for empty/all-inf states
+            else:
+                base_score = 0.0
+
+            score_pad = np.full(padding_len, base_score, dtype=np.float32)
             mask_pad = np.zeros(padding_len, dtype=bool)
+            # --- FIX END ---
             
             game_state['cumulative_scores'] = np.concatenate([current_scores, score_pad])
             
@@ -58,7 +69,7 @@ class StateManager:
             
             game_state['animal_count'] = new_animal_count
             
-        # If engine is smaller (rare, maybe deletion?), slice it
+        # Case 3: Engine shrank (Deletion? Rare)
         elif new_animal_count < state_n:
             game_state['cumulative_scores'] = current_scores[:new_animal_count]
             game_state['rejected_mask'] = game_state['rejected_mask'][:new_animal_count]
@@ -78,6 +89,7 @@ class StateManager:
     
     @staticmethod
     def get_state_cache_key(game_state: dict, n: int) -> str:
+        # Convert numpy to tuple for hashing
         scores_hash = hash(tuple(game_state['cumulative_scores'].tolist()))
         mask_hash = hash(tuple(game_state['rejected_mask'].tolist()))
         asked_hash = hash(tuple(sorted(game_state['asked_features'])))
