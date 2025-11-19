@@ -1,5 +1,7 @@
 import threading
+import time
 import numpy as np
+from datetime import datetime, timezone, timedelta
 
 import db
 from engine import AkinatorEngine
@@ -8,8 +10,7 @@ from state_manager import StateManager
 
 class AkinatorService:
     """
-    Service Layer.
-    Manages game flow and engine interaction.
+    Service Layer with Precise Real-time Sync.
     """
     
     def __init__(self):
@@ -19,11 +20,22 @@ class AkinatorService:
         self.state_manager = StateManager()
         self._prediction_cache = {}
         self._cache_lock = threading.Lock()
+        
+        self.is_running = True
         self._load_all_engines()
+        
+        # Reset sync time to NOW after load to start polling fresh changes
+        self.last_sync_time = datetime.now(timezone.utc)
+        
+        # Start Poller
+        self.sync_thread = threading.Thread(target=self._background_sync_loop, daemon=True)
+        self.sync_thread.start()
 
     def _create_engine(self, domain_name: str) -> AkinatorEngine:
         try:
+            # Load full dataset (active + suggested)
             df, feature_cols, questions_map = db.load_data_from_supabase(domain_name)
+            # Create with padding
             engine = AkinatorEngine(df, feature_cols, questions_map)
             return engine
         except Exception as e:
@@ -45,13 +57,62 @@ class AkinatorService:
             self._prediction_cache.clear()
         print(f"✅ All engines loaded. Serving {len(self.engines)} domains.")
 
-    def _background_reload(self):
-        print("🚀 Starting background engine reload...")
-        try:
-            self._load_all_engines()
-            print(f"✅ Engine hot-swap complete.")
-        except Exception as e:
-            print(f"❌ ERROR: Background reload failed: {e}")
+    def _background_sync_loop(self):
+        """
+        Smart Poll: Fetches diffs -> Hot Patch.
+        """
+        print(f"🔄 Real-time sync loop started.")
+        
+        while self.is_running:
+            try:
+                time.sleep(3.0) # Poll every 3s
+                
+                # Prepare next timestamp anchor
+                next_sync_time = datetime.now(timezone.utc)
+                
+                with self.engines_lock:
+                    domains = list(self.engines.keys())
+                
+                total_updates = 0
+                
+                for domain in domains:
+                    # Fetch updates since last_sync_time
+                    updates = db.get_recent_updates(domain, self.last_sync_time)
+                    
+                    if updates:
+                        with self.engines_lock:
+                            engine = self.engines.get(domain)
+                            if not engine: continue
+                            
+                            # 1. Ingest Data
+                            for up in updates:
+                                engine.smart_ingest_update(
+                                    item_name=up['item_name'],
+                                    feature_name=up['feature_name'],
+                                    value=up['value'],
+                                    question_text=up.get('question_text')
+                                )
+                            
+                            # 2. Update Strategy
+                            # We do this once per batch per domain
+                            engine.recalculate_stats()
+                            
+                        total_updates += len(updates)
+                        print(f"⚡ [Realtime] Synced {len(updates)} updates for '{domain}'")
+                
+                if total_updates > 0:
+                    with self._cache_lock:
+                        self._prediction_cache.clear()
+                    
+                    # Update cursor only if we processed data successfully
+                    self.last_sync_time = next_sync_time
+                else:
+                    # Move cursor forward to avoid scanning old time windows if nothing happened
+                    self.last_sync_time = next_sync_time
+                
+            except Exception as e:
+                print(f"⚠️ Sync Loop Error: {e}")
+                time.sleep(5.0)
 
     def _get_engine_and_migrate_state(self, game_state: dict) -> tuple[AkinatorEngine, dict]:
         domain_name = game_state.get('domain_name')
@@ -61,18 +122,27 @@ class AkinatorService:
             domain_name, engine = next(iter(self.engines.items()))
             game_state['domain_name'] = domain_name
             
-        game_state = self.state_manager.migrate_state(game_state, len(engine.animals), engine.animals)
-        if 'cumulative_scores' not in game_state or len(game_state['cumulative_scores']) != len(engine.animals):
-            game_state['cumulative_scores'] = np.zeros(len(engine.animals), dtype=np.float32)
-        if 'answer_history' not in game_state:
-            game_state['answer_history'] = []
+        # Dynamic Session Migration
+        # Check if engine item count > session array size
+        # This happens if a new item was added while user was playing
+        game_state = self.state_manager.migrate_state(game_state, engine.n_items)
+        
         return engine, game_state
 
     def _get_probs_and_state(self, game_state: dict) -> tuple[np.ndarray, dict, AkinatorEngine]:
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
+        
         scores = game_state['cumulative_scores'].copy()
         mask = game_state['rejected_mask']
+        
+        # Safety check: if scores mismatch engine, return empty (should be handled by migrate_state)
+        if len(scores) != engine.n_items:
+            # Last ditch migration attempt
+            game_state = self.state_manager.migrate_state(game_state, engine.n_items)
+            scores = game_state['cumulative_scores'].copy()
+            mask = game_state['rejected_mask']
+
         scores[mask] = -np.inf
         
         if len(scores) > 0:
@@ -80,9 +150,12 @@ class AkinatorService:
             probs = e_x / (e_x.sum() + 1e-10)
         else:
             probs = np.array([], dtype=np.float32)
+        
         probs[mask] = 0.0
         return probs, game_state, engine
 
+    # --- Proxy Methods ---
+    
     def get_available_domains(self) -> list[str]:
         with self.engines_lock:
             return list(self.engines.keys())
@@ -91,7 +164,8 @@ class AkinatorService:
         with self.engines_lock:
             engine = self.engines.get(domain_name)
             if not engine: raise ValueError(f"Domain '{domain_name}' not found.")
-            return self.state_manager.create_initial_state(domain_name, len(engine.animals))
+            # Use current n_items from engine
+            return self.state_manager.create_initial_state(domain_name, engine.n_items)
 
     def get_top_predictions(self, game_state: dict, n: int = 5) -> list[dict]:
         state_key = self.state_manager.get_state_cache_key(game_state, n)
@@ -99,13 +173,17 @@ class AkinatorService:
             if state_key in self._prediction_cache: return self._prediction_cache[state_key]
         
         probs, game_state, engine = self._get_probs_and_state(game_state)
+        if len(probs) == 0: return []
+        
         sorted_indices = np.argsort(probs)[::-1]
         results = []
         for i in range(min(n, len(sorted_indices))):
             idx = sorted_indices[i]
             prob = probs[idx]
             if prob < 0.001: break
-            results.append({'animal': engine.animals[idx], 'probability': float(prob)})
+            # Safely access animals array
+            if idx < engine.n_items:
+                results.append({'animal': engine.animals[idx], 'probability': float(prob)})
         
         with self._cache_lock:
             self._prediction_cache[state_key] = results
@@ -121,38 +199,35 @@ class AkinatorService:
         return game_state
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
-        """
-        Determines the next best question to ask.
-        """
         prior, game_state, engine = self._get_probs_and_state(game_state)
         asked = game_state['asked_features']
         q_count = game_state['question_count']
         
-        # Q0 optimization: Uses pre-computed indices.
-        if q_count == 0 and hasattr(engine, 'sorted_initial_feature_indices'):
-            feature, q = engine.select_question(prior, asked, q_count)
-            return feature, q, game_state
-        
-        entropy = engine._calculate_entropy(prior)
-        print(f"[Question] PURE ENTROPY: Finding best split across {np.sum(prior > 0.001):.0f} items (entropy={entropy:.2f})")
-        
         feature, q = engine.select_question(prior, asked, q_count)
-        
         return feature, q, game_state
     
     def process_answer(self, game_state: dict, feature: str, answer: str) -> dict:
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
             
-        if feature not in engine.feature_cols: return game_state
-        feature_idx_list = np.where(engine.feature_cols == feature)[0]
-        if len(feature_idx_list) == 0: return game_state
-        feature_idx = int(feature_idx_list[0])
+        try:
+            # Map feature name to index
+            f_idx = engine.feature_map.get(feature)
+            if f_idx is None: return game_state
+        except Exception:
+            return game_state 
 
         current_scores = game_state['cumulative_scores']
-        new_scores = engine.update(feature_idx, answer, current_scores)
-        game_state['cumulative_scores'] = new_scores
         
+        # Engine update returns new scores (potentially longer if engine grew)
+        new_scores = engine.update(f_idx, answer, current_scores)
+        
+        game_state['cumulative_scores'] = new_scores
+        # Update mask size if needed to match new scores
+        if len(new_scores) > len(game_state['rejected_mask']):
+            padding = len(new_scores) - len(game_state['rejected_mask'])
+            game_state['rejected_mask'] = np.concatenate([game_state['rejected_mask'], np.zeros(padding, dtype=bool)])
+            
         if 'answer_history' not in game_state: game_state['answer_history'] = []
         game_state['answer_history'].append({'feature': feature, 'answer': answer})
         
@@ -162,66 +237,61 @@ class AkinatorService:
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
         
-        idx_list = np.where(engine.animals == animal_name)[0]
+        # Find animal index in active items
+        active_animals = engine.animals[:engine.n_items]
+        idx_list = np.where(active_animals == animal_name)[0]
+        
         if len(idx_list) > 0:
-            game_state['rejected_mask'][idx_list[0]] = True
+            idx = idx_list[0]
+            # Ensure mask is large enough
+            if idx < len(game_state['rejected_mask']):
+                game_state['rejected_mask'][idx] = True
+                
         return game_state
 
-    def get_features_for_data_collection(self, domain_name: str, item_name: str) -> list[dict]:
+    def get_features_for_data_collection(self, domain_name, item_name):
         with self.engines_lock:
             engine = self.engines.get(domain_name)
-            if not engine: raise ValueError(f"Domain '{domain_name}' not found.")
-        return engine.get_features_for_data_collection(item_name, num_features=5)
+            if not engine: raise ValueError("Domain not found")
+        return engine.get_features_for_data_collection(item_name)
 
-    def get_feature_gains(self, domain_name: str) -> list[dict]:
+    def get_feature_gains(self, domain_name):
         with self.engines_lock:
             engine = self.engines.get(domain_name)
-            if not engine: raise ValueError(f"Domain '{domain_name}' not found.")
+            if not engine: raise ValueError("Domain not found")
         return engine.get_all_feature_gains()
+    
+    def record_suggestion(self, *args): return db.persist_suggestion(*args)
+    def learn_new_animal(self, *args): return db.persist_new_animal(*args)
+    def start_engine_reload(self): self._load_all_engines()
 
-    def record_suggestion(self, animal_name: str, answered_features: dict, domain_name: str) -> str:
-        return db.persist_suggestion(animal_name, answered_features, domain_name)
-
-    def learn_new_animal(self, animal_name: str, answered_features: dict, domain_name: str) -> str:
-        return db.persist_new_animal(animal_name, answered_features, domain_name)
-
-    def start_engine_reload(self):
-        threading.Thread(target=self._background_reload, daemon=True).start()
-
-    def get_game_report(self, domain_name: str, item_name: str, user_answers: dict, is_new: bool) -> dict:
+    def get_game_report(self, domain_name, item_name, user_answers, is_new):
         with self.engines_lock:
             engine = self.engines.get(domain_name)
-            if not engine: raise ValueError(f"Domain '{domain_name}' not found.")
+            if not engine: raise ValueError("Domain not found")
         
         questions_report = []
         item_idx = -1
         
-        if is_new:
-            report_name = f"{item_name} (New Item)"
-        else:
-            report_name = item_name
+        if not is_new:
+            active_animals = engine.animals[:engine.n_items]
             try:
-                item_idx = np.where(engine.animals == item_name)[0][0]
-            except (IndexError, TypeError):
-                report_name = f"{item_name} (Item not found)"
-                is_new = True
+                item_idx = np.where(active_animals == item_name)[0][0]
+            except: is_new = True
 
         for feature_name, user_value in user_answers.items():
-            question_text = engine.questions_map.get(feature_name, f"Is it {feature_name}?")
+            q_text = engine.questions_map.get(feature_name, f"Is it {feature_name}?")
             consensus_value = None
             if not is_new and item_idx != -1:
                 try:
-                    f_idx = np.where(engine.feature_cols == feature_name)[0]
-                    if len(f_idx) > 0:
-                        val = engine.features[item_idx, int(f_idx[0])]
+                    f_idx = engine.feature_map.get(feature_name)
+                    if f_idx is not None:
+                        val = engine.features[item_idx, f_idx]
                         if not np.isnan(val): consensus_value = float(val)
                 except: pass
             
             questions_report.append({
-                "question": question_text,
-                "feature": feature_name,
-                "user_answer": float(user_value),
-                "consensus_answer": consensus_value
+                "question": q_text, "feature": feature_name,
+                "user_answer": float(user_value), "consensus_answer": consensus_value
             })
-
-        return {"item_name": report_name, "is_new_item": is_new, "questions": questions_report}
+        return {"item_name": item_name, "is_new_item": is_new, "questions": questions_report}

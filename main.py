@@ -2,6 +2,7 @@ import uvicorn
 import uuid
 import time
 import traceback
+import random
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -61,15 +62,21 @@ async def lifespan(app: FastAPI):
         undo_handler = UndoHandler(service)
         
         # Warmup
-        print("🔥 Warming up engine for default 'animals' domain...")
-        if "animals" in service.get_available_domains():
-            initial_state = service.create_initial_state(domain_name="animals")
-            service.get_next_question(initial_state)
-            service.get_top_predictions(initial_state, n=5)
+        loaded_domains = service.get_available_domains()
+        if loaded_domains:
+            print(f"🔥 Warming up {len(loaded_domains)} domains...")
+            for domain in loaded_domains:
+                try:
+                    # print(f"   -> Warming '{domain}'")
+                    initial_state = service.create_initial_state(domain_name=domain)
+                    service.get_next_question(initial_state)
+                    service.get_top_predictions(initial_state, n=5)
+                except Exception as e:
+                    print(f"   ⚠️ Warmup failed for '{domain}': {e}")
         else:
-            print("⚠ 'animals' domain not found, skipping warmup.")
+            print("⚠ No domains loaded, skipping warmup.")
         
-        print(f"✅ FastAPI startup complete. {len(service.get_available_domains())} domains loaded.")
+        print(f"✅ FastAPI startup complete. {len(loaded_domains)} domains loaded.")
     except Exception as e:
         print(f"❌ CRITICAL: Failed to initialize. Server cannot start.")
         print(f"Error: {e}")
@@ -84,7 +91,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Akinator API",
     description="Multi-domain Akinator-style game server.",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan
 )
 
@@ -106,19 +113,6 @@ def get_service() -> AkinatorService:
     return service
 
 
-def get_article(word: str) -> str:
-    """Determines if 'a' or 'an' should precede the word."""
-    if not word:
-        return "a"
-    try:
-        first_char = word.strip()[0].lower()
-        if first_char in 'aeiou':
-            return "an"
-    except IndexError:
-        return "a"
-    return "a"
-
-
 # --- Endpoints ---
 
 @app.get("/domains")
@@ -136,7 +130,6 @@ async def start_game(payload: StartPayload):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     
-    # Initial state is set to 'initial' by state_manager
     db.push_session_state(session_id, game_state)
     return {"session_id": session_id, "domain_name": payload.domain_name}
 
@@ -166,7 +159,6 @@ async def get_question(session_id: str):
                 'top_predictions': top_predictions
             }
         
-        # Get regular question
         feature, question, game_state = srv.get_next_question(game_state)
 
         if feature and feature not in game_state['asked_features']:
@@ -177,20 +169,12 @@ async def get_question(session_id: str):
 
         if not feature or not question:
             top_preds = srv.get_top_predictions(game_state, n=3)
-            if not top_preds:
-                return {
-                    'question': "I'm stumped! You win!",
-                    'feature': "game_over_lost",
-                    'top_predictions': [],
-                    'should_guess': False,
-                    'is_sneaky_guess': False
-                }
-
             return {
-                'should_guess': True,
-                'guess': top_preds[0]['animal'],
-                'guess_type': 'final',
-                'top_predictions': top_preds
+                'question': "I'm stumped! You win!",
+                'feature': "game_over_lost",
+                'top_predictions': top_preds if top_preds else [],
+                'should_guess': False,
+                'is_sneaky_guess': False
             }
         
         q_num = game_state.get('question_count', 0) + 1
@@ -222,23 +206,11 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
     feature = payload.feature
     
     answer_map = {
-            # Standard values
-            'yes': 'yes', 
-            'y': 'yes',
-            'no': 'no', 
-            'n': 'no',
-
-            # NEW frontend values -> Engine values
-            'mostly': 'usually',       # Maps "Mostly" to engine's 0.75
-            'probably': 'usually',     # Keep for backward compatibility if needed
-            'usually': 'usually',      # Keep for engine compatibility
-
-            'sort of': 'sometimes',    # Maps "Sort of" to engine's 0.5
-            'sometimes': 'sometimes',  # Keep for engine compatibility
-            'maybe': 'sometimes',      # Keep for robustness
-
-            'not really': 'rarely',    # Maps "Not really" to engine's 0.25
-            'rarely': 'rarely'         # Keep for engine compatibility
+            'yes': 'yes', 'y': 'yes',
+            'no': 'no', 'n': 'no',
+            'mostly': 'usually', 'probably': 'usually', 'usually': 'usually',
+            'sort of': 'sometimes', 'sometimes': 'sometimes', 'maybe': 'sometimes',
+            'not really': 'rarely', 'rarely': 'rarely'
         }
         
     brain_answer = answer_map.get(client_answer)
@@ -271,13 +243,8 @@ async def submit_answer(session_id: str, payload: AnswerPayload):
 
 @app.post("/undo/{session_id}")
 async def undo_last_action(session_id: str):
-    """
-    FIXED: Now properly handles question numbering and guess states.
-    """
     try:
         srv = get_service()
-        
-        # Perform the undo
         reverted_state, error = undo_handler.perform_undo(session_id)
         
         if not reverted_state:
@@ -286,15 +253,12 @@ async def undo_last_action(session_id: str):
                 detail=error or "Session expired or not found"
             )
         
-        # Build response from the reverted state (pass session_id)
         response = undo_handler.build_response_from_state(reverted_state, session_id, error)
-        
         return response
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error in /undo: {e}")
-        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -328,13 +292,12 @@ async def reject_animal(session_id: str, payload: RejectPayload):
     }
 
 
-# --- REMOVED /win and /learn ENDPOINTS ---
-# The new /report endpoint now handles this functionality.
-
-
 @app.get("/items_for_questions/{domain_name}")
 async def get_items_for_questions(domain_name: str):
-    import random
+    """
+    Returns random items for a domain to ask questions about.
+    CRITICAL FIX: Slices the padded array using n_items to avoid sending None values.
+    """
     srv = get_service()
     
     with srv.engines_lock:
@@ -342,7 +305,13 @@ async def get_items_for_questions(domain_name: str):
         if not engine:
             raise HTTPException(status_code=404, detail=f"Domain '{domain_name}' not found.")
         
-        all_items = list(engine.animals)
+        # Slice the numpy array to get only ACTIVE items
+        # .tolist() ensures it's a Python list suitable for JSON
+        active_items = engine.animals[:engine.n_items]
+        
+        # Convert to list and filter out Nones just in case, though indices should be valid
+        all_items = [x for x in active_items if x is not None]
+        
         if len(all_items) == 0:
             return {"items": []}
         
@@ -392,8 +361,9 @@ async def get_stats():
         domain_stats = {}
         for domain, engine in srv.engines.items():
             domain_stats[domain] = {
-                'total_items': len(engine.animals),
-                'total_features': len(engine.feature_cols),
+                # FIX: Report active counts, not padded capacity
+                'total_items': int(engine.n_items),
+                'total_features': int(engine.n_features),
                 'precomputed_features': len(engine.sorted_initial_feature_indices)
             }
     
@@ -453,10 +423,6 @@ async def get_and_finalize_game_report(
     item_name: str, 
     is_new: bool = False
 ):
-    """
-    Retrieves a final report AND finalizes the game.
-    Replaces calls to /win and /learn.
-    """
     srv = get_service()
     game_state = db.get_current_session_state(session_id)
     if not game_state:
@@ -466,7 +432,6 @@ async def get_and_finalize_game_report(
         user_answers = game_state.get('answered_features', {})
         domain_name = game_state.get('domain_name', 'animals')
         
-        # --- FIX START: Check if already finalized to prevent duplicate votes ---
         if game_state.get('game_finalized', False):
              return srv.get_game_report(
                 domain_name=domain_name,
@@ -481,19 +446,14 @@ async def get_and_finalize_game_report(
             is_new=is_new
         )
         
-        # 2. Finalize the game (write-op)
         if is_new:
             srv.learn_new_animal(item_name, user_answers, domain_name)
         else:
             srv.record_suggestion(item_name, user_answers, domain_name)
         
-        # 3. Clean up: Don't delete immediately, just mark as finalized.
-        # Redis TTL will clean it up after 30 minutes.
-        # db.delete_session(session_id)  <-- REMOVED THIS LINE
         game_state['game_finalized'] = True
         db.push_session_state(session_id, game_state)
         
-        # 4. Return the report
         return report_data
         
     except ValueError as e:
@@ -524,17 +484,11 @@ async def trigger_reload(reload_token: str = Header(..., alias="X-Reload-Token")
         raise HTTPException(status_code=500, detail="Failed to start reload process")
 
 
-# --- NEW ENDPOINT ---
 @app.get("/admin/feature_gains/{domain_name}", include_in_schema=False)
 async def get_feature_gains(
     domain_name: str,
     reload_token: str = Header(..., alias="X-Reload-Token")
 ):
-    """
-    NEW: This endpoint directly answers your question about
-    calculating the gain for all features. It returns a JSON
-    list of all features and their initial information gain.
-    """
     if not config.RELOAD_SECRET_TOKEN:
         raise HTTPException(status_code=503, detail="Admin endpoints are not configured")
         
@@ -555,7 +509,6 @@ async def get_feature_gains(
     except Exception as e:
         print(f"ERROR: /admin/feature_gains failed: {e}")
         raise HTTPException(status_code=500, detail="Failed to calculate gains")
-# --- END NEW ENDPOINT ---
 
 
 if __name__ == "__main__":
