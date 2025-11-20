@@ -4,13 +4,11 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V14.0 - Robust Probabilistic & Smart Narrowing).
+    Real-time Padded Akinator Engine (V14.1 - Robust Probabilistic & Stochastic Start).
     
-    Fixes:
-    - Deduplication via case-insensitive mapping.
-    - "Climbing" logic: Items are never hard-eliminated, allowing correction.
-    - Smart Narrowing: Questions focus on splitting the TOP candidates.
-    - Added: Nearest Neighbor search for 'Similar Items'.
+    Updates:
+    - select_question: Now randomizes the first question from the Top 5 candidates.
+    - select_question: Strictly greedy (argmax) for all subsequent questions.
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -260,7 +258,11 @@ class AkinatorEngine:
 
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
-        SMART NARROWING.
+        SMART NARROWING with STOCHASTIC START.
+        
+        Logic:
+        - If Question 0: Pick RANDOMLY from the top 5 features.
+        - If Question > 0: GREEDY AF (Strict Argmax) to converge rapidly.
         """
         active_cols = self.feature_cols_array[:self.n_features]
         asked_mask = np.isin(active_cols, asked_features)
@@ -294,7 +296,32 @@ class AkinatorEngine:
                 max_corr = np.max(np.abs(corr_sub), axis=1)
                 scores[valid_candidates] *= (1.0 - max_corr**2)
 
-        best_candidate_idx = candidate_indices[np.argmax(scores[candidate_indices])]
+        # --- SELECTION LOGIC START ---
+        
+        if question_count == 0:
+            # RANDOM START: Pick from Top 5 to ensure variety
+            
+            # 1. Get scores for candidates
+            candidate_scores = scores[candidate_indices]
+            
+            # 2. Sort descending (indices relative to candidate_indices)
+            sorted_local_indices = np.argsort(candidate_scores)[::-1]
+            
+            # 3. Define pool (Top 5 or fewer if not enough data)
+            pool_size = min(len(sorted_local_indices), 5)
+            
+            if pool_size == 0: 
+                return None, None
+                
+            # 4. Pick Randomly
+            random_pool_index = np.random.choice(sorted_local_indices[:pool_size])
+            best_candidate_idx = candidate_indices[random_pool_index]
+            
+        else:
+            # GREEDY AF: Strict Argmax for maximum efficiency
+            best_candidate_idx = candidate_indices[np.argmax(scores[candidate_indices])]
+            
+        # --- SELECTION LOGIC END ---
         
         fname = str(active_cols[best_candidate_idx])
         return fname, self.questions_map.get(fname, f"Is it {fname}?")
@@ -315,21 +342,17 @@ class AkinatorEngine:
         should_guess = False
         reason = ""
         
+        # 1. Hard Limit (Max Questions)
         if q_count >= 40:
             should_guess = True
             reason = "max_questions"
-        elif q_count > 15:
-            if ratio > 2.5 and top_prob > 0.4:
-                should_guess = True
-                reason = "dominance_late"
-        elif q_count > 8:
-            if ratio > 5.0 and top_prob > 0.6:
-                should_guess = True
-                reason = "dominance_mid"
-        elif q_count > 4:
-            if ratio > 15.0 and top_prob > 0.85:
-                should_guess = True
-                reason = "dominance_early"
+            
+        # 2. Strict Confidence Requirements
+        # Regardless of question count, we demand high certainty.
+        # This prevents "eager" guessing in the early/mid game.
+        elif top_prob > 0.90 and ratio > 8.0:
+            should_guess = True
+            reason = "strict_confidence"
                 
         return should_guess, top_animal if should_guess else None, reason
     
