@@ -34,7 +34,7 @@ class SuggestFeaturePayload(BaseModel):
     item_name: str
     fuzzy_value: float
 
-# --- NEW: Report Models ---
+# --- Report Models ---
 class ReportQuestion(BaseModel):
     question: str
     feature: str
@@ -45,6 +45,7 @@ class GameReport(BaseModel):
     item_name: str
     is_new_item: bool
     questions: List[ReportQuestion]
+    similar_items: List[str] = [] # <--- NEW: Server-provided suggestions
 
 
 # --- Global Variables ---
@@ -91,7 +92,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Akinator API",
     description="Multi-domain Akinator-style game server.",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan
 )
 
@@ -294,10 +295,6 @@ async def reject_animal(session_id: str, payload: RejectPayload):
 
 @app.get("/items_for_questions/{domain_name}")
 async def get_items_for_questions(domain_name: str):
-    """
-    Returns random items for a domain to ask questions about.
-    CRITICAL FIX: Slices the padded array using n_items to avoid sending None values.
-    """
     srv = get_service()
     
     with srv.engines_lock:
@@ -305,11 +302,7 @@ async def get_items_for_questions(domain_name: str):
         if not engine:
             raise HTTPException(status_code=404, detail=f"Domain '{domain_name}' not found.")
         
-        # Slice the numpy array to get only ACTIVE items
-        # .tolist() ensures it's a Python list suitable for JSON
         active_items = engine.animals[:engine.n_items]
-        
-        # Convert to list and filter out Nones just in case, though indices should be valid
         all_items = [x for x in active_items if x is not None]
         
         if len(all_items) == 0:
@@ -361,7 +354,6 @@ async def get_stats():
         domain_stats = {}
         for domain, engine in srv.engines.items():
             domain_stats[domain] = {
-                # FIX: Report active counts, not padded capacity
                 'total_items': int(engine.n_items),
                 'total_features': int(engine.n_features),
                 'precomputed_features': len(engine.sorted_initial_feature_indices)
@@ -423,6 +415,11 @@ async def get_and_finalize_game_report(
     item_name: str, 
     is_new: bool = False
 ):
+    """
+    Finalizes the game and returns a detailed report.
+    NEW: Now calculates similarity based on vector distance (Nearest Neighbors)
+    so we can suggest 'Similar Items' even for brand new items.
+    """
     srv = get_service()
     game_state = db.get_current_session_state(session_id)
     if not game_state:
@@ -439,6 +436,8 @@ async def get_and_finalize_game_report(
                 user_answers=user_answers,
                 is_new=is_new
             )
+        
+        # Get the report (which now includes 'similar_items')
         report_data = srv.get_game_report(
             domain_name=domain_name,
             item_name=item_name,
@@ -446,6 +445,7 @@ async def get_and_finalize_game_report(
             is_new=is_new
         )
         
+        # Persist data
         if is_new:
             srv.learn_new_animal(item_name, user_answers, domain_name)
         else:

@@ -10,6 +10,7 @@ class AkinatorEngine:
     - Deduplication via case-insensitive mapping.
     - "Climbing" logic: Items are never hard-eliminated, allowing correction.
     - Smart Narrowing: Questions focus on splitting the TOP candidates.
+    - Added: Nearest Neighbor search for 'Similar Items'.
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -218,13 +219,10 @@ class AkinatorEngine:
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
         """
         ROBUST SCORING (The "Climbing" Logic).
-        Instead of eliminating items, we just lower their probability.
-        This allows an item to recover if the user made a mistake or data is imperfect.
         """
         # Resize scores if engine grew
         if len(current_scores) < self.n_items:
             padding_len = self.n_items - len(current_scores)
-            # Initialize padding with MEAN score, not Min, so new items have a chance
             valid_scores = current_scores[np.isfinite(current_scores)]
             base_score = np.mean(valid_scores) if len(valid_scores) > 0 else 0.0
             padding = np.full(padding_len, base_score, dtype=np.float32)
@@ -239,24 +237,15 @@ class AkinatorEngine:
         f_col_clean = np.nan_to_num(f_col, nan=0.5)
         
         # 2. Gaussian Likelihood
-        # We use a wider sigma (0.18) to be forgiving of bad data/answers
         sigma = 0.18
         distance = np.abs(f_col_clean - answer_val)
-        
-        # Calculate raw likelihood: exp(-0.5 * (dist/sigma)^2)
-        # This creates a bell curve. Perfect match = 1.0, Far mismatch = near 0
         gaussian_likelihood = np.exp(-0.5 * (distance / sigma) ** 2)
         
-        # 3. NOISE FLOOR (The "User Error" Factor)
-        # We assume there is always a 2% chance the user is wrong or the data is wrong.
-        # This prevents likelihood from ever being 0.0 (which would be -inf score).
-        # This is what allows items to "climb back up".
+        # 3. NOISE FLOOR
         p_noise = 0.02
         final_likelihood = (1.0 - p_noise) * gaussian_likelihood + p_noise
         
         # 4. Boost Confidence
-        # If data is very confident (near 0 or 1) and matches answer, give bonus
-        # This helps convergence speed for clear answers
         if answer_val > 0.75:
              bonus_mask = (f_col_clean > 0.8)
              final_likelihood[bonus_mask] *= 1.25
@@ -265,7 +254,6 @@ class AkinatorEngine:
              final_likelihood[bonus_mask] *= 1.25
              
         # 5. Convert to Log-Prob update
-        # Clip to avoid log(0)
         log_update = np.log(np.clip(final_likelihood, 1e-9, None))
         
         return current_scores + log_update
@@ -273,18 +261,12 @@ class AkinatorEngine:
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
         """
         SMART NARROWING.
-        Selects questions that best split the current TOP candidates.
         """
         active_cols = self.feature_cols_array[:self.n_features]
         asked_mask = np.isin(active_cols, asked_features)
         
-        # 1. Identify Top Candidates (Focus Mass)
-        # We only care about distinguishing items that are actually likely.
         if prior is not None and len(prior) > 0:
-            # Sort candidates by probability
             sorted_indices = np.argsort(prior)[::-1]
-            
-            # Take the top cumulative 90% of probability mass (or at least top 20 items)
             cum_sum = np.cumsum(prior[sorted_indices])
             cutoff = np.argmax(cum_sum > 0.90)
             top_k = max(20, cutoff + 1)
@@ -292,91 +274,59 @@ class AkinatorEngine:
         else:
             target_indices = np.arange(self.n_items)
 
-        # 2. Select Features with High Variance within Target Group
-        # Slice features for top candidates only
         target_features = self.features[target_indices, :]
-        
-        # Calculate variance of features strictly within this likely group
-        # This ensures we ask questions relevant to the remaining animals
         target_var = np.var(np.nan_to_num(target_features, nan=0.5), axis=0)
         
-        # Filter already asked
         candidate_indices = np.where((~asked_mask) & self.allowed_feature_mask)[0]
         
         if len(candidate_indices) == 0: return None, None
 
-        # 3. Correlation Penalty (Redundancy Check)
-        # If we already asked "Is it a feline?", don't ask "Is it a cat?"
         scores = target_var.copy()
-        
-        # Get indices of features we've already asked
         asked_indices = np.where(asked_mask)[0]
         
         if len(asked_indices) > 0:
-            # Limit matrix size for speed
             limit = min(self.n_features, self.feature_correlation_matrix.shape[0])
             valid_candidates = candidate_indices[candidate_indices < limit]
             valid_asked = asked_indices[asked_indices < limit]
             
             if len(valid_candidates) > 0 and len(valid_asked) > 0:
-                # For each candidate, find its max correlation with ANY asked question
-                # corr shape: (n_candidates, n_asked)
                 corr_sub = self.feature_correlation_matrix[valid_candidates][:, valid_asked]
                 max_corr = np.max(np.abs(corr_sub), axis=1)
-                
-                # Penalize score: Score = Variance * (1 - Correlation^2)
-                # If correlation is 1.0, score becomes 0.
                 scores[valid_candidates] *= (1.0 - max_corr**2)
 
-        # 4. Pick Best
-        # We only look at scores for valid candidates
         best_candidate_idx = candidate_indices[np.argmax(scores[candidate_indices])]
         
         fname = str(active_cols[best_candidate_idx])
         return fname, self.questions_map.get(fname, f"Is it {fname}?")
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
-        """
-        Determines if we should guess based on 'Dominance'.
-        If Top 1 is significantly more likely than Top 2, we guess.
-        """
         if probs.sum() < 1e-10: return False, None, None
         
-        # Normalize
         probs = probs / probs.sum()
-        
         sorted_idx = np.argsort(probs)[::-1]
         top_idx = sorted_idx[0]
         top_prob = probs[top_idx]
         top_animal = self.animals[top_idx]
         
         q_count = game_state['question_count']
-        
-        # Get Second place
         second_prob = probs[sorted_idx[1]] if len(sorted_idx) > 1 else 0.001
-        
-        # Dominance Ratio: How many times more likely is #1 than #2?
         ratio = top_prob / (second_prob + 1e-9)
         
-        # Aggressive guessing thresholds
         should_guess = False
         reason = ""
         
-        if q_count >= 40: # Safety Valve
+        if q_count >= 40:
             should_guess = True
             reason = "max_questions"
         elif q_count > 15:
-            # Late game: moderate dominance is enough
             if ratio > 2.5 and top_prob > 0.4:
                 should_guess = True
                 reason = "dominance_late"
         elif q_count > 8:
-            # Mid game: need high dominance
             if ratio > 5.0 and top_prob > 0.6:
                 should_guess = True
                 reason = "dominance_mid"
         elif q_count > 4:
-            # Early game: need extreme dominance (e.g., "Is it your mother?")
             if ratio > 15.0 and top_prob > 0.85:
                 should_guess = True
                 reason = "dominance_early"
@@ -390,7 +340,6 @@ class AkinatorEngine:
     def get_features_for_data_collection(self, item_name, num_features=5):
         if len(self.allowed_feature_indices) == 0: return []
         
-        # prioritize high variance features
         variances = self.col_var[self.allowed_feature_indices]
         prob_dist = variances / variances.sum()
         
@@ -421,3 +370,56 @@ class AkinatorEngine:
                 "initial_gain": float(self.col_var[idx])
             })
         return sorted(results, key=lambda x: x['initial_gain'], reverse=True)
+
+    def build_feature_vector(self, user_answers: dict) -> np.ndarray:
+        """
+        Builds a feature vector from a dictionary of user answers.
+        Unanswered features are set to 0.5 (uncertainty).
+        """
+        vector = np.full(self.n_features, 0.5, dtype=np.float32)
+        for fname, val in user_answers.items():
+            idx = self.feature_map.get(fname)
+            if idx is not None and idx < self.n_features:
+                vector[idx] = float(val)
+        return vector
+
+    def find_nearest_neighbors(self, target_vector: np.ndarray, exclude_name: str = None, n: int = 3) -> list[str]:
+        """
+        Calculates Euclidean distance between target vector and all active items.
+        Returns top N most similar item names.
+        """
+        if self.n_items == 0 or self.n_features == 0:
+            return []
+
+        # 1. Get Active Features (Handle NaNs by converting to 0.5)
+        # shape: (n_items, n_features)
+        active_matrix = np.nan_to_num(
+            self.features[:self.n_items, :self.n_features], 
+            nan=0.5
+        )
+        
+        # 2. Calculate Distances (Euclidean)
+        # broadcast target_vector across the matrix
+        # diff shape: (n_items, n_features)
+        diff = active_matrix - target_vector
+        
+        # dist shape: (n_items,)
+        distances = np.linalg.norm(diff, axis=1)
+        
+        # 3. Sort
+        sorted_indices = np.argsort(distances)
+        
+        results = []
+        for idx in sorted_indices:
+            if len(results) >= n:
+                break
+                
+            candidate_name = self.animals[idx]
+            
+            # Skip if it's the item itself (case-insensitive check)
+            if exclude_name and candidate_name.lower().strip() == exclude_name.lower().strip():
+                continue
+                
+            results.append(candidate_name)
+            
+        return results
