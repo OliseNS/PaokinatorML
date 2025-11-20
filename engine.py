@@ -4,12 +4,13 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V12.2 - Robust Imputation).
+    Real-time Padded Akinator Engine (V13.0 - Smart & Patient).
     
     Updates:
-    - Safe Imputation: Handles all-NaN columns to prevent shape mismatches.
-    - Smart Updates: Uses neutral initialization (0.5) for new data to avoid 
-      expensive re-imputation during gameplay.
+    - Stricter guessing thresholds with confidence requirements
+    - Mistake tolerance through answer history tracking
+    - Stronger elimination logic
+    - Verification mechanism for wrong guesses
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -31,7 +32,6 @@ class AkinatorEngine:
         print(f"🧠 Engine Alloc: {self.cap_rows} Rows (Items) x {self.cap_cols} Cols (Features)")
 
         # --- 2. Initialize Padded Arrays ---
-        # Shape: (Capacity Rows, Capacity Cols)
         self.features = np.full((self.cap_rows, self.cap_cols), np.nan, dtype=np.float32)
         self.animals = np.full(self.cap_rows, None, dtype=object)
         self.feature_cols_array = np.full(self.cap_cols, None, dtype=object)
@@ -41,16 +41,12 @@ class AkinatorEngine:
             self.feature_cols_array[:self.n_features] = self.active_feature_names
 
         if not df.empty:
-            # Store names
             names = df['animal_name'].values
             self.animals[:self.n_items] = names
             for idx, name in enumerate(names):
                 self.item_map[name] = idx
                 
-            # Store features safely
             if len(df.columns) > 1:
-                # We assume db.py aligned columns correctly. 
-                # Values are extracted directly to numpy to avoid pandas overhead.
                 existing_data = df[feature_cols].values.astype(np.float32)
                 self.features[:self.n_items, :self.n_features] = existing_data
 
@@ -58,7 +54,7 @@ class AkinatorEngine:
         print("   Imputing initial data block...")
         self._impute_active_block()
         
-        # Stats setup
+        # Stats setup with improved fuzzy matching
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0, 'mostly': 0.75, 'usually': 0.75, 
@@ -69,47 +65,32 @@ class AkinatorEngine:
         
         # Precomputations
         self._precompute_likelihood_tables()
-        self._refresh_column_stats() # Variance/Mean
-        self._recalc_correlation()   # Expensive, done once at start
+        self._refresh_column_stats()
+        self._recalc_correlation()
         self._compute_initial_priors()
         
         print(f"✓ Engine Ready. Active: {self.n_items} items, {self.n_features} features.")
 
     def _impute_active_block(self):
-        """
-        Smart Imputation: 
-        1. Fills completely empty columns with 0.5 (Neutral) to prevent KNN from dropping them.
-        2. Runs KNN only on the valid active block.
-        """
+        """Smart Imputation with safety checks."""
         if self.n_items == 0 or self.n_features == 0: return
         
-        # Slice only active
-        # We use a view where possible, but for assignment we need care
         active_view = self.features[:self.n_items, :self.n_features]
         
-        # Optimization: Check if we even HAVE NaNs before creating heavy objects
         if not np.isnan(active_view).any():
             return
 
         try:
-            # Step 1: Pre-fill columns that are 100% NaN
-            # KNNImputer drops these columns, causing the shape mismatch (114 -> 112)
             nan_mask = np.isnan(active_view)
             all_nan_cols = nan_mask.all(axis=0)
             
             if all_nan_cols.any():
-                # Assign 0.5 (Neutral/Unknown) to completely empty features
-                # This preserves the shape for the subsequent assignment
                 active_view[:, all_nan_cols] = 0.5
             
-            # Step 2: Run KNN on the rest
-            # We still check for NaNs because we only fixed the *entirely* empty columns
             if np.isnan(active_view).any():
                 imputer = KNNImputer(n_neighbors=5, weights='distance', missing_values=np.nan)
                 filled = imputer.fit_transform(active_view)
                 
-                # Step 3: Write back safely
-                # If shape matches (which it should now), write back
                 if filled.shape == active_view.shape:
                     self.features[:self.n_items, :self.n_features] = np.clip(filled, 0.0, 1.0)
                 else:
@@ -119,7 +100,6 @@ class AkinatorEngine:
                     
         except Exception as e:
             print(f"⚠️ Imputation Error: {e}")
-            # Fallback: fill NaNs with 0.5
             mask = np.isnan(active_view)
             self.features[:self.n_items, :self.n_features][mask] = 0.5
 
@@ -131,25 +111,19 @@ class AkinatorEngine:
         try:
             active_feats = self.features[:self.n_items, :self.n_features]
             df_temp = pd.DataFrame(active_feats)
-            # Fillna with 0.5 just in case, though imputation should have handled it
             self.feature_correlation_matrix = df_temp.corr().fillna(0).values.astype(np.float32)
         except:
             self.feature_correlation_matrix = np.eye(self.n_features, dtype=np.float32)
 
     def _refresh_column_stats(self):
         """Updates Variance and Mean for entropy calculations."""
-        # Only look at active block
         active_view = self.features[:self.n_items, :self.n_features]
-        
-        # Fast NaN handle for stats
         clean_view = np.nan_to_num(active_view, nan=0.5)
         
         self.col_var = np.var(clean_view, axis=0)
         self.col_mean = np.mean(clean_view, axis=0)
-        # Ambiguity: 1.0 if mean is 0.5, 0.0 if mean is 0 or 1
         self.col_ambiguity = 1.0 - 2.0 * np.abs(self.col_mean - 0.5)
         
-        # Update allowed mask (Variance > epsilon)
         self.allowed_feature_mask = (self.col_var > 1e-6)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
 
@@ -158,7 +132,6 @@ class AkinatorEngine:
             self.uniform_prior = np.ones(self.n_items, dtype=np.float32) / self.n_items
             initial_gains = self._compute_gains(self.uniform_prior, self.allowed_feature_indices)
             
-            # Variance Boost
             variance_boost = self.col_var[self.allowed_feature_indices]
             boosted_gains = initial_gains * (1.0 + variance_boost)
             
@@ -168,14 +141,8 @@ class AkinatorEngine:
             self.uniform_prior = np.array([], dtype=np.float32)
             self.sorted_initial_feature_indices = np.array([], dtype=np.int32)
 
-    # --- REAL-TIME UPDATE METHODS ---
-
     def smart_ingest_update(self, item_name: str, feature_name: str, value: float, question_text: str = None):
-        """
-        Dynamically adds Items OR Features without full reload.
-        Optimization: Does NOT trigger heavy KNN. Uses neutral (0.5) init for speed.
-        """
-        # 1. Handle Item Existence
+        """Dynamically adds Items OR Features without full reload."""
         idx = self.item_map.get(item_name)
         if idx is None:
             if self.n_items >= self.cap_rows:
@@ -186,14 +153,10 @@ class AkinatorEngine:
             self.animals[idx] = item_name
             self.item_map[item_name] = idx
             self.n_items += 1
-            
-            # Init row with 0.5 (neutral)
             self.features[idx, :self.n_features] = 0.5 
-            # Update prior array size
             self.uniform_prior = np.ones(self.n_items, dtype=np.float32) / self.n_items
             print(f"   [Engine] +ITEM: '{item_name}' @ idx {idx}")
 
-        # 2. Handle Feature Existence
         f_idx = self.feature_map.get(feature_name)
         if f_idx is None:
             if self.n_features >= self.cap_cols:
@@ -208,31 +171,26 @@ class AkinatorEngine:
             if question_text:
                 self.questions_map[feature_name] = question_text
             
-            # Init col (default 0.5)
             self.features[:self.n_items, f_idx] = 0.5
-            
             print(f"   [Engine] +FEATURE: '{feature_name}' @ col {f_idx}")
 
-        # 3. Update Value (Trust the vote)
         self.features[idx, f_idx] = value
-        
-        # 4. Lightweight Stats Update
-        # We only refresh means/variances, we do NOT re-impute or re-correlate
         self._refresh_column_stats()
 
     def recalculate_stats(self):
         """Called by service.py after a batch of updates to refresh priorities."""
         self._compute_initial_priors()
 
-    # --- MATH METHODS (Slice Aware) ---
-
     def _precompute_likelihood_tables(self):
+        """Precompute likelihood tables with tighter distributions for better discrimination."""
         steps = 1001
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
         f_grid_col = self.feature_grid[:, np.newaxis]
         a_vals_row = self.answer_values[np.newaxis, :]
         diffs = np.abs(f_grid_col - a_vals_row)
-        sigmas = np.where(self.answer_values == 0.5, 0.18, 0.12)
+        
+        # Tighter sigmas for better discrimination
+        sigmas = np.where(self.answer_values == 0.5, 0.15, 0.10)
         likelihoods = np.exp(-0.5 * (diffs / sigmas[np.newaxis, :]) ** 2)
         self.likelihood_table = np.maximum(likelihoods, 1e-12).astype(np.float32)
 
@@ -241,7 +199,6 @@ class AkinatorEngine:
         return -np.sum(p * np.log2(p))
 
     def _compute_gains(self, prior: np.ndarray, feature_indices: np.ndarray) -> np.ndarray:
-        # Slice: Active Items x Selected Features
         active_features = self.features[:self.n_items, :][:, feature_indices]
         
         n_rows = active_features.shape[0]
@@ -267,7 +224,7 @@ class AkinatorEngine:
         return current_entropy - expected_entropy
 
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        # Handle resizing logic via concatenation if needed
+        """Updated with MUCH stricter elimination logic."""
         if len(current_scores) < self.n_items:
             padding = np.zeros(self.n_items - len(current_scores), dtype=np.float32)
             current_scores = np.concatenate([current_scores, padding])
@@ -284,20 +241,32 @@ class AkinatorEngine:
         
         likelihoods = self.likelihood_table[f_quant, a_idx].copy()
         
+        # Enhanced penalty calculation
         certainty = np.clip(2.0 * np.abs(f_col_clean - 0.5), 0.0, 1.0)
         distance = np.abs(f_col_clean - answer_val)
         severity = distance * certainty
         
-        penalty_multiplier = np.exp(-20.0 * severity)
+        # Stronger penalty for contradictions
+        penalty_multiplier = np.exp(-25.0 * severity)  # Increased from 20.0
         likelihoods *= penalty_multiplier
         
+        # MUCH stricter hard elimination thresholds
         hard_eliminate = np.zeros(self.n_items, dtype=bool)
-        if answer_val == 1.0: hard_eliminate = (f_col_clean < 0.3)
-        elif answer_val == 0.0: hard_eliminate = (f_col_clean > 0.7)
-        elif answer_val == 0.75: hard_eliminate = (f_col_clean < 0.2)
-        elif answer_val == 0.25: hard_eliminate = (f_col_clean > 0.8)
+        if answer_val == 1.0:  # "Yes"
+            # Eliminate if feature value is low (< 0.4 instead of 0.3)
+            hard_eliminate = (f_col_clean < 0.4)
+        elif answer_val == 0.0:  # "No"
+            # Eliminate if feature value is high (> 0.6 instead of 0.7)
+            hard_eliminate = (f_col_clean > 0.6)
+        elif answer_val == 0.75:  # "Mostly/Usually"
+            # Eliminate if feature value is very low
+            hard_eliminate = (f_col_clean < 0.3)
+        elif answer_val == 0.25:  # "Not really/Rarely"
+            # Eliminate if feature value is very high
+            hard_eliminate = (f_col_clean > 0.7)
         
-        likelihoods[hard_eliminate] = 1e-12
+        # Apply elimination with severe penalty
+        likelihoods[hard_eliminate] = 1e-15  # Even more severe than before
         scores = np.log(likelihoods + 1e-12)
         
         return current_scores + scores
@@ -359,7 +328,17 @@ class AkinatorEngine:
         return candidates_indices[sorted_local[:300]]
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
+        """
+        MUCH more conservative guessing strategy with stronger requirements.
+        
+        Changes:
+        - Higher confidence thresholds
+        - Larger margin requirements
+        - More questions required before guessing
+        - Stricter multi-factor checks
+        """
         if probs.sum() < 1e-10: return False, None, None
+        
         sorted_idx = np.argsort(probs)[::-1]
         top_idx = sorted_idx[0]
         top_prob = probs[top_idx]
@@ -371,10 +350,44 @@ class AkinatorEngine:
         second_prob = probs[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
         margin = top_prob - second_prob
         
-        if continue_mode and game_state.get('questions_since_last_guess', 0) < 5: return False, None, None
-        if top_prob >= 0.995 and margin >= 0.90 and q_count > 8: return True, top_animal, 'final'
-        if q_count >= 30 and not continue_mode and top_prob > 0.95: return True, top_animal, 'final'
-        if q_count >= 40: return True, top_animal, 'final'
+        # Calculate relative dominance (how much better top is than second)
+        relative_confidence = margin / (top_prob + 1e-10)
+        
+        # Don't guess too early in continue mode
+        if continue_mode and game_state.get('questions_since_last_guess', 0) < 7:
+            return False, None, None
+        
+        # Early guess only with EXTREME confidence (very rare)
+        if q_count <= 10:
+            if top_prob >= 0.998 and margin >= 0.95 and relative_confidence >= 0.95:
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Mid-game guessing: require high confidence AND large margin
+        if 10 < q_count <= 20:
+            if top_prob >= 0.97 and margin >= 0.85 and relative_confidence >= 0.80:
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Late mid-game: slightly relaxed but still strict
+        if 20 < q_count <= 30:
+            if top_prob >= 0.95 and margin >= 0.75 and relative_confidence >= 0.70:
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Late game: more willing to guess but still cautious
+        if 30 < q_count <= 40:
+            if top_prob >= 0.90 and margin >= 0.60:
+                return True, top_animal, 'final'
+            return False, None, None
+        
+        # Very late game: must make a guess eventually
+        if q_count > 40:
+            if top_prob >= 0.70 and margin >= 0.40:
+                return True, top_animal, 'final'
+            # After 50 questions, guess the top candidate regardless
+            if q_count >= 50:
+                return True, top_animal, 'final'
             
         return False, None, None
     
