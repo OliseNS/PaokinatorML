@@ -4,11 +4,12 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V14.1 - Robust Probabilistic & Stochastic Start).
+    Real-time Padded Akinator Engine (V14.2 - Ultra-Strict Confidence).
     
     Updates:
-    - select_question: Now randomizes the first question from the Top 5 candidates.
-    - select_question: Strictly greedy (argmax) for all subsequent questions.
+    - should_make_guess: Now requires 99.5% confidence and 20x probability ratio.
+    - should_make_guess: Hard limit set to 25 questions.
+    - select_question: Randomizes Q1 (Top 5), then Greedy (Argmax).
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -342,15 +343,15 @@ class AkinatorEngine:
         should_guess = False
         reason = ""
         
-        # 1. Hard Limit (Max Questions)
-        if q_count >= 40:
+        # 1. Hard Limit (Guess at 25 if not found yet)
+        if q_count >= 25:
             should_guess = True
-            reason = "max_questions"
+            reason = "max_questions_25"
             
-        # 2. Strict Confidence Requirements
-        # Regardless of question count, we demand high certainty.
-        # This prevents "eager" guessing in the early/mid game.
-        elif top_prob > 0.90 and ratio > 8.0:
+        # 2. Ultra-Strict Confidence Rule (Regardless of Question Count)
+        # We demand 99.5% certainty and a massive lead (20x ratio).
+        # This ensures the engine is essentially never "overconfident".
+        elif top_prob > 0.995 and ratio > 20.0:
             should_guess = True
             reason = "strict_confidence"
                 
