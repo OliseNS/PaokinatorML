@@ -4,13 +4,13 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V13.0 - Smart & Patient).
+    Real-time Padded Akinator Engine (V13.5 - Fast Convergence & Smart Guessing).
     
     Updates:
-    - Stricter guessing thresholds with confidence requirements
-    - Mistake tolerance through answer history tracking
-    - Stronger elimination logic
-    - Verification mechanism for wrong guesses
+    - Aggressive elimination for impossible candidates
+    - Dynamic guessing based on convergence rate
+    - Smart scoring that heavily penalizes contradictions
+    - Fast narrowing with confidence-based thresholds
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -182,15 +182,15 @@ class AkinatorEngine:
         self._compute_initial_priors()
 
     def _precompute_likelihood_tables(self):
-        """Precompute likelihood tables with tighter distributions for better discrimination."""
+        """Precompute likelihood tables with sharp discrimination."""
         steps = 1001
         self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
         f_grid_col = self.feature_grid[:, np.newaxis]
         a_vals_row = self.answer_values[np.newaxis, :]
         diffs = np.abs(f_grid_col - a_vals_row)
         
-        # Tighter sigmas for better discrimination
-        sigmas = np.where(self.answer_values == 0.5, 0.15, 0.10)
+        # Sharp sigmas for rapid convergence
+        sigmas = np.where(self.answer_values == 0.5, 0.14, 0.09)
         likelihoods = np.exp(-0.5 * (diffs / sigmas[np.newaxis, :]) ** 2)
         self.likelihood_table = np.maximum(likelihoods, 1e-12).astype(np.float32)
 
@@ -224,7 +224,10 @@ class AkinatorEngine:
         return current_entropy - expected_entropy
 
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """Updated with MUCH stricter elimination logic."""
+        """
+        Ultra-aggressive scoring that ELIMINATES impossible candidates.
+        Key: Contradictions result in near-impossible scores.
+        """
         if len(current_scores) < self.n_items:
             padding = np.zeros(self.n_items - len(current_scores), dtype=np.float32)
             current_scores = np.concatenate([current_scores, padding])
@@ -241,37 +244,66 @@ class AkinatorEngine:
         
         likelihoods = self.likelihood_table[f_quant, a_idx].copy()
         
-        # Enhanced penalty calculation
-        certainty = np.clip(2.0 * np.abs(f_col_clean - 0.5), 0.0, 1.0)
+        # Calculate mismatch severity
         distance = np.abs(f_col_clean - answer_val)
-        severity = distance * certainty
+        certainty = np.clip(2.0 * np.abs(f_col_clean - 0.5), 0.0, 1.0)
         
-        # Stronger penalty for contradictions
-        penalty_multiplier = np.exp(-25.0 * severity)  # Increased from 20.0
-        likelihoods *= penalty_multiplier
+        # CRITICAL: Multi-stage elimination system
         
-        # MUCH stricter hard elimination thresholds
-        hard_eliminate = np.zeros(self.n_items, dtype=bool)
-        if answer_val == 1.0:  # "Yes"
-            # Eliminate if feature value is low (< 0.4 instead of 0.3)
-            hard_eliminate = (f_col_clean < 0.4)
-        elif answer_val == 0.0:  # "No"
-            # Eliminate if feature value is high (> 0.6 instead of 0.7)
-            hard_eliminate = (f_col_clean > 0.6)
+        # Stage 1: Soft penalty for minor mismatches
+        soft_penalty = np.exp(-15.0 * distance * certainty)
+        likelihoods *= soft_penalty
+        
+        # Stage 2: Hard elimination for clear contradictions
+        elimination_mask = np.zeros(self.n_items, dtype=bool)
+        
+        if answer_val == 1.0:  # User said "YES"
+            # Eliminate items with low feature values
+            elimination_mask = (f_col_clean < 0.45)
+            # Super harsh on very low values
+            extreme_mismatch = (f_col_clean < 0.25)
+            
+        elif answer_val == 0.0:  # User said "NO"
+            # Eliminate items with high feature values
+            elimination_mask = (f_col_clean > 0.55)
+            # Super harsh on very high values
+            extreme_mismatch = (f_col_clean > 0.75)
+            
         elif answer_val == 0.75:  # "Mostly/Usually"
-            # Eliminate if feature value is very low
-            hard_eliminate = (f_col_clean < 0.3)
+            # Should be high but not necessarily 1.0
+            elimination_mask = (f_col_clean < 0.35)
+            extreme_mismatch = (f_col_clean < 0.15)
+            
         elif answer_val == 0.25:  # "Not really/Rarely"
-            # Eliminate if feature value is very high
-            hard_eliminate = (f_col_clean > 0.7)
+            # Should be low but not necessarily 0.0
+            elimination_mask = (f_col_clean > 0.65)
+            extreme_mismatch = (f_col_clean > 0.85)
         
-        # Apply elimination with severe penalty
-        likelihoods[hard_eliminate] = 1e-15  # Even more severe than before
+        # Apply brutal elimination
+        likelihoods[elimination_mask] = 1e-20
+        if 'extreme_mismatch' in locals():
+            likelihoods[extreme_mismatch] = 1e-30
+        
+        # Stage 3: Amplify matches (reward correct items)
+        strong_match = np.zeros(self.n_items, dtype=bool)
+        if answer_val == 1.0:
+            strong_match = (f_col_clean > 0.7)
+        elif answer_val == 0.0:
+            strong_match = (f_col_clean < 0.3)
+        elif answer_val == 0.75:
+            strong_match = (f_col_clean > 0.6) & (f_col_clean < 0.9)
+        elif answer_val == 0.25:
+            strong_match = (f_col_clean > 0.1) & (f_col_clean < 0.4)
+        
+        # Boost strong matches
+        likelihoods[strong_match] *= 1.5
+        
         scores = np.log(likelihoods + 1e-12)
         
         return current_scores + scores
 
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
+        """Select questions that maximize information gain and convergence speed."""
         active_cols = self.feature_cols_array[:self.n_features]
         
         asked_mask = np.isin(active_cols, asked_features)
@@ -280,24 +312,30 @@ class AkinatorEngine:
 
         if not candidates_indices.any(): return None, None
         
-        # Q0 Optimization
-        if question_count == 0 and len(self.sorted_initial_feature_indices) > 0:
+        # Q0-Q2 Optimization: Use precomputed high-gain features
+        if question_count < 3 and len(self.sorted_initial_feature_indices) > 0:
             top_initial = self.sorted_initial_feature_indices
             valid_initial = top_initial[top_initial < self.n_features]
             
             top_is_available_mask = np.isin(valid_initial, candidates_indices)
             available_top = valid_initial[top_is_available_mask]
             
+            # Pick from top 20% for variety while maintaining quality
             top_cut = max(1, len(available_top) // 5)
             if len(available_top) > 0:
                 best_feat_idx = np.random.choice(available_top[:top_cut])
                 fname = str(active_cols[best_feat_idx])
                 return fname, self.questions_map.get(fname, f"Is it {fname}?")
 
-        candidates_to_eval = self._select_candidate_subset(candidates_indices)
+        # Dynamic candidate evaluation
+        candidates_to_eval = self._select_candidate_subset(candidates_indices, prior)
         combined_gains = self._compute_gains(prior, candidates_to_eval)
         
-        # Add Correlation Penalty
+        # Bonus for discriminating features (high variance in remaining candidates)
+        remaining_variance = self.col_var[candidates_to_eval]
+        combined_gains *= (1.0 + 0.5 * remaining_variance)
+        
+        # Correlation penalty (avoid redundant questions)
         asked_indices = np.where(asked_mask)[0]
         if len(asked_indices) > 0:
             try:
@@ -311,7 +349,7 @@ class AkinatorEngine:
                 if len(valid_candidates) > 0 and len(valid_asked) > 0:
                     corr_slice = self.feature_correlation_matrix[valid_candidates, :][:, valid_asked]
                     max_correlations = np.abs(corr_slice).max(axis=1)
-                    combined_gains[valid_cand_mask] *= np.exp(-2.5 * max_correlations**2)
+                    combined_gains[valid_cand_mask] *= np.exp(-3.0 * max_correlations**2)
             except Exception: pass
 
         best_local_idx = np.argmax(combined_gains)
@@ -320,24 +358,39 @@ class AkinatorEngine:
         fname = str(active_cols[best_feat_idx])
         return fname, self.questions_map.get(fname, f"Is it {fname}?")
 
-    def _select_candidate_subset(self, candidates_indices):
+    def _select_candidate_subset(self, candidates_indices, prior=None):
+        """Smart candidate selection based on current probability distribution."""
         candidates_indices = np.array(candidates_indices, dtype=np.int32)
         if len(candidates_indices) <= 300: return candidates_indices
-        var_scores = self.col_var[candidates_indices]
-        sorted_local = np.argsort(var_scores)[::-1]
+        
+        # If we have prior info, prioritize features that split the top candidates
+        if prior is not None and len(prior) > 0:
+            # Get top 30% of candidates by probability
+            top_k = max(5, int(0.3 * len(prior)))
+            top_candidates = np.argsort(prior)[-top_k:]
+            
+            # Calculate variance among top candidates for each feature
+            feature_subset = self.features[top_candidates, :][:, candidates_indices]
+            subset_var = np.var(feature_subset, axis=0)
+            
+            # Combine with overall variance
+            total_var = subset_var + 0.3 * self.col_var[candidates_indices]
+            sorted_local = np.argsort(total_var)[::-1]
+        else:
+            var_scores = self.col_var[candidates_indices]
+            sorted_local = np.argsort(var_scores)[::-1]
+        
         return candidates_indices[sorted_local[:300]]
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        MUCH more conservative guessing strategy with stronger requirements.
-        
-        Changes:
-        - Higher confidence thresholds
-        - Larger margin requirements
-        - More questions required before guessing
-        - Stricter multi-factor checks
+        Smart guessing based on CONVERGENCE and CONFIDENCE.
+        Guesses when the answer is clear, never when ambiguous.
         """
         if probs.sum() < 1e-10: return False, None, None
+        
+        # Normalize probabilities
+        probs = probs / probs.sum()
         
         sorted_idx = np.argsort(probs)[::-1]
         top_idx = sorted_idx[0]
@@ -347,49 +400,71 @@ class AkinatorEngine:
         q_count = game_state['question_count']
         continue_mode = game_state.get('continue_mode', False)
         
+        # Calculate convergence metrics
         second_prob = probs[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
+        third_prob = probs[sorted_idx[2]] if len(sorted_idx) > 2 else 0.0
+        
         margin = top_prob - second_prob
+        dominance_ratio = top_prob / (second_prob + 1e-10)
         
-        # Calculate relative dominance (how much better top is than second)
-        relative_confidence = margin / (top_prob + 1e-10)
+        # Calculate entropy (lower = more certain)
+        entropy = self._calculate_entropy(probs)
+        max_entropy = np.log2(len(probs))
+        normalized_entropy = entropy / (max_entropy + 1e-10)
         
-        # Don't guess too early in continue mode
-        if continue_mode and game_state.get('questions_since_last_guess', 0) < 7:
+        # Continue mode: need more evidence after wrong guess
+        if continue_mode and game_state.get('questions_since_last_guess', 0) < 5:
             return False, None, None
         
-        # Early guess only with EXTREME confidence (very rare)
-        if q_count <= 10:
-            if top_prob >= 0.998 and margin >= 0.95 and relative_confidence >= 0.95:
-                return True, top_animal, 'final'
-            return False, None, None
+        # CRITICAL: Multi-factor convergence check
+        converged = False
+        reason = None
         
-        # Mid-game guessing: require high confidence AND large margin
-        if 10 < q_count <= 20:
-            if top_prob >= 0.97 and margin >= 0.85 and relative_confidence >= 0.80:
-                return True, top_animal, 'final'
-            return False, None, None
+        # Early convergence (10-15 questions): VERY strong signal required
+        if 10 <= q_count <= 15:
+            if (top_prob >= 0.85 and 
+                margin >= 0.70 and 
+                dominance_ratio >= 8.0 and
+                normalized_entropy < 0.15):
+                converged = True
+                reason = 'early_convergence'
         
-        # Late mid-game: slightly relaxed but still strict
-        if 20 < q_count <= 30:
-            if top_prob >= 0.95 and margin >= 0.75 and relative_confidence >= 0.70:
-                return True, top_animal, 'final'
-            return False, None, None
+        # Mid-game (15-25 questions): Strong convergence
+        elif 15 < q_count <= 25:
+            if (top_prob >= 0.75 and 
+                margin >= 0.55 and 
+                dominance_ratio >= 5.0 and
+                normalized_entropy < 0.25):
+                converged = True
+                reason = 'mid_convergence'
         
-        # Late game: more willing to guess but still cautious
-        if 30 < q_count <= 40:
-            if top_prob >= 0.90 and margin >= 0.60:
-                return True, top_animal, 'final'
-            return False, None, None
+        # Late-mid (25-35 questions): Clear leader
+        elif 25 < q_count <= 35:
+            if (top_prob >= 0.60 and 
+                margin >= 0.40 and 
+                dominance_ratio >= 3.0):
+                converged = True
+                reason = 'late_mid_convergence'
         
-        # Very late game: must make a guess eventually
-        if q_count > 40:
-            if top_prob >= 0.70 and margin >= 0.40:
-                return True, top_animal, 'final'
-            # After 50 questions, guess the top candidate regardless
-            if q_count >= 50:
-                return True, top_animal, 'final'
-            
-        return False, None, None
+        # Late game (35-45 questions): Make educated guess
+        elif 35 < q_count <= 45:
+            if (top_prob >= 0.45 and 
+                margin >= 0.25 and
+                dominance_ratio >= 2.0):
+                converged = True
+                reason = 'late_convergence'
+        
+        # Very late (45+ questions): Must guess
+        elif q_count > 45:
+            if top_prob >= 0.30 and margin >= 0.15:
+                converged = True
+                reason = 'forced_guess'
+            # Emergency guess at 60 questions
+            elif q_count >= 60:
+                converged = True
+                reason = 'emergency'
+        
+        return converged, top_animal if converged else None, reason
     
     @property
     def feature_cols(self):
