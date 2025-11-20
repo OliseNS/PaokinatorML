@@ -262,7 +262,7 @@ class AkinatorEngine:
         SMART NARROWING with STOCHASTIC START.
         
         Logic:
-        - If Question 0: Pick RANDOMLY from the top 5 features.
+        - If Question 0: Pick RANDOMLY from the Top 25 features (High Variety).
         - If Question > 0: GREEDY AF (Strict Argmax) to converge rapidly.
         """
         active_cols = self.feature_cols_array[:self.n_features]
@@ -300,7 +300,7 @@ class AkinatorEngine:
         # --- SELECTION LOGIC START ---
         
         if question_count == 0:
-            # RANDOM START: Pick from Top 5 to ensure variety
+            # RANDOM START: Widen pool to Top 25 for "Extreme Randomness"
             
             # 1. Get scores for candidates
             candidate_scores = scores[candidate_indices]
@@ -308,8 +308,9 @@ class AkinatorEngine:
             # 2. Sort descending (indices relative to candidate_indices)
             sorted_local_indices = np.argsort(candidate_scores)[::-1]
             
-            # 3. Define pool (Top 5 or fewer if not enough data)
-            pool_size = min(len(sorted_local_indices), 5)
+            # 3. Define pool (Top 25 instead of Top 5)
+            # This forces variety. It won't just ask the #1 best question every time.
+            pool_size = min(len(sorted_local_indices), 25)
             
             if pool_size == 0: 
                 return None, None
@@ -319,14 +320,13 @@ class AkinatorEngine:
             best_candidate_idx = candidate_indices[random_pool_index]
             
         else:
-            # GREEDY AF: Strict Argmax for maximum efficiency
+            # GREEDY AF: Strict Argmax for maximum efficiency after Q1
             best_candidate_idx = candidate_indices[np.argmax(scores[candidate_indices])]
             
         # --- SELECTION LOGIC END ---
         
         fname = str(active_cols[best_candidate_idx])
         return fname, self.questions_map.get(fname, f"Is it {fname}?")
-
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         if probs.sum() < 1e-10: return False, None, None
         
