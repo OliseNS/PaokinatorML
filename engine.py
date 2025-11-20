@@ -4,13 +4,12 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V13.5 - Fast Convergence & Smart Guessing).
+    Real-time Padded Akinator Engine (V14.0 - Robust Probabilistic & Smart Narrowing).
     
-    Updates:
-    - Aggressive elimination for impossible candidates
-    - Dynamic guessing based on convergence rate
-    - Smart scoring that heavily penalizes contradictions
-    - Fast narrowing with confidence-based thresholds
+    Fixes:
+    - Deduplication via case-insensitive mapping.
+    - "Climbing" logic: Items are never hard-eliminated, allowing correction.
+    - Smart Narrowing: Questions focus on splitting the TOP candidates.
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -21,9 +20,9 @@ class AkinatorEngine:
         self.n_items = len(df)
         self.n_features = len(feature_cols)
         
-        # O(1) Lookups
+        # O(1) Lookups - NOW NORMALIZED to prevent duplicates
         self.feature_map = {name: i for i, name in enumerate(self.active_feature_names)}
-        self.item_map = {} 
+        self.item_map = {} # Populated below
         
         # --- 1. Setup Capacity (Double Padding) ---
         self.cap_rows = self.n_items + row_padding
@@ -43,8 +42,11 @@ class AkinatorEngine:
         if not df.empty:
             names = df['animal_name'].values
             self.animals[:self.n_items] = names
+            
+            # CRITICAL FIX: Normalize keys for deduplication
             for idx, name in enumerate(names):
-                self.item_map[name] = idx
+                clean_key = str(name).strip().lower()
+                self.item_map[clean_key] = idx
                 
             if len(df.columns) > 1:
                 existing_data = df[feature_cols].values.astype(np.float32)
@@ -54,17 +56,32 @@ class AkinatorEngine:
         print("   Imputing initial data block...")
         self._impute_active_block()
         
-        # Stats setup with improved fuzzy matching
+        # Stats setup 
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
-        self.fuzzy_map = {
-            'yes': 1.0, 'y': 1.0, 'mostly': 0.75, 'usually': 0.75, 
-            'probably': 0.75, 'sort of': 0.5, 'sometimes': 0.5, 
-            'somewhat': 0.5, 'not really': 0.25, 'rarely': 0.25, 
-            'no': 0.0, 'n': 0.0
-        }
         
+        # Improved fuzzy map
+        self.fuzzy_map = {
+            'yes': 1.0, 
+            'y': 1.0, 
+            
+            'probably': 0.75, 
+            'mostly': 0.75, 
+            'usually': 0.75, 
+            
+            'somewhat': 0.5, 
+            'sort of': 0.5, 
+            'sometimes': 0.5, 
+            'idk': 0.5, 
+            'unknown': 0.5,
+            
+            'probably not': 0.25,  
+            'not really': 0.25, 
+            'rarely': 0.25, 
+            
+            'no': 0.0, 
+            'n': 0.0
+        }
         # Precomputations
-        self._precompute_likelihood_tables()
         self._refresh_column_stats()
         self._recalc_correlation()
         self._compute_initial_priors()
@@ -72,95 +89,102 @@ class AkinatorEngine:
         print(f"✓ Engine Ready. Active: {self.n_items} items, {self.n_features} features.")
 
     def _impute_active_block(self):
-        """Smart Imputation with safety checks."""
+        """
+        Fills gaps in knowledge. If 'projector' is new and missing data, 
+        this infers it from similar items (like 'TV'), making it guessable immediately.
+        """
         if self.n_items == 0 or self.n_features == 0: return
         
         active_view = self.features[:self.n_items, :self.n_features]
         
-        if not np.isnan(active_view).any():
-            return
-
-        try:
-            nan_mask = np.isnan(active_view)
-            all_nan_cols = nan_mask.all(axis=0)
+        # 1. Fill complete empty columns with uncertainty (0.5)
+        nan_mask = np.isnan(active_view)
+        all_nan_cols = nan_mask.all(axis=0)
+        if all_nan_cols.any():
+            active_view[:, all_nan_cols] = 0.5
             
-            if all_nan_cols.any():
-                active_view[:, all_nan_cols] = 0.5
-            
-            if np.isnan(active_view).any():
-                imputer = KNNImputer(n_neighbors=5, weights='distance', missing_values=np.nan)
+        # 2. KNN Imputation for partial data
+        if np.isnan(active_view).any():
+            try:
+                # increased k-neighbors for better generalization
+                imputer = KNNImputer(n_neighbors=7, weights='distance')
                 filled = imputer.fit_transform(active_view)
-                
-                if filled.shape == active_view.shape:
-                    self.features[:self.n_items, :self.n_features] = np.clip(filled, 0.0, 1.0)
-                else:
-                    print(f"⚠️ Imputation Mismatch: Imputer returned {filled.shape}, expected {active_view.shape}. Falling back to 0.5 fill.")
-                    mask = np.isnan(active_view)
-                    self.features[:self.n_items, :self.n_features][mask] = 0.5
-                    
-        except Exception as e:
-            print(f"⚠️ Imputation Error: {e}")
-            mask = np.isnan(active_view)
-            self.features[:self.n_items, :self.n_features][mask] = 0.5
+                self.features[:self.n_items, :self.n_features] = np.clip(filled, 0.01, 0.99)
+            except Exception as e:
+                print(f"⚠️ Imputation fallback: {e}")
+                mask = np.isnan(active_view)
+                self.features[:self.n_items, :self.n_features][mask] = 0.5
 
     def _recalc_correlation(self):
-        """Calculates feature correlation matrix for penalty logic."""
-        if self.n_items < 2 or self.n_features == 0:
+        """Calculates correlation to prevent asking redundant questions."""
+        if self.n_items < 5 or self.n_features == 0:
             self.feature_correlation_matrix = np.eye(self.n_features, dtype=np.float32)
             return
         try:
             active_feats = self.features[:self.n_items, :self.n_features]
-            df_temp = pd.DataFrame(active_feats)
-            self.feature_correlation_matrix = df_temp.corr().fillna(0).values.astype(np.float32)
+            # Using numpy for speed
+            centered = active_feats - np.mean(active_feats, axis=0)
+            cov = np.dot(centered.T, centered) / (self.n_items - 1)
+            std = np.sqrt(np.diag(cov))
+            corr = cov / np.outer(std, std)
+            self.feature_correlation_matrix = np.nan_to_num(corr, nan=0.0)
         except:
             self.feature_correlation_matrix = np.eye(self.n_features, dtype=np.float32)
 
     def _refresh_column_stats(self):
-        """Updates Variance and Mean for entropy calculations."""
+        """Refreshes variance to find 'informative' features."""
         active_view = self.features[:self.n_items, :self.n_features]
         clean_view = np.nan_to_num(active_view, nan=0.5)
         
         self.col_var = np.var(clean_view, axis=0)
         self.col_mean = np.mean(clean_view, axis=0)
-        self.col_ambiguity = 1.0 - 2.0 * np.abs(self.col_mean - 0.5)
         
-        self.allowed_feature_mask = (self.col_var > 1e-6)
+        # Features with very low variance (everyone matches) are useless
+        self.allowed_feature_mask = (self.col_var > 1e-4)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
 
     def _compute_initial_priors(self):
+        """Calculates the best Q1-Q3 questions (Global Variance)."""
         if self.n_items > 0 and len(self.allowed_feature_indices) > 0:
-            self.uniform_prior = np.ones(self.n_items, dtype=np.float32) / self.n_items
-            initial_gains = self._compute_gains(self.uniform_prior, self.allowed_feature_indices)
-            
-            variance_boost = self.col_var[self.allowed_feature_indices]
-            boosted_gains = initial_gains * (1.0 + variance_boost)
-            
-            sorted_indices = np.argsort(boosted_gains)[::-1]
+            # Just rank by variance for initial speed
+            variances = self.col_var[self.allowed_feature_indices]
+            sorted_indices = np.argsort(variances)[::-1]
             self.sorted_initial_feature_indices = self.allowed_feature_indices[sorted_indices]
         else:
-            self.uniform_prior = np.array([], dtype=np.float32)
             self.sorted_initial_feature_indices = np.array([], dtype=np.int32)
 
     def smart_ingest_update(self, item_name: str, feature_name: str, value: float, question_text: str = None):
-        """Dynamically adds Items OR Features without full reload."""
-        idx = self.item_map.get(item_name)
+        """
+        DEDUPLICATED Ingestion.
+        Checks for 'Projector' via 'projector' key.
+        """
+        # 1. Sanitize Key
+        clean_item_key = str(item_name).strip().lower()
+        
+        idx = self.item_map.get(clean_item_key)
+        
+        # 2. Add Item if New
         if idx is None:
             if self.n_items >= self.cap_rows:
-                print(f"⚠️ Row Capacity Reached ({self.cap_rows}). Cannot add '{item_name}'.")
+                print(f"⚠️ Capacity Reached. Cannot add '{item_name}'.")
                 return
             
             idx = self.n_items
-            self.animals[idx] = item_name
-            self.item_map[item_name] = idx
+            self.animals[idx] = item_name # Store Display Name
+            self.item_map[clean_item_key] = idx # Store Clean Key
             self.n_items += 1
-            self.features[idx, :self.n_features] = 0.5 
-            self.uniform_prior = np.ones(self.n_items, dtype=np.float32) / self.n_items
+            
+            # Initialize with average of existing items (Not 0.5, but Mean)
+            # This helps it blend in immediately rather than being an outlier
+            if self.n_features > 0:
+                self.features[idx, :self.n_features] = self.col_mean[:self.n_features]
+                
             print(f"   [Engine] +ITEM: '{item_name}' @ idx {idx}")
 
+        # 3. Add Feature if New
         f_idx = self.feature_map.get(feature_name)
         if f_idx is None:
             if self.n_features >= self.cap_cols:
-                print(f"⚠️ Col Capacity Reached ({self.cap_cols}). Cannot add '{feature_name}'.")
                 return
             
             f_idx = self.n_features
@@ -171,300 +195,193 @@ class AkinatorEngine:
             if question_text:
                 self.questions_map[feature_name] = question_text
             
+            # Initialize new feature to 0.5 (Uncertainty)
             self.features[:self.n_items, f_idx] = 0.5
             print(f"   [Engine] +FEATURE: '{feature_name}' @ col {f_idx}")
 
+        # 4. Update Value
         self.features[idx, f_idx] = value
+        
+        # Quick stats refresh if significant updates happen
+        # (Optional optimization: only run every N updates)
         self._refresh_column_stats()
 
     def recalculate_stats(self):
-        """Called by service.py after a batch of updates to refresh priorities."""
+        self._refresh_column_stats()
+        self._recalc_correlation()
         self._compute_initial_priors()
-
-    def _precompute_likelihood_tables(self):
-        """Precompute likelihood tables with sharp discrimination."""
-        steps = 1001
-        self.feature_grid = np.linspace(0.0, 1.0, steps, dtype=np.float32)
-        f_grid_col = self.feature_grid[:, np.newaxis]
-        a_vals_row = self.answer_values[np.newaxis, :]
-        diffs = np.abs(f_grid_col - a_vals_row)
-        
-        # Sharp sigmas for rapid convergence
-        sigmas = np.where(self.answer_values == 0.5, 0.14, 0.09)
-        likelihoods = np.exp(-0.5 * (diffs / sigmas[np.newaxis, :]) ** 2)
-        self.likelihood_table = np.maximum(likelihoods, 1e-12).astype(np.float32)
 
     def _calculate_entropy(self, probs: np.ndarray) -> float:
         p = np.clip(probs, 1e-10, 1.0)
         return -np.sum(p * np.log2(p))
 
-    def _compute_gains(self, prior: np.ndarray, feature_indices: np.ndarray) -> np.ndarray:
-        active_features = self.features[:self.n_items, :][:, feature_indices]
-        
-        n_rows = active_features.shape[0]
-        n_feats = len(feature_indices)
-        if n_rows == 0 or n_feats == 0: return np.zeros(n_feats, dtype=np.float32)
-
-        f_filled = np.nan_to_num(active_features, nan=0.5)
-        f_quant = np.clip(np.rint(f_filled * 1000), 0, 1000).astype(np.int32)
-        flat_quant = f_quant.flatten()
-
-        n_answers = 5
-        likelihoods = self.likelihood_table[flat_quant, :].reshape(n_rows, n_feats, n_answers)
-        
-        p_answers = np.einsum('i,ijk->jk', prior, likelihoods)
-        posteriors = prior[:, np.newaxis, np.newaxis] * likelihoods
-        posteriors /= (p_answers[np.newaxis, :, :] + 1e-10)
-        
-        p_logs = np.log2(np.clip(posteriors, 1e-10, 1.0))
-        entropies = -np.sum(posteriors * p_logs, axis=0)
-        expected_entropy = np.sum(p_answers * entropies, axis=1)
-        
-        current_entropy = self._calculate_entropy(prior)
-        return current_entropy - expected_entropy
-
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
         """
-        Ultra-aggressive scoring that ELIMINATES impossible candidates.
-        Key: Contradictions result in near-impossible scores.
+        ROBUST SCORING (The "Climbing" Logic).
+        Instead of eliminating items, we just lower their probability.
+        This allows an item to recover if the user made a mistake or data is imperfect.
         """
+        # Resize scores if engine grew
         if len(current_scores) < self.n_items:
-            padding = np.zeros(self.n_items - len(current_scores), dtype=np.float32)
+            padding_len = self.n_items - len(current_scores)
+            # Initialize padding with MEAN score, not Min, so new items have a chance
+            valid_scores = current_scores[np.isfinite(current_scores)]
+            base_score = np.mean(valid_scores) if len(valid_scores) > 0 else 0.0
+            padding = np.full(padding_len, base_score, dtype=np.float32)
             current_scores = np.concatenate([current_scores, padding])
-        elif len(current_scores) > self.n_items:
-            current_scores = current_scores[:self.n_items]
         
-        answer_val = self.fuzzy_map.get(answer_str.lower(), 0.5)
+        current_scores = current_scores[:self.n_items]
         
+        answer_val = self.fuzzy_map.get(str(answer_str).lower(), 0.5)
+        
+        # 1. Get Data
         f_col = self.features[:self.n_items, feature_idx]
         f_col_clean = np.nan_to_num(f_col, nan=0.5)
         
-        f_quant = np.clip(np.rint(f_col_clean * 1000), 0, 1000).astype(np.int32)
-        a_idx = np.abs(self.answer_values - answer_val).argmin()
-        
-        likelihoods = self.likelihood_table[f_quant, a_idx].copy()
-        
-        # Calculate mismatch severity
+        # 2. Gaussian Likelihood
+        # We use a wider sigma (0.18) to be forgiving of bad data/answers
+        sigma = 0.18
         distance = np.abs(f_col_clean - answer_val)
-        certainty = np.clip(2.0 * np.abs(f_col_clean - 0.5), 0.0, 1.0)
         
-        # CRITICAL: Multi-stage elimination system
+        # Calculate raw likelihood: exp(-0.5 * (dist/sigma)^2)
+        # This creates a bell curve. Perfect match = 1.0, Far mismatch = near 0
+        gaussian_likelihood = np.exp(-0.5 * (distance / sigma) ** 2)
         
-        # Stage 1: Soft penalty for minor mismatches
-        soft_penalty = np.exp(-15.0 * distance * certainty)
-        likelihoods *= soft_penalty
+        # 3. NOISE FLOOR (The "User Error" Factor)
+        # We assume there is always a 2% chance the user is wrong or the data is wrong.
+        # This prevents likelihood from ever being 0.0 (which would be -inf score).
+        # This is what allows items to "climb back up".
+        p_noise = 0.02
+        final_likelihood = (1.0 - p_noise) * gaussian_likelihood + p_noise
         
-        # Stage 2: Hard elimination for clear contradictions
-        elimination_mask = np.zeros(self.n_items, dtype=bool)
+        # 4. Boost Confidence
+        # If data is very confident (near 0 or 1) and matches answer, give bonus
+        # This helps convergence speed for clear answers
+        if answer_val > 0.75:
+             bonus_mask = (f_col_clean > 0.8)
+             final_likelihood[bonus_mask] *= 1.25
+        elif answer_val < 0.25:
+             bonus_mask = (f_col_clean < 0.2)
+             final_likelihood[bonus_mask] *= 1.25
+             
+        # 5. Convert to Log-Prob update
+        # Clip to avoid log(0)
+        log_update = np.log(np.clip(final_likelihood, 1e-9, None))
         
-        if answer_val == 1.0:  # User said "YES"
-            # Eliminate items with low feature values
-            elimination_mask = (f_col_clean < 0.45)
-            # Super harsh on very low values
-            extreme_mismatch = (f_col_clean < 0.25)
-            
-        elif answer_val == 0.0:  # User said "NO"
-            # Eliminate items with high feature values
-            elimination_mask = (f_col_clean > 0.55)
-            # Super harsh on very high values
-            extreme_mismatch = (f_col_clean > 0.75)
-            
-        elif answer_val == 0.75:  # "Mostly/Usually"
-            # Should be high but not necessarily 1.0
-            elimination_mask = (f_col_clean < 0.35)
-            extreme_mismatch = (f_col_clean < 0.15)
-            
-        elif answer_val == 0.25:  # "Not really/Rarely"
-            # Should be low but not necessarily 0.0
-            elimination_mask = (f_col_clean > 0.65)
-            extreme_mismatch = (f_col_clean > 0.85)
-        
-        # Apply brutal elimination
-        likelihoods[elimination_mask] = 1e-20
-        if 'extreme_mismatch' in locals():
-            likelihoods[extreme_mismatch] = 1e-30
-        
-        # Stage 3: Amplify matches (reward correct items)
-        strong_match = np.zeros(self.n_items, dtype=bool)
-        if answer_val == 1.0:
-            strong_match = (f_col_clean > 0.7)
-        elif answer_val == 0.0:
-            strong_match = (f_col_clean < 0.3)
-        elif answer_val == 0.75:
-            strong_match = (f_col_clean > 0.6) & (f_col_clean < 0.9)
-        elif answer_val == 0.25:
-            strong_match = (f_col_clean > 0.1) & (f_col_clean < 0.4)
-        
-        # Boost strong matches
-        likelihoods[strong_match] *= 1.5
-        
-        scores = np.log(likelihoods + 1e-12)
-        
-        return current_scores + scores
+        return current_scores + log_update
 
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
-        """Select questions that maximize information gain and convergence speed."""
+        """
+        SMART NARROWING.
+        Selects questions that best split the current TOP candidates.
+        """
         active_cols = self.feature_cols_array[:self.n_features]
-        
         asked_mask = np.isin(active_cols, asked_features)
-        candidates_mask = self.allowed_feature_mask & ~asked_mask
-        candidates_indices = np.where(candidates_mask)[0].astype(np.int32)
-
-        if not candidates_indices.any(): return None, None
         
-        # Q0-Q2 Optimization: Use precomputed high-gain features
-        if question_count < 3 and len(self.sorted_initial_feature_indices) > 0:
-            top_initial = self.sorted_initial_feature_indices
-            valid_initial = top_initial[top_initial < self.n_features]
-            
-            top_is_available_mask = np.isin(valid_initial, candidates_indices)
-            available_top = valid_initial[top_is_available_mask]
-            
-            # Pick from top 20% for variety while maintaining quality
-            top_cut = max(1, len(available_top) // 5)
-            if len(available_top) > 0:
-                best_feat_idx = np.random.choice(available_top[:top_cut])
-                fname = str(active_cols[best_feat_idx])
-                return fname, self.questions_map.get(fname, f"Is it {fname}?")
-
-        # Dynamic candidate evaluation
-        candidates_to_eval = self._select_candidate_subset(candidates_indices, prior)
-        combined_gains = self._compute_gains(prior, candidates_to_eval)
-        
-        # Bonus for discriminating features (high variance in remaining candidates)
-        remaining_variance = self.col_var[candidates_to_eval]
-        combined_gains *= (1.0 + 0.5 * remaining_variance)
-        
-        # Correlation penalty (avoid redundant questions)
-        asked_indices = np.where(asked_mask)[0]
-        if len(asked_indices) > 0:
-            try:
-                limit = min(self.n_features, self.feature_correlation_matrix.shape[0])
-                valid_cand_mask = candidates_to_eval < limit
-                valid_candidates = candidates_to_eval[valid_cand_mask]
-                
-                valid_asked_mask = asked_indices < limit
-                valid_asked = asked_indices[valid_asked_mask]
-                
-                if len(valid_candidates) > 0 and len(valid_asked) > 0:
-                    corr_slice = self.feature_correlation_matrix[valid_candidates, :][:, valid_asked]
-                    max_correlations = np.abs(corr_slice).max(axis=1)
-                    combined_gains[valid_cand_mask] *= np.exp(-3.0 * max_correlations**2)
-            except Exception: pass
-
-        best_local_idx = np.argmax(combined_gains)
-        best_feat_idx = candidates_to_eval[best_local_idx]
-        
-        fname = str(active_cols[best_feat_idx])
-        return fname, self.questions_map.get(fname, f"Is it {fname}?")
-
-    def _select_candidate_subset(self, candidates_indices, prior=None):
-        """Smart candidate selection based on current probability distribution."""
-        candidates_indices = np.array(candidates_indices, dtype=np.int32)
-        if len(candidates_indices) <= 300: return candidates_indices
-        
-        # If we have prior info, prioritize features that split the top candidates
+        # 1. Identify Top Candidates (Focus Mass)
+        # We only care about distinguishing items that are actually likely.
         if prior is not None and len(prior) > 0:
-            # Get top 30% of candidates by probability
-            top_k = max(5, int(0.3 * len(prior)))
-            top_candidates = np.argsort(prior)[-top_k:]
+            # Sort candidates by probability
+            sorted_indices = np.argsort(prior)[::-1]
             
-            # Calculate variance among top candidates for each feature
-            feature_subset = self.features[top_candidates, :][:, candidates_indices]
-            subset_var = np.var(feature_subset, axis=0)
-            
-            # Combine with overall variance
-            total_var = subset_var + 0.3 * self.col_var[candidates_indices]
-            sorted_local = np.argsort(total_var)[::-1]
+            # Take the top cumulative 90% of probability mass (or at least top 20 items)
+            cum_sum = np.cumsum(prior[sorted_indices])
+            cutoff = np.argmax(cum_sum > 0.90)
+            top_k = max(20, cutoff + 1)
+            target_indices = sorted_indices[:top_k]
         else:
-            var_scores = self.col_var[candidates_indices]
-            sorted_local = np.argsort(var_scores)[::-1]
+            target_indices = np.arange(self.n_items)
+
+        # 2. Select Features with High Variance within Target Group
+        # Slice features for top candidates only
+        target_features = self.features[target_indices, :]
         
-        return candidates_indices[sorted_local[:300]]
+        # Calculate variance of features strictly within this likely group
+        # This ensures we ask questions relevant to the remaining animals
+        target_var = np.var(np.nan_to_num(target_features, nan=0.5), axis=0)
+        
+        # Filter already asked
+        candidate_indices = np.where((~asked_mask) & self.allowed_feature_mask)[0]
+        
+        if len(candidate_indices) == 0: return None, None
+
+        # 3. Correlation Penalty (Redundancy Check)
+        # If we already asked "Is it a feline?", don't ask "Is it a cat?"
+        scores = target_var.copy()
+        
+        # Get indices of features we've already asked
+        asked_indices = np.where(asked_mask)[0]
+        
+        if len(asked_indices) > 0:
+            # Limit matrix size for speed
+            limit = min(self.n_features, self.feature_correlation_matrix.shape[0])
+            valid_candidates = candidate_indices[candidate_indices < limit]
+            valid_asked = asked_indices[asked_indices < limit]
+            
+            if len(valid_candidates) > 0 and len(valid_asked) > 0:
+                # For each candidate, find its max correlation with ANY asked question
+                # corr shape: (n_candidates, n_asked)
+                corr_sub = self.feature_correlation_matrix[valid_candidates][:, valid_asked]
+                max_corr = np.max(np.abs(corr_sub), axis=1)
+                
+                # Penalize score: Score = Variance * (1 - Correlation^2)
+                # If correlation is 1.0, score becomes 0.
+                scores[valid_candidates] *= (1.0 - max_corr**2)
+
+        # 4. Pick Best
+        # We only look at scores for valid candidates
+        best_candidate_idx = candidate_indices[np.argmax(scores[candidate_indices])]
+        
+        fname = str(active_cols[best_candidate_idx])
+        return fname, self.questions_map.get(fname, f"Is it {fname}?")
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        Smart guessing based on CONVERGENCE and CONFIDENCE.
-        Guesses when the answer is clear, never when ambiguous.
+        Determines if we should guess based on 'Dominance'.
+        If Top 1 is significantly more likely than Top 2, we guess.
         """
         if probs.sum() < 1e-10: return False, None, None
         
-        # Normalize probabilities
+        # Normalize
         probs = probs / probs.sum()
         
         sorted_idx = np.argsort(probs)[::-1]
         top_idx = sorted_idx[0]
         top_prob = probs[top_idx]
-        
         top_animal = self.animals[top_idx]
+        
         q_count = game_state['question_count']
-        continue_mode = game_state.get('continue_mode', False)
         
-        # Calculate convergence metrics
-        second_prob = probs[sorted_idx[1]] if len(sorted_idx) > 1 else 0.0
-        third_prob = probs[sorted_idx[2]] if len(sorted_idx) > 2 else 0.0
+        # Get Second place
+        second_prob = probs[sorted_idx[1]] if len(sorted_idx) > 1 else 0.001
         
-        margin = top_prob - second_prob
-        dominance_ratio = top_prob / (second_prob + 1e-10)
+        # Dominance Ratio: How many times more likely is #1 than #2?
+        ratio = top_prob / (second_prob + 1e-9)
         
-        # Calculate entropy (lower = more certain)
-        entropy = self._calculate_entropy(probs)
-        max_entropy = np.log2(len(probs))
-        normalized_entropy = entropy / (max_entropy + 1e-10)
+        # Aggressive guessing thresholds
+        should_guess = False
+        reason = ""
         
-        # Continue mode: need more evidence after wrong guess
-        if continue_mode and game_state.get('questions_since_last_guess', 0) < 5:
-            return False, None, None
-        
-        # CRITICAL: Multi-factor convergence check
-        converged = False
-        reason = None
-        
-        # Early convergence (10-15 questions): VERY strong signal required
-        if 10 <= q_count <= 15:
-            if (top_prob >= 0.85 and 
-                margin >= 0.70 and 
-                dominance_ratio >= 8.0 and
-                normalized_entropy < 0.15):
-                converged = True
-                reason = 'early_convergence'
-        
-        # Mid-game (15-25 questions): Strong convergence
-        elif 15 < q_count <= 25:
-            if (top_prob >= 0.75 and 
-                margin >= 0.55 and 
-                dominance_ratio >= 5.0 and
-                normalized_entropy < 0.25):
-                converged = True
-                reason = 'mid_convergence'
-        
-        # Late-mid (25-35 questions): Clear leader
-        elif 25 < q_count <= 35:
-            if (top_prob >= 0.60 and 
-                margin >= 0.40 and 
-                dominance_ratio >= 3.0):
-                converged = True
-                reason = 'late_mid_convergence'
-        
-        # Late game (35-45 questions): Make educated guess
-        elif 35 < q_count <= 45:
-            if (top_prob >= 0.45 and 
-                margin >= 0.25 and
-                dominance_ratio >= 2.0):
-                converged = True
-                reason = 'late_convergence'
-        
-        # Very late (45+ questions): Must guess
-        elif q_count > 45:
-            if top_prob >= 0.30 and margin >= 0.15:
-                converged = True
-                reason = 'forced_guess'
-            # Emergency guess at 60 questions
-            elif q_count >= 60:
-                converged = True
-                reason = 'emergency'
-        
-        return converged, top_animal if converged else None, reason
+        if q_count >= 40: # Safety Valve
+            should_guess = True
+            reason = "max_questions"
+        elif q_count > 15:
+            # Late game: moderate dominance is enough
+            if ratio > 2.5 and top_prob > 0.4:
+                should_guess = True
+                reason = "dominance_late"
+        elif q_count > 8:
+            # Mid game: need high dominance
+            if ratio > 5.0 and top_prob > 0.6:
+                should_guess = True
+                reason = "dominance_mid"
+        elif q_count > 4:
+            # Early game: need extreme dominance (e.g., "Is it your mother?")
+            if ratio > 15.0 and top_prob > 0.85:
+                should_guess = True
+                reason = "dominance_early"
+                
+        return should_guess, top_animal if should_guess else None, reason
     
     @property
     def feature_cols(self):
@@ -472,7 +389,18 @@ class AkinatorEngine:
 
     def get_features_for_data_collection(self, item_name, num_features=5):
         if len(self.allowed_feature_indices) == 0: return []
-        selected = np.random.choice(self.allowed_feature_indices, size=min(num_features, len(self.allowed_feature_indices)), replace=False)
+        
+        # prioritize high variance features
+        variances = self.col_var[self.allowed_feature_indices]
+        prob_dist = variances / variances.sum()
+        
+        selected = np.random.choice(
+            self.allowed_feature_indices, 
+            size=min(num_features, len(self.allowed_feature_indices)), 
+            replace=False,
+            p=prob_dist
+        )
+        
         results = []
         active_cols = self.feature_cols_array[:self.n_features]
         for idx in selected:
@@ -485,13 +413,11 @@ class AkinatorEngine:
     
     def get_all_feature_gains(self) -> list[dict]:
         if self.n_items == 0: return []
-        prior = np.ones(self.n_items, dtype=np.float32) / self.n_items
-        gains = self._compute_gains(prior, self.allowed_feature_indices)
         results = []
         active_cols = self.feature_cols_array[:self.n_features]
-        for i, idx in enumerate(self.allowed_feature_indices):
+        for idx in self.allowed_feature_indices:
             results.append({
                 "feature_name": str(active_cols[idx]),
-                "initial_gain": float(gains[i])
+                "initial_gain": float(self.col_var[idx])
             })
         return sorted(results, key=lambda x: x['initial_gain'], reverse=True)
