@@ -279,7 +279,7 @@ class AkinatorService:
     def learn_new_animal(self, *args): return db.persist_new_animal(*args)
     def start_engine_reload(self): self._load_all_engines()
 
-    def get_game_report(self, domain_name, item_name, user_answers, is_new, session_id=None, ai_won=False):
+    def get_game_report(self, domain_name, item_name, user_answers, is_new, session_id=None, ai_won=False, sparse_count=0):
         with self.engines_lock:
             engine = self.engines.get(domain_name)
             if not engine: raise ValueError("Domain not found")
@@ -321,7 +321,8 @@ class AkinatorService:
             "item_name": item_name, 
             "is_new_item": is_new, 
             "questions": questions_report,
-            "similar_items": similar_items
+            "similar_items": similar_items,
+            "sparse_questions_asked": sparse_count # <--- Added field
         }
         
         if session_id:

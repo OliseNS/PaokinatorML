@@ -46,6 +46,7 @@ class GameReport(BaseModel):
     is_new_item: bool
     questions: List[ReportQuestion]
     similar_items: List[str] = []
+    sparse_questions_asked: int = 0 # <--- Added field
 
 
 # --- Global Variables ---
@@ -429,13 +430,17 @@ async def get_and_finalize_game_report(
         user_answers = game_state.get('answered_features', {})
         domain_name = game_state.get('domain_name', 'animals')
         
+        # Extract sparse data count
+        sparse_count = game_state.get('sparse_questions_asked', 0)
+        
         if game_state.get('game_finalized', False):
              return srv.get_game_report(
                 domain_name=domain_name,
                 item_name=item_name,
                 user_answers=user_answers,
                 is_new=is_new,
-                session_id=session_id
+                session_id=session_id,
+                sparse_count=sparse_count # Pass it here too
             )
         
         # Determine AI Win Status (Simple logic: if is_new is False, AI effectively guessed it)
@@ -447,7 +452,8 @@ async def get_and_finalize_game_report(
             user_answers=user_answers,
             is_new=is_new,
             session_id=session_id, # <--- Trigger persistent save
-            ai_won=ai_won
+            ai_won=ai_won,
+            sparse_count=sparse_count # New arg
         )
         
         if report_data['is_new_item']:
