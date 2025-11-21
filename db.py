@@ -7,6 +7,7 @@ from supabase import create_client, Client
 import config
 from datetime import datetime, timezone
 import traceback
+import json
 
 m.patch()
 LIMIT = 10000
@@ -106,6 +107,39 @@ def get_all_domains() -> list[str]:
     except: return ["animals"]
 
 
+# --- REPORT PERSISTENCE ---
+
+def save_game_report(session_id: str, domain_name: str, target_item: str, ai_won: bool, report_data: dict):
+    if not supabase: return
+    try:
+        supabase.table("game_reports").insert({
+            "session_id": session_id,
+            "domain_name": domain_name,
+            "target_item": target_item,
+            "ai_won": ai_won,
+            "report_json": report_data
+        }).execute()
+        print(f"✓ Saved game report for session {session_id}")
+    except Exception as e:
+        print(f"✗ Failed to save game report: {e}")
+
+def get_game_report_by_session(session_id: str):
+    if not supabase: return None
+    try:
+        # Check DB
+        res = supabase.table("game_reports")\
+            .select("report_json")\
+            .eq("session_id", session_id)\
+            .limit(1).execute()
+            
+        if res.data:
+            return res.data[0]['report_json']
+        return None
+    except Exception as e:
+        print(f"Error fetching report: {e}")
+        return None
+
+
 # --- Data Loading (Active + Suggested) ---
 
 def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame, list, dict]:
@@ -118,7 +152,7 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
     if not domain.data: return pd.DataFrame(), [], {}
     domain_id = domain.data[0]['id']
 
-    # 1. Get Features (ALL statuses)
+    # 1. Get Features
     feat_res = supabase.table("domain_features").select("features(id, feature_name, question_text)")\
         .eq("domain_id", domain_id).execute()
     
@@ -130,7 +164,7 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
     feature_count = len(feature_ids)
     print(f"✓ Features Loaded: {feature_count}")
 
-    # 2. Get Items (ALL statuses)
+    # 2. Get Items
     items_res = supabase.table("items").select("id,item_name").eq("domain_id", domain_id)\
         .limit(50000).execute()
     
@@ -141,12 +175,11 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
     if not item_ids or not feature_ids:
         return pd.DataFrame(columns=['animal_name'] + feature_cols), feature_cols, questions_map
 
-    # 3. Get Feature Values (Batched)
+    # 3. Get Feature Values
     max_rows_per_query = 9500
     batch_size = max(1, max_rows_per_query // max(1, feature_count))
     all_data = []
-    total_batches = (len(item_ids) + batch_size - 1) // batch_size
-
+    
     for i in range(0, len(item_ids), batch_size):
         batch_ids = item_ids[i:i+batch_size]
         raw_data = supabase.table("item_features").select("item_id,feature_id,value_sum,vote_count")\
@@ -162,7 +195,7 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
     
     print(f"\n✓ Retrieved {len(all_data)} feature values")
 
-    # 4. Pivot to DataFrame (Optimized to avoid fragmentation)
+    # 4. Pivot to DataFrame
     if not all_data:
         df_wide = pd.DataFrame({'animal_name': list(item_map.values())})
     else:
@@ -171,19 +204,11 @@ def load_data_from_supabase(domain_name: str = "animals") -> tuple[pd.DataFrame,
         df_wide = df_wide.reindex(list(item_map.values()))
         df_wide = df_wide.reset_index().rename(columns={'index': 'animal_name'})
     
-    # Optimization: Efficiently add missing columns using concatenation instead of loop
     missing_cols = [c for c in feature_cols if c not in df_wide.columns]
     if missing_cols:
-        # Create a DataFrame of NaNs for the missing columns
         df_missing = pd.DataFrame(np.nan, index=df_wide.index, columns=missing_cols)
         df_wide = pd.concat([df_wide, df_missing], axis=1)
     
-    # Ensure numeric types
-    # We use apply only on feature columns to be safe
-    # But usually concat respects types. pd.to_numeric might be needed if 'value' was mixed.
-    # We skip explicit loop for speed unless needed. Assuming float32 from engine cast.
-
-    # Sort columns to match feature_cols list order for the Engine
     cols_to_keep = ['animal_name'] + feature_cols
     df_wide = df_wide[cols_to_keep]
 
@@ -204,7 +229,6 @@ def get_recent_updates(domain_name: str, since: datetime) -> list[dict]:
         target_domain_id = _get_domain_id(domain_name)
 
         for row in data.data:
-            # Filter by domain since we can't easily do it in the join query yet
             if row['items']['domain_id'] != target_domain_id:
                 continue
 

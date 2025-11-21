@@ -4,12 +4,7 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V15.0 - Buffered Confidence).
-    
-    Updates:
-    - should_make_guess: Added 'Anti-Spam Buffer' (must ask 3 questions between guesses).
-    - should_make_guess: Loosened confidence slightly (97% prob, 8x ratio) for faster play.
-    - should_make_guess: Hard limit enforced at 25 questions.
+    Real-time Padded Akinator Engine (V16.0 - Normalized & Tuned).
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -20,46 +15,57 @@ class AkinatorEngine:
         self.n_items = len(df)
         self.n_features = len(feature_cols)
         
-        # O(1) Lookups - NORMALIZED to prevent duplicates
-        self.feature_map = {name: i for i, name in enumerate(self.active_feature_names)}
-        self.item_map = {} # Populated below
+        # --- NORMALIZATION & DISPLAY MAP ---
+        self.display_name_map = {} 
         
-        # --- 1. Setup Capacity (Double Padding) ---
+        # O(1) Lookups - NORMALIZED
+        self.feature_map = {name: i for i, name in enumerate(self.active_feature_names)}
+        self.item_map = {} 
+        
         self.cap_rows = self.n_items + row_padding
         self.cap_cols = self.n_features + col_padding
         
-        print(f"🧠 Engine Alloc: {self.cap_rows} Rows (Items) x {self.cap_cols} Cols (Features)")
+        print(f"🧠 Engine Alloc: {self.cap_rows} Rows x {self.cap_cols} Cols")
 
-        # --- 2. Initialize Padded Arrays ---
         self.features = np.full((self.cap_rows, self.cap_cols), np.nan, dtype=np.float32)
         self.animals = np.full(self.cap_rows, None, dtype=object)
         self.feature_cols_array = np.full(self.cap_cols, None, dtype=object)
         
-        # --- 3. Load Initial Data ---
         if self.n_features > 0:
             self.feature_cols_array[:self.n_features] = self.active_feature_names
 
         if not df.empty:
             names = df['animal_name'].values
-            self.animals[:self.n_items] = names
             
-            # Normalize keys for deduplication
-            for idx, name in enumerate(names):
-                clean_key = str(name).strip().lower()
-                self.item_map[clean_key] = idx
-                
+            # --- DEDUPLICATION LOGIC ---
+            unique_indices = []
+            seen_keys = set()
+            
+            for original_idx, name in enumerate(names):
+                clean_key = self._normalize(name)
+                if clean_key not in seen_keys:
+                    seen_keys.add(clean_key)
+                    unique_indices.append(original_idx)
+                    
+                    # Map normalized key to the new dense index
+                    new_idx = len(unique_indices) - 1
+                    self.item_map[clean_key] = new_idx
+                    self.animals[new_idx] = name # Keep original casing for display
+                    self.display_name_map[clean_key] = name
+            
+            # Update n_items to reflect deduplicated count
+            self.n_items = len(unique_indices)
+            
             if len(df.columns) > 1:
-                existing_data = df[feature_cols].values.astype(np.float32)
-                self.features[:self.n_items, :self.n_features] = existing_data
+                # Load only the unique rows
+                raw_features = df[feature_cols].values.astype(np.float32)
+                self.features[:self.n_items, :self.n_features] = raw_features[unique_indices]
 
-        # --- 4. Initial Math Prep ---
-        print("   Imputing initial data block...")
         self._impute_active_block()
         
         # Stats setup 
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float32)
         
-        # Fuzzy map
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0, 
             'probably': 0.75, 'mostly': 0.75, 'usually': 0.75, 
@@ -68,12 +74,15 @@ class AkinatorEngine:
             'no': 0.0, 'n': 0.0
         }
         
-        # Precomputations
         self._refresh_column_stats()
         self._recalc_correlation()
         self._compute_initial_priors()
         
-        print(f"✓ Engine Ready. Active: {self.n_items} items, {self.n_features} features.")
+        print(f"✓ Engine Ready. Active: {self.n_items} items (deduplicated).")
+
+    def _normalize(self, text):
+        """Centralized normalization for the engine."""
+        return str(text).strip().lower()
 
     def _impute_active_block(self):
         """Fills gaps in knowledge using KNN."""
@@ -81,13 +90,11 @@ class AkinatorEngine:
         
         active_view = self.features[:self.n_items, :self.n_features]
         
-        # 1. Fill complete empty columns with uncertainty (0.5)
         nan_mask = np.isnan(active_view)
         all_nan_cols = nan_mask.all(axis=0)
         if all_nan_cols.any():
             active_view[:, all_nan_cols] = 0.5
             
-        # 2. KNN Imputation for partial data
         if np.isnan(active_view).any():
             try:
                 imputer = KNNImputer(n_neighbors=7, weights='distance')
@@ -121,7 +128,6 @@ class AkinatorEngine:
         self.col_var = np.var(clean_view, axis=0)
         self.col_mean = np.mean(clean_view, axis=0)
         
-        # Features with very low variance (everyone matches) are useless
         self.allowed_feature_mask = (self.col_var > 1e-4)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
 
@@ -136,16 +142,16 @@ class AkinatorEngine:
 
     def smart_ingest_update(self, item_name: str, feature_name: str, value: float, question_text: str = None):
         """DEDUPLICATED Ingestion."""
-        clean_item_key = str(item_name).strip().lower()
+        clean_item_key = self._normalize(item_name)
         idx = self.item_map.get(clean_item_key)
         
         # Add Item if New
         if idx is None:
-            if self.n_items >= self.cap_rows:
-                return
+            if self.n_items >= self.cap_rows: return
             idx = self.n_items
-            self.animals[idx] = item_name 
+            self.animals[idx] = item_name  # Store Display Name
             self.item_map[clean_item_key] = idx 
+            self.display_name_map[clean_item_key] = item_name
             self.n_items += 1
             if self.n_features > 0:
                 self.features[idx, :self.n_features] = self.col_mean[:self.n_features]
@@ -153,8 +159,7 @@ class AkinatorEngine:
         # Add Feature if New
         f_idx = self.feature_map.get(feature_name)
         if f_idx is None:
-            if self.n_features >= self.cap_cols:
-                return
+            if self.n_features >= self.cap_cols: return
             f_idx = self.n_features
             self.feature_cols_array[f_idx] = feature_name
             self.feature_map[feature_name] = f_idx
@@ -163,7 +168,6 @@ class AkinatorEngine:
                 self.questions_map[feature_name] = question_text
             self.features[:self.n_items, f_idx] = 0.5
 
-        # Update Value
         self.features[idx, f_idx] = value
         self._refresh_column_stats()
 
@@ -173,7 +177,6 @@ class AkinatorEngine:
         self._compute_initial_priors()
 
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """ROBUST SCORING (The "Climbing" Logic)."""
         if len(current_scores) < self.n_items:
             padding_len = self.n_items - len(current_scores)
             valid_scores = current_scores[np.isfinite(current_scores)]
@@ -187,12 +190,10 @@ class AkinatorEngine:
         f_col = self.features[:self.n_items, feature_idx]
         f_col_clean = np.nan_to_num(f_col, nan=0.5)
         
-        # Gaussian Likelihood
         sigma = 0.18
         distance = np.abs(f_col_clean - answer_val)
         gaussian_likelihood = np.exp(-0.5 * (distance / sigma) ** 2)
         
-        # Noise Floor & Boost
         p_noise = 0.02
         final_likelihood = (1.0 - p_noise) * gaussian_likelihood + p_noise
         
@@ -204,7 +205,6 @@ class AkinatorEngine:
         return current_scores + np.log(np.clip(final_likelihood, 1e-9, None))
 
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
-        """SMART NARROWING with STOCHASTIC START."""
         active_cols = self.feature_cols_array[:self.n_features]
         asked_mask = np.isin(active_cols, asked_features)
         
@@ -226,7 +226,6 @@ class AkinatorEngine:
         scores = target_var.copy()
         asked_indices = np.where(asked_mask)[0]
         
-        # Correlation penalty
         if len(asked_indices) > 0:
             limit = min(self.n_features, self.feature_correlation_matrix.shape[0])
             valid_candidates = candidate_indices[candidate_indices < limit]
@@ -237,7 +236,6 @@ class AkinatorEngine:
                 scores[valid_candidates] *= (1.0 - max_corr**2)
 
         if question_count == 0:
-            # Q1: Randomize slightly to prevent repetitive games
             candidate_scores = scores[candidate_indices]
             sorted_local_indices = np.argsort(candidate_scores)[::-1]
             pool_size = min(len(sorted_local_indices), 25)
@@ -245,7 +243,6 @@ class AkinatorEngine:
             random_pool_index = np.random.choice(sorted_local_indices[:pool_size])
             best_candidate_idx = candidate_indices[random_pool_index]
         else:
-            # Greedy Argmax
             best_candidate_idx = candidate_indices[np.argmax(scores[candidate_indices])]
             
         fname = str(active_cols[best_candidate_idx])
@@ -253,8 +250,8 @@ class AkinatorEngine:
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         """
-        Decides if we should guess or ask more questions.
-        Includes strict anti-spam buffers and a hard limit at 25.
+        Decides if we should guess.
+        FIXED: Lower thresholds, stricter buffers for wrong guesses.
         """
         if probs.sum() < 1e-10: return False, None, None
         
@@ -264,34 +261,33 @@ class AkinatorEngine:
         top_prob = probs[top_idx]
         top_animal = self.animals[top_idx]
         
-        # --- 1. Get State Variables ---
         q_count = game_state.get('question_count', 0)
-        
-        # Default to 999 if key missing (allows first guess of the game).
-        # If in 'continue mode', this will be 0, 1, 2...
         q_since_guess = game_state.get('questions_since_last_guess', 999) 
         
-        # Second highest prob for ratio calculation
+        # Ratio Calculation
         second_prob = probs[sorted_idx[1]] if len(sorted_idx) > 1 else 0.001
         ratio = top_prob / (second_prob + 1e-9)
         
-        # --- 2. Hard Limit (Force Guess at 25) ---
+        # --- 1. HARD LIMIT ---
         if q_count >= 25:
             return True, top_animal, "max_questions_25"
             
-        # --- 3. Anti-Spam Buffer ---
-        # If we are in continue mode, we MUST ask at least 3 questions before guessing again.
-        # This prevents the "Guess -> No -> Guess -> No" loop.
-        if q_since_guess < 3:
-            return False, None, None
-            
-        # --- 4. High Confidence Logic (Tuned) ---
-        # We require high probability AND a significant lead over the runner-up.
-        # Adjusted: 97.0% prob + 8x ratio (was 99.5% / 20x).
-        # This is "Very High Confidence" but not "Statistical Certainty", allowing faster play.
-        if top_prob > 0.97 and ratio > 8.0:
+        # --- 2. ANTI-INFINITE LOOP BUFFER (CRITICAL FIX) ---
+        # If we have guessed recently, we FORCE at least 5 questions between guesses 
+        # unless probability is nearly 100%.
+        min_questions_between_guesses = 5
+        if q_since_guess < min_questions_between_guesses:
+             if top_prob < 0.999:
+                 return False, None, None
+
+        # --- 3. TUNED CONFIDENCE LOGIC ---
+        # Faster guessing: 95% + 2x ratio or 85% + 4x ratio
+        if top_prob > 0.95 and ratio > 2.0:
             return True, top_animal, "high_confidence"
-                
+            
+        if top_prob > 0.85 and ratio > 4.0:
+            return True, top_animal, "clear_leader"
+            
         return False, None, None
     
     @property
@@ -338,6 +334,9 @@ class AkinatorEngine:
 
     def find_nearest_neighbors(self, target_vector: np.ndarray, exclude_name: str = None, n: int = 3) -> list[str]:
         if self.n_items == 0 or self.n_features == 0: return []
+        
+        exclude_clean = self._normalize(exclude_name) if exclude_name else None
+        
         active_matrix = np.nan_to_num(self.features[:self.n_items, :self.n_features], nan=0.5)
         diff = active_matrix - target_vector
         distances = np.linalg.norm(diff, axis=1)
@@ -347,7 +346,7 @@ class AkinatorEngine:
         for idx in sorted_indices:
             if len(results) >= n: break
             candidate_name = self.animals[idx]
-            if exclude_name and candidate_name.lower().strip() == exclude_name.lower().strip():
+            if exclude_clean and self._normalize(candidate_name) == exclude_clean:
                 continue
             results.append(candidate_name)
         return results

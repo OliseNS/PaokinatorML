@@ -45,7 +45,7 @@ class GameReport(BaseModel):
     item_name: str
     is_new_item: bool
     questions: List[ReportQuestion]
-    similar_items: List[str] = [] # <--- NEW: Server-provided suggestions
+    similar_items: List[str] = []
 
 
 # --- Global Variables ---
@@ -68,7 +68,6 @@ async def lifespan(app: FastAPI):
             print(f"🔥 Warming up {len(loaded_domains)} domains...")
             for domain in loaded_domains:
                 try:
-                    # print(f"   -> Warming '{domain}'")
                     initial_state = service.create_initial_state(domain_name=domain)
                     service.get_next_question(initial_state)
                     service.get_top_predictions(initial_state, n=5)
@@ -92,7 +91,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Akinator API",
     description="Multi-domain Akinator-style game server.",
-    version="2.3.0",
+    version="2.4.0",
     lifespan=lifespan
 )
 
@@ -415,15 +414,16 @@ async def get_and_finalize_game_report(
     item_name: str, 
     is_new: bool = False
 ):
-    """
-    Finalizes the game and returns a detailed report.
-    NEW: Now calculates similarity based on vector distance (Nearest Neighbors)
-    so we can suggest 'Similar Items' even for brand new items.
-    """
     srv = get_service()
     game_state = db.get_current_session_state(session_id)
+    
+    # --- PERSISTENCE FALLBACK ---
     if not game_state:
-        raise HTTPException(status_code=404, detail="Session expired or not found")
+        # Check if we have a saved report in SQL
+        saved_report = db.get_game_report_by_session(session_id)
+        if saved_report:
+            return saved_report
+        raise HTTPException(status_code=404, detail="Session expired and no report found.")
 
     try:
         user_answers = game_state.get('answered_features', {})
@@ -434,19 +434,23 @@ async def get_and_finalize_game_report(
                 domain_name=domain_name,
                 item_name=item_name,
                 user_answers=user_answers,
-                is_new=is_new
+                is_new=is_new,
+                session_id=session_id
             )
         
-        # Get the report (which now includes 'similar_items')
+        # Determine AI Win Status (Simple logic: if is_new is False, AI effectively guessed it)
+        ai_won = not is_new
+        
         report_data = srv.get_game_report(
             domain_name=domain_name,
             item_name=item_name,
             user_answers=user_answers,
-            is_new=is_new
+            is_new=is_new,
+            session_id=session_id, # <--- Trigger persistent save
+            ai_won=ai_won
         )
         
-        # Persist data
-        if is_new:
+        if report_data['is_new_item']:
             srv.learn_new_animal(item_name, user_answers, domain_name)
         else:
             srv.record_suggestion(item_name, user_answers, domain_name)

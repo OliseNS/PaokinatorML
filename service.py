@@ -237,15 +237,16 @@ class AkinatorService:
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
         
-        # Find animal index in active items
-        active_animals = engine.animals[:engine.n_items]
-        idx_list = np.where(active_animals == animal_name)[0]
+        # Normalization fix for rejection
+        target_clean = engine._normalize(animal_name)
         
-        if len(idx_list) > 0:
-            idx = idx_list[0]
-            # Ensure mask is large enough
-            if idx < len(game_state['rejected_mask']):
-                game_state['rejected_mask'][idx] = True
+        # Scan active items
+        for i in range(engine.n_items):
+            current_name = engine.animals[i]
+            if engine._normalize(current_name) == target_clean:
+                if i < len(game_state['rejected_mask']):
+                    game_state['rejected_mask'][i] = True
+                break
                 
         return game_state
 
@@ -265,54 +266,43 @@ class AkinatorService:
     def learn_new_animal(self, *args): return db.persist_new_animal(*args)
     def start_engine_reload(self): self._load_all_engines()
 
-    def get_game_report(self, domain_name, item_name, user_answers, is_new):
+    def get_game_report(self, domain_name, item_name, user_answers, is_new, session_id=None, ai_won=False):
         """
-        Generates a game report AND finds smart 'Similar Items'.
-        Logic:
-        - If existing item: Uses its known feature vector from the Engine.
-        - If new item: Constructs a feature vector from 'user_answers'.
-        - Compares vector against all active items to find 3 Nearest Neighbors.
+        Generates report, auto-corrects 'is_new' if item exists, and Saves to DB.
         """
         with self.engines_lock:
             engine = self.engines.get(domain_name)
             if not engine: raise ValueError("Domain not found")
             
-            # 1. Determine Target Vector for Similarity Search
-            if not is_new:
-                # Try to find existing item
-                clean_key = str(item_name).strip().lower()
-                idx = engine.item_map.get(clean_key)
-                
-                if idx is not None and idx < engine.n_items:
-                    # Use the authoritative vector from the engine
-                    # (handle NaNs by converting to 0.5)
-                    target_vector = np.nan_to_num(engine.features[idx, :engine.n_features], nan=0.5)
-                else:
-                    # Fallback: treat as new if we can't find it by name
-                    is_new = True
-                    target_vector = engine.build_feature_vector(user_answers)
+            clean_item_name = str(item_name).strip().lower()
+            
+            # 1. INTELLIGENT DETECTION: Check if we actually have this item
+            existing_idx = engine.item_map.get(clean_item_name)
+            
+            if existing_idx is not None:
+                # We found it! It's NOT new.
+                is_new = False
+                # Use the capitalized display name from engine
+                item_name = engine.animals[existing_idx]
+                target_vector = np.nan_to_num(engine.features[existing_idx, :engine.n_features], nan=0.5)
             else:
-                # Construct vector from what the user told us
+                # Actually new
                 target_vector = engine.build_feature_vector(user_answers)
 
-            # 2. Find Nearest Neighbors (Similar Items)
+            # 2. Find Neighbors
             similar_items = engine.find_nearest_neighbors(target_vector, exclude_name=item_name, n=3)
 
             # 3. Build Question Report
             questions_report = []
             
-            # For consensus data
-            item_idx = -1
-            if not is_new:
-                try:
-                    item_idx = engine.item_map.get(str(item_name).strip().lower(), -1)
-                except: pass
+            # Re-fetch index (might be -1 if new)
+            item_idx = engine.item_map.get(clean_item_name, -1)
 
             for feature_name, user_value in user_answers.items():
                 q_text = engine.questions_map.get(feature_name, f"Is it {feature_name}?")
                 consensus_value = None
                 
-                if not is_new and item_idx != -1:
+                if item_idx != -1:
                     try:
                         f_idx = engine.feature_map.get(feature_name)
                         if f_idx is not None:
@@ -327,9 +317,17 @@ class AkinatorService:
                     "consensus_answer": consensus_value
                 })
 
-        return {
+        report_data = {
             "item_name": item_name, 
             "is_new_item": is_new, 
             "questions": questions_report,
-            "similar_items": similar_items  # <--- Added Field
+            "similar_items": similar_items
         }
+        
+        # --- BACKGROUND SAVE TO SQL ---
+        if session_id:
+            threading.Thread(target=db.save_game_report, args=(
+                session_id, domain_name, item_name, ai_won, report_data
+            )).start()
+
+        return report_data
