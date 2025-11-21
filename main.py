@@ -46,7 +46,7 @@ class GameReport(BaseModel):
     is_new_item: bool
     questions: List[ReportQuestion]
     similar_items: List[str] = []
-    sparse_questions_asked: int = 0 # <--- Added field
+    sparse_questions_asked: int = 0
 
 
 # --- Global Variables ---
@@ -60,6 +60,8 @@ async def lifespan(app: FastAPI):
     global service, undo_handler
     print("FastAPI server starting up...")
     try:
+        # The service constructor loads all engines synchronously.
+        # This means 'service' will only be assigned once loading is COMPLETE.
         service = AkinatorService()
         undo_handler = UndoHandler(service)
         
@@ -110,11 +112,31 @@ async def add_process_time_header(request: Request, call_next):
 
 def get_service() -> AkinatorService:
     if service is None:
-        raise HTTPException(status_code=503, detail="Service not available")
+        raise HTTPException(status_code=503, detail="Service not available (Initializing or Failed)")
     return service
 
 
 # --- Endpoints ---
+
+@app.get("/health")
+async def health_check():
+    """
+    Liveness/Readiness probe.
+    Returns 200 OK only if the service is fully initialized and data is loaded.
+    """
+    if service is None:
+        # If service is None, we are still loading or failed.
+        # Return 503 so load balancers/Railway know we aren't ready.
+        raise HTTPException(status_code=503, detail="Service Initializing")
+    
+    # If we are here, the service object exists, meaning __init__ finished.
+    # This implies all engines from Supabase are loaded.
+    return {
+        "status": "healthy", 
+        "ready": True,
+        "domains_loaded": len(service.engines)
+    }
+
 
 @app.get("/domains")
 async def get_available_domains():
@@ -440,7 +462,7 @@ async def get_and_finalize_game_report(
                 user_answers=user_answers,
                 is_new=is_new,
                 session_id=session_id,
-                sparse_count=sparse_count # Pass it here too
+                sparse_count=sparse_count
             )
         
         # Determine AI Win Status (Simple logic: if is_new is False, AI effectively guessed it)
@@ -453,7 +475,7 @@ async def get_and_finalize_game_report(
             is_new=is_new,
             session_id=session_id, # <--- Trigger persistent save
             ai_won=ai_won,
-            sparse_count=sparse_count # New arg
+            sparse_count=sparse_count
         )
         
         if report_data['is_new_item']:
