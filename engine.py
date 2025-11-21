@@ -4,10 +4,12 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V14.5 - Logic Fix).
+    Real-time Padded Akinator Engine (V14.6 - Tuning Fixes).
     
     Updates:
-    - should_make_guess: Fixed infinite loop in continue mode. Enforces new questions after rejection.
+    - should_make_guess: Lowered continue threshold to 3.
+    - update: REMOVED artificial scoring boosts (1.25x) to prevent generic items
+      like 'Labubu' from hijacking the game based on common traits (plastic, solid).
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -240,6 +242,7 @@ class AkinatorEngine:
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
         """
         ROBUST SCORING (The "Climbing" Logic).
+        UPDATED: Removed artificial boosts to prevent "Labubu" scenarios.
         """
         # Resize scores if engine grew
         if len(current_scores) < self.n_items:
@@ -258,21 +261,21 @@ class AkinatorEngine:
         f_col_clean = np.nan_to_num(f_col, nan=0.5)
         
         # 2. Gaussian Likelihood
-        sigma = 0.18
+        # Sigma: Controls tolerance. 0.22 allows for "Yes"(1.0) and "Probably"(0.75) to partially overlap.
+        sigma = 0.22
         distance = np.abs(f_col_clean - answer_val)
         gaussian_likelihood = np.exp(-0.5 * (distance / sigma) ** 2)
         
         # 3. NOISE FLOOR
-        p_noise = 0.02
+        # Controls how fatal a mismatch is. 0.01 means a hard miss divides probability by 100.
+        p_noise = 0.01
         final_likelihood = (1.0 - p_noise) * gaussian_likelihood + p_noise
         
-        # 4. Boost Confidence
-        if answer_val > 0.75:
-             bonus_mask = (f_col_clean > 0.8)
-             final_likelihood[bonus_mask] *= 1.25
-        elif answer_val < 0.25:
-             bonus_mask = (f_col_clean < 0.2)
-             final_likelihood[bonus_mask] *= 1.25
+        # 4. REMOVED Artificial Boosts
+        # Previously we did `final_likelihood *= 1.25` if it matched.
+        # This caused generic items (solid, plastic, toy) to accumulate massive scores
+        # simply by fitting broad categories, even if they missed specific ones.
+        # We now rely purely on the Gaussian probability.
              
         # 5. Convert to Log-Prob update
         log_update = np.log(np.clip(final_likelihood, 1e-9, None))
@@ -374,20 +377,17 @@ class AkinatorEngine:
         
         # 1. Rejection Cool-down:
         # If we just rejected a guess (continue_mode is True), do NOT guess again immediately.
-        # Force at least 5 new questions to gather new info.
-        if continue_mode and q_since_last_guess < 5:
+        # UPDATED: Force at least 3 new questions (was 5).
+        if continue_mode and q_since_last_guess < 3:
             return False, None, None
 
         # 2. Hard Limit (Question 25)
         # ONLY trigger this if we haven't entered continue mode yet.
-        # If we are in continue mode, we are past the "initial rush" and should only guess if confident.
         if q_count >= 25 and not continue_mode:
             should_guess = True
             reason = "max_questions_25"
             
         # 3. Confidence Check
-        # If in continue mode, we might want slightly higher confidence before interrupting again,
-        # but standard 98% usually works fine.
         elif top_prob > 0.98 and ratio > 5:
             should_guess = True
             reason = "balanced_confidence"
