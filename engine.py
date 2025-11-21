@@ -4,10 +4,10 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V14.4 - Enhanced Normalization).
+    Real-time Padded Akinator Engine (V14.5 - Logic Fix).
     
     Updates:
-    - _normalize: Now aggressively merges variants ("Hot Dog" == "Hotdogs" == "hotdog").
+    - should_make_guess: Fixed infinite loop in continue mode. Enforces new questions after rejection.
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -359,21 +359,40 @@ class AkinatorEngine:
         top_prob = probs[top_idx]
         top_animal = self.animals[top_idx]
         
-        q_count = game_state['question_count']
+        # Extract State
+        q_count = game_state.get('question_count', 0)
+        continue_mode = game_state.get('continue_mode', False)
+        q_since_last_guess = game_state.get('questions_since_last_guess', 0)
+        
         second_prob = probs[sorted_idx[1]] if len(sorted_idx) > 1 else 0.001
         ratio = top_prob / (second_prob + 1e-9)
         
         should_guess = False
         reason = ""
         
-        # 1. Hard Limit (Guess at 25 if not found yet)
-        if q_count >= 25:
+        # --- FIXED LOGIC START ---
+        
+        # 1. Rejection Cool-down:
+        # If we just rejected a guess (continue_mode is True), do NOT guess again immediately.
+        # Force at least 5 new questions to gather new info.
+        if continue_mode and q_since_last_guess < 5:
+            return False, None, None
+
+        # 2. Hard Limit (Question 25)
+        # ONLY trigger this if we haven't entered continue mode yet.
+        # If we are in continue mode, we are past the "initial rush" and should only guess if confident.
+        if q_count >= 25 and not continue_mode:
             should_guess = True
             reason = "max_questions_25"
             
-        elif top_prob > 0.95 and ratio > 3:
+        # 3. Confidence Check
+        # If in continue mode, we might want slightly higher confidence before interrupting again,
+        # but standard 98% usually works fine.
+        elif top_prob > 0.98 and ratio > 5:
             should_guess = True
             reason = "balanced_confidence"
+                
+        # --- FIXED LOGIC END ---
                 
         return should_guess, top_animal if should_guess else None, reason
     
