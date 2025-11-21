@@ -274,7 +274,7 @@ class AkinatorService:
             engine = self.engines.get(domain_name)
             if not engine: raise ValueError("Domain not found")
             
-            clean_item_name = str(item_name).strip().lower()
+            clean_item_name = engine._normalize(item_name)
             
             # 1. INTELLIGENT DETECTION: Check if we actually have this item
             existing_idx = engine.item_map.get(clean_item_name)

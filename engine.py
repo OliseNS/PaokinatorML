@@ -4,12 +4,10 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V14.2 - Ultra-Strict Confidence).
+    Real-time Padded Akinator Engine (V14.4 - Enhanced Normalization).
     
     Updates:
-    - should_make_guess: Now requires 99.5% confidence and 20x probability ratio.
-    - should_make_guess: Hard limit set to 25 questions.
-    - select_question: Randomizes Q1 (Top 5), then Greedy (Argmax).
+    - _normalize: Now aggressively merges variants ("Hot Dog" == "Hotdogs" == "hotdog").
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -43,9 +41,9 @@ class AkinatorEngine:
             names = df['animal_name'].values
             self.animals[:self.n_items] = names
             
-            # CRITICAL FIX: Normalize keys for deduplication
+            # CRITICAL FIX: Normalize keys for deduplication using the shared method
             for idx, name in enumerate(names):
-                clean_key = str(name).strip().lower()
+                clean_key = self._normalize(name)
                 self.item_map[clean_key] = idx
                 
             if len(df.columns) > 1:
@@ -87,6 +85,30 @@ class AkinatorEngine:
         self._compute_initial_priors()
         
         print(f"✓ Engine Ready. Active: {self.n_items} items, {self.n_features} features.")
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """
+        Aggressive Normalization.
+        1. Lowercase & Strip
+        2. Remove spaces/hyphens/underscores ("Hot Dog" -> "hotdog")
+        3. Remove trailing 's' ("Hotdogs" -> "hotdog")
+           (Protected: 'ss' ending like 'glass', and words <= 3 chars like 'bus')
+        """
+        if not text: return ""
+        
+        # 1. Strip and Lower
+        clean = str(text).strip().lower()
+        
+        # 2. Remove separators
+        clean = clean.replace(" ", "").replace("-", "").replace("_", "")
+        
+        # 3. Simple Singularization
+        # If it ends in 's', isn't 'ss' (glass), and is long enough (avoids 'bus' -> 'bu' risk for most short words)
+        if clean.endswith("s") and not clean.endswith("ss") and len(clean) > 3:
+            clean = clean[:-1]
+            
+        return clean
 
     def _impute_active_block(self):
         """
@@ -159,7 +181,7 @@ class AkinatorEngine:
         Checks for 'Projector' via 'projector' key.
         """
         # 1. Sanitize Key
-        clean_item_key = str(item_name).strip().lower()
+        clean_item_key = self._normalize(item_name)
         
         idx = self.item_map.get(clean_item_key)
         
@@ -327,6 +349,7 @@ class AkinatorEngine:
         
         fname = str(active_cols[best_candidate_idx])
         return fname, self.questions_map.get(fname, f"Is it {fname}?")
+
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
         if probs.sum() < 1e-10: return False, None, None
         
@@ -348,12 +371,14 @@ class AkinatorEngine:
             should_guess = True
             reason = "max_questions_25"
             
-        # 2. Ultra-Strict Confidence Rule (Regardless of Question Count)
-        # We demand 99.5% certainty and a massive lead (20x ratio).
-        # This ensures the engine is essentially never "overconfident".
-        elif top_prob > 0.995 and ratio > 20.0:
+        # 2. Adjusted Confidence Rule (Balanced)
+        # - Confidence > 80% (was 99.5%)
+        # - Ratio > 1.5x (was 20x)
+        # This makes it less "trigger happy" on random noise, but converges 
+        # WAY faster than the previous ultra-strict mode.
+        elif top_prob > 0.80 and ratio > 1.5:
             should_guess = True
-            reason = "strict_confidence"
+            reason = "balanced_confidence"
                 
         return should_guess, top_animal if should_guess else None, reason
     
@@ -441,7 +466,8 @@ class AkinatorEngine:
             candidate_name = self.animals[idx]
             
             # Skip if it's the item itself (case-insensitive check)
-            if exclude_name and candidate_name.lower().strip() == exclude_name.lower().strip():
+            # Use _normalize for better safety if needed, but string comparison is mostly safe here
+            if exclude_name and self._normalize(candidate_name) == self._normalize(exclude_name):
                 continue
                 
             results.append(candidate_name)
