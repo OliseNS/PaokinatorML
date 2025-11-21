@@ -103,11 +103,8 @@ class AkinatorService:
                 if total_updates > 0:
                     with self._cache_lock:
                         self._prediction_cache.clear()
-                    
-                    # Update cursor only if we processed data successfully
                     self.last_sync_time = next_sync_time
                 else:
-                    # Move cursor forward to avoid scanning old time windows if nothing happened
                     self.last_sync_time = next_sync_time
                 
             except Exception as e:
@@ -123,10 +120,7 @@ class AkinatorService:
             game_state['domain_name'] = domain_name
             
         # Dynamic Session Migration
-        # Check if engine item count > session array size
-        # This happens if a new item was added while user was playing
         game_state = self.state_manager.migrate_state(game_state, engine.n_items)
-        
         return engine, game_state
 
     def _get_probs_and_state(self, game_state: dict) -> tuple[np.ndarray, dict, AkinatorEngine]:
@@ -136,9 +130,7 @@ class AkinatorService:
         scores = game_state['cumulative_scores'].copy()
         mask = game_state['rejected_mask']
         
-        # Safety check: if scores mismatch engine, return empty (should be handled by migrate_state)
         if len(scores) != engine.n_items:
-            # Last ditch migration attempt
             game_state = self.state_manager.migrate_state(game_state, engine.n_items)
             scores = game_state['cumulative_scores'].copy()
             mask = game_state['rejected_mask']
@@ -164,7 +156,6 @@ class AkinatorService:
         with self.engines_lock:
             engine = self.engines.get(domain_name)
             if not engine: raise ValueError(f"Domain '{domain_name}' not found.")
-            # Use current n_items from engine
             return self.state_manager.create_initial_state(domain_name, engine.n_items)
 
     def get_top_predictions(self, game_state: dict, n: int = 5) -> list[dict]:
@@ -181,7 +172,6 @@ class AkinatorService:
             idx = sorted_indices[i]
             prob = probs[idx]
             if prob < 0.001: break
-            # Safely access animals array
             if idx < engine.n_items:
                 results.append({'animal': engine.animals[idx], 'probability': float(prob)})
         
@@ -203,6 +193,35 @@ class AkinatorService:
         asked = game_state['asked_features']
         q_count = game_state['question_count']
         
+        # --- DATA COLLECTION INJECTION LOGIC ---
+        sparse_asked_count = game_state.get('sparse_questions_asked', 0)
+        
+        top_prob = np.max(prior) if len(prior) > 0 else 0
+        
+        # Trigger Conditions:
+        # 1. "Mid-Game Pocket": Between Q5 and Q20.
+        # 2. Limit: Max 2 per session.
+        # 3. Safety: Not in continue mode, not highly confident yet (>0.85).
+        # 4. Chance: 25% probability per turn (stochastic).
+        should_try_sparse = (
+            5 <= q_count <= 20 and
+            sparse_asked_count < 2 and
+            not game_state.get('continue_mode', False) and
+            top_prob < 0.85 and
+            np.random.random() < 0.25 
+        )
+
+        if should_try_sparse:
+            # print(f"[Service] Attempting sparse discovery...")
+            feature, q = engine.select_sparse_discovery_question(prior, asked)
+            
+            if feature:
+                # print(f"[Service] 🟢 Inserted sparse question: {feature}")
+                game_state['sparse_questions_asked'] = sparse_asked_count + 1
+                return feature, q, game_state
+
+        # --- END INJECTION LOGIC ---
+        
         feature, q = engine.select_question(prior, asked, q_count)
         return feature, q, game_state
     
@@ -211,7 +230,6 @@ class AkinatorService:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
             
         try:
-            # Map feature name to index
             f_idx = engine.feature_map.get(feature)
             if f_idx is None: return game_state
         except Exception:
@@ -219,11 +237,9 @@ class AkinatorService:
 
         current_scores = game_state['cumulative_scores']
         
-        # Engine update returns new scores (potentially longer if engine grew)
         new_scores = engine.update(f_idx, answer, current_scores)
         
         game_state['cumulative_scores'] = new_scores
-        # Update mask size if needed to match new scores
         if len(new_scores) > len(game_state['rejected_mask']):
             padding = len(new_scores) - len(game_state['rejected_mask'])
             game_state['rejected_mask'] = np.concatenate([game_state['rejected_mask'], np.zeros(padding, dtype=bool)])
@@ -237,10 +253,7 @@ class AkinatorService:
         with self.engines_lock:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
         
-        # Normalization fix for rejection
         target_clean = engine._normalize(animal_name)
-        
-        # Scan active items
         for i in range(engine.n_items):
             current_name = engine.animals[i]
             if engine._normalize(current_name) == target_clean:
@@ -267,35 +280,22 @@ class AkinatorService:
     def start_engine_reload(self): self._load_all_engines()
 
     def get_game_report(self, domain_name, item_name, user_answers, is_new, session_id=None, ai_won=False):
-        """
-        Generates report, auto-corrects 'is_new' if item exists, and Saves to DB.
-        """
         with self.engines_lock:
             engine = self.engines.get(domain_name)
             if not engine: raise ValueError("Domain not found")
             
             clean_item_name = engine._normalize(item_name)
-            
-            # 1. INTELLIGENT DETECTION: Check if we actually have this item
             existing_idx = engine.item_map.get(clean_item_name)
             
             if existing_idx is not None:
-                # We found it! It's NOT new.
                 is_new = False
-                # Use the capitalized display name from engine
                 item_name = engine.animals[existing_idx]
                 target_vector = np.nan_to_num(engine.features[existing_idx, :engine.n_features], nan=0.5)
             else:
-                # Actually new
                 target_vector = engine.build_feature_vector(user_answers)
 
-            # 2. Find Neighbors
             similar_items = engine.find_nearest_neighbors(target_vector, exclude_name=item_name, n=3)
-
-            # 3. Build Question Report
             questions_report = []
-            
-            # Re-fetch index (might be -1 if new)
             item_idx = engine.item_map.get(clean_item_name, -1)
 
             for feature_name, user_value in user_answers.items():
@@ -324,7 +324,6 @@ class AkinatorService:
             "similar_items": similar_items
         }
         
-        # --- BACKGROUND SAVE TO SQL ---
         if session_id:
             threading.Thread(target=db.save_game_report, args=(
                 session_id, domain_name, item_name, ai_won, report_data

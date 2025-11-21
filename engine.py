@@ -4,12 +4,13 @@ from sklearn.impute import KNNImputer
 
 class AkinatorEngine:
     """
-    Real-time Padded Akinator Engine (V14.6 - Tuning Fixes).
+    Real-time Padded Akinator Engine (V14.7 - Sparse Data Collection).
     
     Updates:
-    - should_make_guess: Lowered continue threshold to 3.
-    - update: REMOVED artificial scoring boosts (1.25x) to prevent generic items
-      like 'Labubu' from hijacking the game based on common traits (plastic, solid).
+    - select_sparse_discovery_question: Smartly selects questions to fill gaps
+      without disrupting the relative ranking of top candidates.
+    - should_make_guess: Continue threshold is 3.
+    - update: No artificial scoring boosts.
     """
     
     def __init__(self, df, feature_cols, questions_map, row_padding=200, col_padding=100):
@@ -43,7 +44,7 @@ class AkinatorEngine:
             names = df['animal_name'].values
             self.animals[:self.n_items] = names
             
-            # CRITICAL FIX: Normalize keys for deduplication using the shared method
+            # Normalize keys for deduplication
             for idx, name in enumerate(names):
                 clean_key = self._normalize(name)
                 self.item_map[clean_key] = idx
@@ -61,25 +62,11 @@ class AkinatorEngine:
         
         # Improved fuzzy map
         self.fuzzy_map = {
-            'yes': 1.0, 
-            'y': 1.0, 
-            
-            'probably': 0.75, 
-            'mostly': 0.75, 
-            'usually': 0.75, 
-            
-            'somewhat': 0.5, 
-            'sort of': 0.5, 
-            'sometimes': 0.5, 
-            'idk': 0.5, 
-            'unknown': 0.5,
-            
-            'probably not': 0.25,  
-            'not really': 0.25, 
-            'rarely': 0.25, 
-            
-            'no': 0.0, 
-            'n': 0.0
+            'yes': 1.0, 'y': 1.0, 
+            'probably': 0.75, 'mostly': 0.75, 'usually': 0.75, 
+            'somewhat': 0.5, 'sort of': 0.5, 'sometimes': 0.5, 'idk': 0.5, 'unknown': 0.5,
+            'probably not': 0.25, 'not really': 0.25, 'rarely': 0.25, 
+            'no': 0.0, 'n': 0.0
         }
         # Precomputations
         self._refresh_column_stats()
@@ -90,47 +77,24 @@ class AkinatorEngine:
 
     @staticmethod
     def _normalize(text: str) -> str:
-        """
-        Aggressive Normalization.
-        1. Lowercase & Strip
-        2. Remove spaces/hyphens/underscores ("Hot Dog" -> "hotdog")
-        3. Remove trailing 's' ("Hotdogs" -> "hotdog")
-           (Protected: 'ss' ending like 'glass', and words <= 3 chars like 'bus')
-        """
         if not text: return ""
-        
-        # 1. Strip and Lower
         clean = str(text).strip().lower()
-        
-        # 2. Remove separators
         clean = clean.replace(" ", "").replace("-", "").replace("_", "")
-        
-        # 3. Simple Singularization
-        # If it ends in 's', isn't 'ss' (glass), and is long enough (avoids 'bus' -> 'bu' risk for most short words)
         if clean.endswith("s") and not clean.endswith("ss") and len(clean) > 3:
             clean = clean[:-1]
-            
         return clean
 
     def _impute_active_block(self):
-        """
-        Fills gaps in knowledge. If 'projector' is new and missing data, 
-        this infers it from similar items (like 'TV'), making it guessable immediately.
-        """
         if self.n_items == 0 or self.n_features == 0: return
         
         active_view = self.features[:self.n_items, :self.n_features]
-        
-        # 1. Fill complete empty columns with uncertainty (0.5)
         nan_mask = np.isnan(active_view)
         all_nan_cols = nan_mask.all(axis=0)
         if all_nan_cols.any():
             active_view[:, all_nan_cols] = 0.5
             
-        # 2. KNN Imputation for partial data
         if np.isnan(active_view).any():
             try:
-                # increased k-neighbors for better generalization
                 imputer = KNNImputer(n_neighbors=7, weights='distance')
                 filled = imputer.fit_transform(active_view)
                 self.features[:self.n_items, :self.n_features] = np.clip(filled, 0.01, 0.99)
@@ -140,13 +104,11 @@ class AkinatorEngine:
                 self.features[:self.n_items, :self.n_features][mask] = 0.5
 
     def _recalc_correlation(self):
-        """Calculates correlation to prevent asking redundant questions."""
         if self.n_items < 5 or self.n_features == 0:
             self.feature_correlation_matrix = np.eye(self.n_features, dtype=np.float32)
             return
         try:
             active_feats = self.features[:self.n_items, :self.n_features]
-            # Using numpy for speed
             centered = active_feats - np.mean(active_feats, axis=0)
             cov = np.dot(centered.T, centered) / (self.n_items - 1)
             std = np.sqrt(np.diag(cov))
@@ -156,21 +118,15 @@ class AkinatorEngine:
             self.feature_correlation_matrix = np.eye(self.n_features, dtype=np.float32)
 
     def _refresh_column_stats(self):
-        """Refreshes variance to find 'informative' features."""
         active_view = self.features[:self.n_items, :self.n_features]
         clean_view = np.nan_to_num(active_view, nan=0.5)
-        
         self.col_var = np.var(clean_view, axis=0)
         self.col_mean = np.mean(clean_view, axis=0)
-        
-        # Features with very low variance (everyone matches) are useless
         self.allowed_feature_mask = (self.col_var > 1e-4)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask)[0].astype(np.int32)
 
     def _compute_initial_priors(self):
-        """Calculates the best Q1-Q3 questions (Global Variance)."""
         if self.n_items > 0 and len(self.allowed_feature_indices) > 0:
-            # Just rank by variance for initial speed
             variances = self.col_var[self.allowed_feature_indices]
             sorted_indices = np.argsort(variances)[::-1]
             self.sorted_initial_feature_indices = self.allowed_feature_indices[sorted_indices]
@@ -178,56 +134,32 @@ class AkinatorEngine:
             self.sorted_initial_feature_indices = np.array([], dtype=np.int32)
 
     def smart_ingest_update(self, item_name: str, feature_name: str, value: float, question_text: str = None):
-        """
-        DEDUPLICATED Ingestion.
-        Checks for 'Projector' via 'projector' key.
-        """
-        # 1. Sanitize Key
         clean_item_key = self._normalize(item_name)
-        
         idx = self.item_map.get(clean_item_key)
         
-        # 2. Add Item if New
         if idx is None:
             if self.n_items >= self.cap_rows:
                 print(f"⚠️ Capacity Reached. Cannot add '{item_name}'.")
                 return
-            
             idx = self.n_items
-            self.animals[idx] = item_name # Store Display Name
-            self.item_map[clean_item_key] = idx # Store Clean Key
+            self.animals[idx] = item_name 
+            self.item_map[clean_item_key] = idx
             self.n_items += 1
-            
-            # Initialize with average of existing items (Not 0.5, but Mean)
-            # This helps it blend in immediately rather than being an outlier
             if self.n_features > 0:
                 self.features[idx, :self.n_features] = self.col_mean[:self.n_features]
-                
-            print(f"   [Engine] +ITEM: '{item_name}' @ idx {idx}")
 
-        # 3. Add Feature if New
         f_idx = self.feature_map.get(feature_name)
         if f_idx is None:
-            if self.n_features >= self.cap_cols:
-                return
-            
+            if self.n_features >= self.cap_cols: return
             f_idx = self.n_features
             self.feature_cols_array[f_idx] = feature_name
             self.feature_map[feature_name] = f_idx
             self.n_features += 1
-            
             if question_text:
                 self.questions_map[feature_name] = question_text
-            
-            # Initialize new feature to 0.5 (Uncertainty)
             self.features[:self.n_items, f_idx] = 0.5
-            print(f"   [Engine] +FEATURE: '{feature_name}' @ col {f_idx}")
 
-        # 4. Update Value
         self.features[idx, f_idx] = value
-        
-        # Quick stats refresh if significant updates happen
-        # (Optional optimization: only run every N updates)
         self._refresh_column_stats()
 
     def recalculate_stats(self):
@@ -235,16 +167,7 @@ class AkinatorEngine:
         self._recalc_correlation()
         self._compute_initial_priors()
 
-    def _calculate_entropy(self, probs: np.ndarray) -> float:
-        p = np.clip(probs, 1e-10, 1.0)
-        return -np.sum(p * np.log2(p))
-
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
-        """
-        ROBUST SCORING (The "Climbing" Logic).
-        UPDATED: Removed artificial boosts to prevent "Labubu" scenarios.
-        """
-        # Resize scores if engine grew
         if len(current_scores) < self.n_items:
             padding_len = self.n_items - len(current_scores)
             valid_scores = current_scores[np.isfinite(current_scores)]
@@ -253,43 +176,25 @@ class AkinatorEngine:
             current_scores = np.concatenate([current_scores, padding])
         
         current_scores = current_scores[:self.n_items]
-        
         answer_val = self.fuzzy_map.get(str(answer_str).lower(), 0.5)
         
-        # 1. Get Data
         f_col = self.features[:self.n_items, feature_idx]
         f_col_clean = np.nan_to_num(f_col, nan=0.5)
         
-        # 2. Gaussian Likelihood
-        # Sigma: Controls tolerance. 0.22 allows for "Yes"(1.0) and "Probably"(0.75) to partially overlap.
+        # Gaussian Likelihood (Sigma 0.22)
         sigma = 0.22
         distance = np.abs(f_col_clean - answer_val)
         gaussian_likelihood = np.exp(-0.5 * (distance / sigma) ** 2)
         
-        # 3. NOISE FLOOR
-        # Controls how fatal a mismatch is. 0.01 means a hard miss divides probability by 100.
         p_noise = 0.01
         final_likelihood = (1.0 - p_noise) * gaussian_likelihood + p_noise
         
-        # 4. REMOVED Artificial Boosts
-        # Previously we did `final_likelihood *= 1.25` if it matched.
-        # This caused generic items (solid, plastic, toy) to accumulate massive scores
-        # simply by fitting broad categories, even if they missed specific ones.
-        # We now rely purely on the Gaussian probability.
+        # No artificial boost here!
              
-        # 5. Convert to Log-Prob update
         log_update = np.log(np.clip(final_likelihood, 1e-9, None))
-        
         return current_scores + log_update
 
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple[str, str]:
-        """
-        SMART NARROWING with STOCHASTIC START.
-        
-        Logic:
-        - If Question 0: Pick RANDOMLY from the Top 25 features (High Variety).
-        - If Question > 0: GREEDY AF (Strict Argmax) to converge rapidly.
-        """
         active_cols = self.feature_cols_array[:self.n_features]
         asked_mask = np.isin(active_cols, asked_features)
         
@@ -316,41 +221,77 @@ class AkinatorEngine:
             limit = min(self.n_features, self.feature_correlation_matrix.shape[0])
             valid_candidates = candidate_indices[candidate_indices < limit]
             valid_asked = asked_indices[asked_indices < limit]
-            
             if len(valid_candidates) > 0 and len(valid_asked) > 0:
                 corr_sub = self.feature_correlation_matrix[valid_candidates][:, valid_asked]
                 max_corr = np.max(np.abs(corr_sub), axis=1)
                 scores[valid_candidates] *= (1.0 - max_corr**2)
 
-        # --- SELECTION LOGIC START ---
-        
         if question_count == 0:
-            # RANDOM START: Widen pool to Top 25 for "Extreme Randomness"
-            
-            # 1. Get scores for candidates
+            # Random start logic
             candidate_scores = scores[candidate_indices]
-            
-            # 2. Sort descending (indices relative to candidate_indices)
             sorted_local_indices = np.argsort(candidate_scores)[::-1]
-            
-            # 3. Define pool (Top 25 instead of Top 5)
-            # This forces variety. It won't just ask the #1 best question every time.
             pool_size = min(len(sorted_local_indices), 25)
-            
-            if pool_size == 0: 
-                return None, None
-                
-            # 4. Pick Randomly
+            if pool_size == 0: return None, None
             random_pool_index = np.random.choice(sorted_local_indices[:pool_size])
             best_candidate_idx = candidate_indices[random_pool_index]
-            
         else:
-            # GREEDY AF: Strict Argmax for maximum efficiency after Q1
             best_candidate_idx = candidate_indices[np.argmax(scores[candidate_indices])]
             
-        # --- SELECTION LOGIC END ---
-        
         fname = str(active_cols[best_candidate_idx])
+        return fname, self.questions_map.get(fname, f"Is it {fname}?")
+
+    # --- SPARSE DISCOVERY METHOD ---
+    def select_sparse_discovery_question(self, prior: np.ndarray, asked_features: list) -> tuple[str, str] | tuple[None, None]:
+        """
+        Finds a question where the top candidates have 'Unknown' (0.5) data.
+        This collects data without disrupting the relative ranking of the top items.
+        """
+        if prior is None or len(prior) == 0:
+            return None, None
+
+        # 1. Identify Top Candidates (e.g., Top 20)
+        # We care about not disrupting the current leaders.
+        sorted_indices = np.argsort(prior)[::-1]
+        top_k_indices = sorted_indices[:20]
+        
+        if len(top_k_indices) == 0:
+            return None, None
+            
+        # 2. Extract their feature vectors
+        # shape: (20, n_features)
+        top_matrix = self.features[top_k_indices, :self.n_features]
+        
+        # 3. Find columns that are "Unknown" (close to 0.5) for these items
+        # Clean NaNs to 0.5 first
+        clean_matrix = np.nan_to_num(top_matrix, nan=0.5)
+        
+        # Calculate distance from 0.5 (Uncertainty)
+        # 0.0 means exactly 0.5 (perfectly unknown). 0.5 means exactly 1.0 or 0.0 (perfectly known).
+        uncertainty_score = np.abs(clean_matrix - 0.5)
+        
+        # Sum deviation across the top candidates. Lower sum = More Unknowns.
+        col_uncertainty_sum = np.sum(uncertainty_score, axis=0)
+        
+        # 4. Filter out already asked questions
+        active_cols = self.feature_cols_array[:self.n_features]
+        asked_mask = np.isin(active_cols, asked_features)
+        
+        # Set already asked cols to infinity so they aren't picked
+        col_uncertainty_sum[asked_mask] = np.inf
+        
+        # 5. Select the best candidate (Lowest deviation from 0.5)
+        best_idx = np.argmin(col_uncertainty_sum)
+        
+        # Safety Check: 
+        # If avg deviation > 0.15, it means the candidates actually have opinions.
+        # Asking this would disrupt the game. We only want questions where
+        # they all mostly agree on "I don't know".
+        avg_deviation = col_uncertainty_sum[best_idx] / len(top_k_indices)
+        
+        if avg_deviation > 0.15:
+            return None, None
+
+        fname = str(active_cols[best_idx])
         return fname, self.questions_map.get(fname, f"Is it {fname}?")
 
     def should_make_guess(self, game_state: dict, probs: np.ndarray) -> tuple[bool, str | None, str | None]:
@@ -362,7 +303,6 @@ class AkinatorEngine:
         top_prob = probs[top_idx]
         top_animal = self.animals[top_idx]
         
-        # Extract State
         q_count = game_state.get('question_count', 0)
         continue_mode = game_state.get('continue_mode', False)
         q_since_last_guess = game_state.get('questions_since_last_guess', 0)
@@ -373,16 +313,11 @@ class AkinatorEngine:
         should_guess = False
         reason = ""
         
-        # --- FIXED LOGIC START ---
-        
-        # 1. Rejection Cool-down:
-        # If we just rejected a guess (continue_mode is True), do NOT guess again immediately.
-        # UPDATED: Force at least 3 new questions (was 5).
+        # 1. Rejection Cool-down (THRESHOLD = 3)
         if continue_mode and q_since_last_guess < 3:
             return False, None, None
 
         # 2. Hard Limit (Question 25)
-        # ONLY trigger this if we haven't entered continue mode yet.
         if q_count >= 25 and not continue_mode:
             should_guess = True
             reason = "max_questions_25"
@@ -392,8 +327,6 @@ class AkinatorEngine:
             should_guess = True
             reason = "balanced_confidence"
                 
-        # --- FIXED LOGIC END ---
-                
         return should_guess, top_animal if should_guess else None, reason
     
     @property
@@ -402,17 +335,13 @@ class AkinatorEngine:
 
     def get_features_for_data_collection(self, item_name, num_features=5):
         if len(self.allowed_feature_indices) == 0: return []
-        
         variances = self.col_var[self.allowed_feature_indices]
         prob_dist = variances / variances.sum()
-        
         selected = np.random.choice(
             self.allowed_feature_indices, 
             size=min(num_features, len(self.allowed_feature_indices)), 
-            replace=False,
-            p=prob_dist
+            replace=False, p=prob_dist
         )
-        
         results = []
         active_cols = self.feature_cols_array[:self.n_features]
         for idx in selected:
@@ -435,10 +364,6 @@ class AkinatorEngine:
         return sorted(results, key=lambda x: x['initial_gain'], reverse=True)
 
     def build_feature_vector(self, user_answers: dict) -> np.ndarray:
-        """
-        Builds a feature vector from a dictionary of user answers.
-        Unanswered features are set to 0.5 (uncertainty).
-        """
         vector = np.full(self.n_features, 0.5, dtype=np.float32)
         for fname, val in user_answers.items():
             idx = self.feature_map.get(fname)
@@ -447,43 +372,16 @@ class AkinatorEngine:
         return vector
 
     def find_nearest_neighbors(self, target_vector: np.ndarray, exclude_name: str = None, n: int = 3) -> list[str]:
-        """
-        Calculates Euclidean distance between target vector and all active items.
-        Returns top N most similar item names.
-        """
-        if self.n_items == 0 or self.n_features == 0:
-            return []
-
-        # 1. Get Active Features (Handle NaNs by converting to 0.5)
-        # shape: (n_items, n_features)
-        active_matrix = np.nan_to_num(
-            self.features[:self.n_items, :self.n_features], 
-            nan=0.5
-        )
-        
-        # 2. Calculate Distances (Euclidean)
-        # broadcast target_vector across the matrix
-        # diff shape: (n_items, n_features)
+        if self.n_items == 0 or self.n_features == 0: return []
+        active_matrix = np.nan_to_num(self.features[:self.n_items, :self.n_features], nan=0.5)
         diff = active_matrix - target_vector
-        
-        # dist shape: (n_items,)
         distances = np.linalg.norm(diff, axis=1)
-        
-        # 3. Sort
         sorted_indices = np.argsort(distances)
-        
         results = []
         for idx in sorted_indices:
-            if len(results) >= n:
-                break
-                
+            if len(results) >= n: break
             candidate_name = self.animals[idx]
-            
-            # Skip if it's the item itself (case-insensitive check)
-            # Use _normalize for better safety if needed, but string comparison is mostly safe here
             if exclude_name and self._normalize(candidate_name) == self._normalize(exclude_name):
                 continue
-                
             results.append(candidate_name)
-            
         return results

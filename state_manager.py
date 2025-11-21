@@ -20,15 +20,14 @@ class StateManager:
             'questions_since_last_guess': 0,
             'last_guess_type': None,
             'state_type': 'initial',
-            'answer_history': []
+            'answer_history': [],
+            'sparse_questions_asked': 0  # Tracks injected data collection questions
         }
     
     @staticmethod
     def migrate_state(game_state: dict, new_animal_count: int) -> dict:
         """
         Resize state arrays if the engine grew (new items added in real-time).
-        CRITICAL FIX: Initialize new items with minimum score to prevent 
-        them from hijacking active games.
         """
         current_scores = game_state.get('cumulative_scores', np.array([]))
         state_n = len(current_scores)
@@ -43,24 +42,18 @@ class StateManager:
         if new_animal_count > state_n:
             padding_len = new_animal_count - state_n
             
-            # --- FIX START ---
             # Don't use 0.0. Use the worst score in the current active set.
-            # This prevents the new item (which matches nothing yet) from 
-            # beating items that have survived 15 questions.
             if state_n > 0:
-                # Use min score minus a small buffer to ensure it stays at bottom
-                # checking for -inf to avoid issues
                 valid_scores = current_scores[np.isfinite(current_scores)]
                 if len(valid_scores) > 0:
                     base_score = np.min(valid_scores) - 1.0
                 else:
-                    base_score = -20.0 # Fallback for empty/all-inf states
+                    base_score = -20.0
             else:
                 base_score = 0.0
 
             score_pad = np.full(padding_len, base_score, dtype=np.float32)
             mask_pad = np.zeros(padding_len, dtype=bool)
-            # --- FIX END ---
             
             game_state['cumulative_scores'] = np.concatenate([current_scores, score_pad])
             
@@ -69,7 +62,7 @@ class StateManager:
             
             game_state['animal_count'] = new_animal_count
             
-        # Case 3: Engine shrank (Deletion? Rare)
+        # Case 3: Engine shrank
         elif new_animal_count < state_n:
             game_state['cumulative_scores'] = current_scores[:new_animal_count]
             game_state['rejected_mask'] = game_state['rejected_mask'][:new_animal_count]
