@@ -371,12 +371,7 @@ class AkinatorEngine:
             should_guess = True
             reason = "max_questions_25"
             
-        # 2. Adjusted Confidence Rule (Balanced)
-        # - Confidence > 80% (was 99.5%)
-        # - Ratio > 1.5x (was 20x)
-        # This makes it less "trigger happy" on random noise, but converges 
-        # WAY faster than the previous ultra-strict mode.
-        elif top_prob > 0.80 and ratio > 1.5:
+        elif top_prob > 0.95 and ratio > 3:
             should_guess = True
             reason = "balanced_confidence"
                 
