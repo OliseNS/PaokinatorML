@@ -11,6 +11,7 @@ from state_manager import StateManager
 class AkinatorService:
     """
     Service Layer with Precise Real-time Sync.
+    Updated to handle new pacing and safety net logic.
     """
     
     def __init__(self):
@@ -85,6 +86,7 @@ class AkinatorService:
                             if not engine: continue
                             
                             # 1. Ingest Data
+                            # Safe to do in loop because smart_ingest_update is O(1) mostly
                             for up in updates:
                                 engine.smart_ingest_update(
                                     item_name=up['item_name'],
@@ -94,7 +96,7 @@ class AkinatorService:
                                 )
                             
                             # 2. Update Strategy
-                            # We do this once per batch per domain
+                            # We do this once per batch per domain to be efficient
                             engine.recalculate_stats()
                             
                         total_updates += len(updates)
@@ -130,6 +132,7 @@ class AkinatorService:
         scores = game_state['cumulative_scores'].copy()
         mask = game_state['rejected_mask']
         
+        # Ensure sizes match before operations
         if len(scores) != engine.n_items:
             game_state = self.state_manager.migrate_state(game_state, engine.n_items)
             scores = game_state['cumulative_scores'].copy()
@@ -189,20 +192,23 @@ class AkinatorService:
         return game_state
 
     def get_next_question(self, game_state: dict) -> tuple[str | None, str | None, dict]:
+        """
+        Retrieves the next question.
+        Includes logic for 'Sparse Question' injection to improve data quality mid-game.
+        """
         prior, game_state, engine = self._get_probs_and_state(game_state)
         asked = game_state['asked_features']
         q_count = game_state['question_count']
         
         # --- DATA COLLECTION INJECTION LOGIC ---
         sparse_asked_count = game_state.get('sparse_questions_asked', 0)
-        
         top_prob = np.max(prior) if len(prior) > 0 else 0
         
-        # Trigger Conditions:
+        # Refined Trigger Conditions:
         # 1. "Mid-Game Pocket": Between Q5 and Q20.
         # 2. Limit: Max 2 per session.
-        # 3. Safety: Not in continue mode, not highly confident yet (>0.85).
-        # 4. Chance: 25% probability per turn (stochastic).
+        # 3. Safety: Not in continue mode (too risky), not highly confident (>0.85).
+        # 4. Pacing Check: Don't inject if we are approaching a forced guess.
         should_try_sparse = (
             5 <= q_count <= 20 and
             sparse_asked_count < 2 and
@@ -212,17 +218,18 @@ class AkinatorService:
         )
 
         if should_try_sparse:
-            # print(f"[Service] Attempting sparse discovery...")
             feature, q = engine.select_sparse_discovery_question(prior, asked)
-            
             if feature:
-                # print(f"[Service] 🟢 Inserted sparse question: {feature}")
                 game_state['sparse_questions_asked'] = sparse_asked_count + 1
                 return feature, q, game_state
 
-        # --- END INJECTION LOGIC ---
-        
+        # --- NORMAL SELECTION ---
         feature, q = engine.select_question(prior, asked, q_count)
+        
+        # If engine returned None, it means we ran out of valid questions.
+        # The main loop checks for (None, None) and handles it (Game Over/Win),
+        # or we might want to ensure should_make_guess caught this earlier.
+        
         return feature, q, game_state
     
     def process_answer(self, game_state: dict, feature: str, answer: str) -> dict:
@@ -240,6 +247,8 @@ class AkinatorService:
         new_scores = engine.update(f_idx, answer, current_scores)
         
         game_state['cumulative_scores'] = new_scores
+        
+        # Handle resizing if engine grew during update
         if len(new_scores) > len(game_state['rejected_mask']):
             padding = len(new_scores) - len(game_state['rejected_mask'])
             game_state['rejected_mask'] = np.concatenate([game_state['rejected_mask'], np.zeros(padding, dtype=bool)])
@@ -254,6 +263,8 @@ class AkinatorService:
             engine, game_state = self._get_engine_and_migrate_state(game_state)
         
         target_clean = engine._normalize(animal_name)
+        
+        # Mark the specific item as rejected in the mask
         for i in range(engine.n_items):
             current_name = engine.animals[i]
             if engine._normalize(current_name) == target_clean:
@@ -322,7 +333,7 @@ class AkinatorService:
             "is_new_item": is_new, 
             "questions": questions_report,
             "similar_items": similar_items,
-            "sparse_questions_asked": sparse_count # <--- Added field
+            "sparse_questions_asked": sparse_count 
         }
         
         if session_id:
