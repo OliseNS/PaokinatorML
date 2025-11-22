@@ -379,7 +379,7 @@ class AkinatorEngine:
             if top_prob > 0.40:
                 should_guess = True
                 reason = "safety_net_25_confident"
-            elif q_count >= 35:
+            elif q_count >= 30:
                  should_guess = True
                  reason = "safety_net_grace_period_ended"
         
