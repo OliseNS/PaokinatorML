@@ -5,8 +5,8 @@ import threading
 
 class AkinatorEngine:
     """
-    Akinator Engine V19.1 - Light (Pure NumPy)
-    Restored Service Compatibility (Sparse Questions, Neighbor Search).
+    Akinator Engine V19.2 - Sharp (High Confidence)
+    Tuned for stricter logic penalties and delayed guessing.
     """
     __slots__ = (
         'questions_map', 'lock', 'n_items', 'n_features', 
@@ -61,7 +61,7 @@ class AkinatorEngine:
         self.col_var = np.zeros(self.cap_cols, dtype=np.float32)
         self.allowed_feature_mask = np.zeros(self.cap_cols, dtype=bool)
         self.allowed_feature_indices = np.array([], dtype=np.int32)
-        self.sorted_initial_feature_indices = np.array([], dtype=np.int32) # Required by main.py stats
+        self.sorted_initial_feature_indices = np.array([], dtype=np.int32)
 
         self._pending_updates = deque(maxlen=1000)
         self._batch_threshold = 50
@@ -72,15 +72,16 @@ class AkinatorEngine:
         self._compute_initial_stats()
         
         self.answer_values = np.array([1.0, 0.75, 0.5, 0.25, 0.0], dtype=np.float16)
+        # Slightly sharper fuzzy map
         self.fuzzy_map = {
             'yes': 1.0, 'y': 1.0,
-            'probably': 0.75, 'mostly': 0.75, 'usually': 0.75,
+            'probably': 0.8, 'mostly': 0.8, 'usually': 0.8,
             'somewhat': 0.5, 'sort of': 0.5, 'sometimes': 0.5, 'idk': 0.5, 'unknown': 0.5,
-            'probably not': 0.25, 'not really': 0.25, 'rarely': 0.25,
+            'probably not': 0.2, 'not really': 0.2, 'rarely': 0.2,
             'no': 0.0, 'n': 0.0
         }
         
-        print(f"✓ Engine Ready (Light Mode V2): {self.n_items} items, {self.n_features} features")
+        print(f"✓ Engine Ready (Sharp Mode V19.2): {self.n_items} items, {self.n_features} features")
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -116,7 +117,6 @@ class AkinatorEngine:
         self.allowed_feature_mask[:self.n_features] = (self.col_var[:self.n_features] > 1e-4)
         self.allowed_feature_indices = np.where(self.allowed_feature_mask[:self.n_features])[0].astype(np.int32)
         
-        # Create sorted indices for performance stats in main.py
         if len(self.allowed_feature_indices) > 0:
             variances = self.col_var[self.allowed_feature_indices]
             sorted_idx = np.argsort(variances)[::-1]
@@ -172,12 +172,16 @@ class AkinatorEngine:
                 self._update_derived_stats()
                 self._pending_updates.clear()
 
-    # Service.py expects this alias
     def recalculate_stats(self):
         self._update_derived_stats()
         self._pending_updates.clear()
 
     def update(self, feature_idx: int, answer_str: str, current_scores: np.ndarray) -> np.ndarray:
+        """
+        Sharpened Update Logic:
+        Sigma reduced to ~0.15 (Divisor -0.045). 
+        This penalizes mismatches (Consumable=Yes vs Silverware=No) extremely heavily.
+        """
         n = self.n_items
         if len(current_scores) < n:
             pad = np.full(n - len(current_scores), np.mean(current_scores) if len(current_scores) else 0.0)
@@ -191,19 +195,27 @@ class AkinatorEngine:
         diffs = self._score_buffer[:n]
         
         # Vectorized safe fill
-        np.copyto(diffs, f_col) # Copy raw data (with NaNs) to buffer
+        np.copyto(diffs, f_col) 
         mask = np.isnan(diffs)
-        diffs[mask] = col_mean  # Impute on fly
+        diffs[mask] = col_mean
         
         diffs -= answer_val
         np.abs(diffs, out=diffs)
         
         diffs *= diffs
-        diffs /= -0.0968 # 2 * 0.22^2
+        
+        # CRITICAL CHANGE: Sharper Bell Curve
+        # Old: -0.0968 (sigma ~0.22)
+        # New: -0.045  (sigma ~0.15)
+        # This makes contradictions effectively fatal to the candidate score.
+        diffs /= -0.045 
+        
         np.exp(diffs, out=diffs)
         
-        diffs *= 0.97
-        diffs += 0.03
+        # Reduced Smoothing to prevent bad candidates from lingering
+        diffs *= 0.99
+        diffs += 0.01
+        
         np.log(diffs, out=diffs)
         
         return current_scores + diffs
@@ -211,8 +223,9 @@ class AkinatorEngine:
     def select_question(self, prior: np.ndarray, asked_features: list, question_count: int) -> tuple:
         if self._stats_dirty: self._update_derived_stats()
         
+        # Focus on top candidates more strictly
         if prior is not None and len(prior) > 0:
-            k = min(25, self.n_items)
+            k = min(15, self.n_items) # Reduced from 25 to 15 for tighter focus
             top_indices = np.argpartition(prior, -k)[-k:]
         else:
             top_indices = np.arange(self.n_items)
@@ -237,32 +250,19 @@ class AkinatorEngine:
         fname = self.feature_cols_array[best_idx]
         return fname, self.questions_map.get(fname, f"Is it {fname}?")
 
-    # --- RESTORED METHOD ---
     def select_sparse_discovery_question(self, prior: np.ndarray, asked_features: list) -> tuple:
-        """
-        Selects a question to fill knowledge gaps (NaNs/0.5s) for top candidates.
-        """
         if prior is None or len(prior) == 0: return None, None
         
-        # 1. Get Top Candidates
         sorted_idx = np.argsort(prior)[::-1][:20]
         if len(sorted_idx) == 0: return None, None
         
-        # 2. Calculate Uncertainty on Subset
-        # In Light mode, uncertainty is high if value is NaN or close to 0.5
         top_matrix = self.features[sorted_idx, :self.n_features]
-        
-        # Fill NaNs with 0.5 so we can just check distance from 0.5
         filled_matrix = np.nan_to_num(top_matrix, nan=0.5)
         
-        # High "uncertainty score" = Value is close to 0.5
-        # Score = 1.0 - 2*|val - 0.5|. If val is 0.5, score is 1.0. If val is 1.0, score is 0.
         uncertainty_scores = 1.0 - (2.0 * np.abs(filled_matrix - 0.5))
         total_uncertainty = np.sum(uncertainty_scores, axis=0)
         
         asked_set = set(asked_features)
-        
-        # Find feature with highest uncertainty that hasn't been asked
         best_idx = -1
         max_uncertainty = -1.0
         
@@ -277,9 +277,8 @@ class AkinatorEngine:
                 
         if best_idx == -1: return None, None
         
-        # Check if it's actually worth asking (average uncertainty > threshold)
         avg_dev = max_uncertainty / len(sorted_idx)
-        if avg_dev < 0.15: return None, None # Data is already pretty clean
+        if avg_dev < 0.15: return None, None 
         
         fname = self.feature_cols_array[best_idx]
         return fname, self.questions_map.get(fname, f"Is it {fname}?")
@@ -291,26 +290,32 @@ class AkinatorEngine:
         top_prob = probs[top_idx] / probs.sum()
         q_count = game_state.get('question_count', 0)
         
-        if q_count < 8: return False, None, None
+        # 1. Prevent Early Guesses
+        # Increased from 8 to 12. You need to gather data first.
+        if q_count < 12: return False, None, None
         
-        if top_prob > 0.95: 
+        # 2. Very High Confidence Check
+        # Must be 97% certain absolute
+        if top_prob > 0.97: 
             return True, self.animals[top_idx], "very_high_probability"
             
         sorted_idx = np.argsort(probs)[::-1]
         top_prob = probs[sorted_idx[0]] / probs.sum()
         second = probs[sorted_idx[1]] / probs.sum() if len(sorted_idx) > 1 else 0.001
         
-        if q_count >= 25 and top_prob > 0.40: 
+        # 3. Safety Net (Delayed)
+        # Increased q_count from 25 to 35.
+        if q_count >= 35 and top_prob > 0.40: 
             return True, self.animals[sorted_idx[0]], "safety_net"
             
+        # 4. Relative Confidence Check
+        # Increased ratio from 4.0 to 6.0
         ratio = top_prob / (second + 1e-9)
-        if top_prob > 0.85 and ratio > 4.0:
+        if top_prob > 0.85 and ratio > 6.0:
             return True, self.animals[sorted_idx[0]], "high_confidence"
             
         return False, None, None
 
-    # --- RESTORED HELPERS ---
-    
     @property
     def feature_cols(self):
         return [x for x in self.feature_cols_array if x is not None]
@@ -329,13 +334,11 @@ class AkinatorEngine:
                 for i in chosen]
 
     def get_all_feature_gains(self) -> list:
-        # Used by admin stats
         return sorted([{"feature_name": str(self.feature_cols_array[i]), "initial_gain": float(self.col_var[i])}
                        for i in self.allowed_feature_indices],
                       key=lambda x: x['initial_gain'], reverse=True)
 
     def build_feature_vector(self, user_answers: dict) -> np.ndarray:
-        # Used by report generator
         vector = np.full(self.n_features, 0.5, dtype=np.float32)
         for fname, val in user_answers.items():
             idx = self.feature_map.get(fname)
@@ -344,13 +347,10 @@ class AkinatorEngine:
         return vector
 
     def find_nearest_neighbors(self, target_vector: np.ndarray, exclude_name: str = None, n: int = 3) -> list:
-        # Used by report generator
         if self.n_items == 0: return []
         
-        # Impute active data on the fly for distance calc
         active_matrix = np.nan_to_num(self.features[:self.n_items, :self.n_features], nan=0.5)
         
-        # Euclidean distance
         distances = np.linalg.norm(active_matrix - target_vector, axis=1)
         sorted_idx = np.argsort(distances)
         
